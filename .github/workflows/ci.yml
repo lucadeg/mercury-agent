@@ -1,13 +1,9 @@
 name: CI
 
 on:
-  push:
-    branches: [main]
-    tags: ['v*']
-  pull_request:
-    branches: [main]
   workflow_dispatch:
 
+  # Automatic triggers removed; invoke through FounderOS/Admin Gate.
 jobs:
   typecheck:
     name: Typecheck (Node ${{ matrix.node }}, ${{ matrix.os }})
