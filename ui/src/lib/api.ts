@@ -90,7 +90,9 @@ export const auth = {
 // ── Config ──
 export const config = {
   get: () => get<AppConfig>("/api/config"),
-  update: (data: Partial<AppConfig>) => put<{ success: boolean }>("/api/config", data),
+  update: (data: Partial<AppConfig>) => put<{ success: boolean; restartRequired?: boolean }>("/api/config", data),
+  /** Apply saved configuration: the runtime reads providers/keys at boot. */
+  restart: () => post<{ ok: boolean; message: string }>("/api/restart"),
 };
 
 // ── Providers ──
@@ -105,25 +107,30 @@ export const providers = {
 // ── Chat ──
 export const chat = {
   send: (content: string, threadId?: string) =>
-    post<{ sent: boolean }>("/api/chat/send", { content, threadId }),
+    post<{ sent: boolean; sessionId: string }>("/api/chat/send", { content, sessionId: threadId }),
   settings: {
     get: () => get<ChatSettings>("/api/chat/settings"),
     update: (data: Partial<ChatSettings>) =>
       put<ChatSettings>("/api/chat/settings", data),
   },
-  permission: (id: string, action: string) =>
-    post<{ resolved: boolean }>(`/api/chat/permission/${id}`, { action }),
+  permission: (id: string, action: string, targetId?: string) =>
+    post<{ resolved: boolean }>(`/api/chat/permission/${id}`, { action, targetId }),
   models: {
     list: () => get<ModelsResponse>("/api/chat/models"),
-    switch: (provider: string) =>
+    switch: (provider: string, model?: string) =>
       post<{ ok: boolean; message: string }>("/api/chat/models/switch", {
         provider,
+        model,
       }),
+    /** Rename a model and/or set its reasoning level; null / '' / 'auto' resets. */
+    setPrefs: (provider: string, model: string, prefs: { label?: string | null; reasoning?: ReasoningChoice | null }) =>
+      post<{ ok: boolean } & ModelDescription>("/api/chat/models/prefs", { provider, model, ...prefs }),
   },
   threads: {
     list: () => get<{ threads: ChatThread[] }>("/api/chat/threads"),
+    create: (title?: string) => post<ChatThread>("/api/chat/threads", { title }),
     get: (id: string) => get<ChatThread>(`/api/chat/threads/${id}`),
-    delete: (id: string) => del<{ deleted: boolean }>(`/api/chat/threads/${id}`),
+    delete: (id: string) => post<{ deleted: boolean; syncPending: boolean }>(`/api/chat/threads/${id}/delete`, { confirmSessionId: id }),
     addMessage: (id: string, role: string, content: string) =>
       post<{ saved: boolean }>(`/api/chat/threads/${id}/messages`, {
         role,
@@ -222,6 +229,38 @@ export const brain = {
       ),
   },
   graph: () => get<GraphData>("/api/brain/graph"),
+  // Owner Model (ADR-026): what Mercury believes about the owner, with evidence.
+  beliefs: {
+    list: (params?: { status?: string; kind?: string; dimension?: string; limit?: number }) => {
+      const qs = new URLSearchParams();
+      if (params?.status) qs.set("status", params.status);
+      if (params?.kind) qs.set("kind", params.kind);
+      if (params?.dimension) qs.set("dimension", params.dimension);
+      if (params?.limit) qs.set("limit", String(params.limit));
+      return get<{ beliefs: Belief[]; total: number; counts: BeliefCounts }>(`/api/brain/beliefs?${qs}`);
+    },
+    learned: (days?: number, limit?: number) => {
+      const qs = new URLSearchParams();
+      if (days) qs.set("days", String(days));
+      if (limit) qs.set("limit", String(limit));
+      return get<{ beliefs: Belief[]; total: number; days: number }>(`/api/brain/beliefs/learned?${qs}`);
+    },
+    contested: () =>
+      get<{ pairs: Array<{ a: Belief; b: Belief | null }>; total: number }>("/api/brain/beliefs/contested"),
+    get: (id: string) => get<Belief & { evidence: BeliefEvidence[] }>(`/api/brain/beliefs/${id}`),
+    confirm: (id: string) => post<{ success: boolean; belief: Belief }>(`/api/brain/beliefs/${id}/confirm`),
+    forget: (id: string) => post<{ success: boolean; forgotten: string }>(`/api/brain/beliefs/${id}/forget`),
+    correct: (id: string, statement: string) =>
+      post<{ success: boolean; belief: Belief; replaced: Belief }>(`/api/brain/beliefs/${id}/correct`, { statement }),
+    settle: (winnerId: string, loserId: string) =>
+      post<{ success: boolean; winner: Belief; loser: Belief }>("/api/brain/beliefs/settle", { winnerId, loserId }),
+  },
+  quarantine: {
+    list: (limit?: number) =>
+      get<{ memories: Memory[]; total: number }>(`/api/brain/quarantine${limit ? `?limit=${limit}` : ""}`),
+    restore: (id: string) =>
+      post<{ success: boolean; memory: Memory | null }>(`/api/brain/quarantine/${id}/restore`),
+  },
 };
 
 // ── Agents / Tasks ──
@@ -243,11 +282,91 @@ export const skills = {
   list: () => get<{ skills: Skill[]; total: number }>("/api/skills"),
   install: (url: string) =>
     post<{ success: boolean; name: string }>("/api/skills/install", { url }),
+  installFromRegistry: (id: string, force = false) =>
+    post<{
+      success: boolean;
+      id: string;
+      version: string;
+      status: "installed" | "updated" | "reinstalled" | "already-installed";
+      path: string;
+      webUrl: string;
+    }>("/api/skills/install-from-registry", { id, force }),
   activate: (name: string) =>
     post<{ success: boolean }>(`/api/skills/${name}/activate`),
   deactivate: (name: string) =>
     post<{ success: boolean }>(`/api/skills/${name}/deactivate`),
   delete: (name: string) => del<{ success: boolean }>(`/api/skills/${name}`),
+};
+
+// ── Plugins ──
+export type PluginStatus = "available" | "installed" | "enabled" | "disabled" | "update-available" | "incompatible" | "error";
+
+export interface PluginSetting {
+  key: string;
+  type: "string" | "number" | "boolean" | "enum" | "secret";
+  description: string;
+  options?: string[];
+  value: unknown;
+  label?: string;
+  when?: Record<string, string | boolean | string[]> | Array<Record<string, string | boolean | string[]>>;
+  isSet?: boolean;
+  group?: string;
+  setup?: boolean;
+  required?: boolean;
+  optionLabels?: Record<string, string>;
+  format?: "text" | "phone";
+}
+
+export interface PluginItem {
+  id: string;
+  name: string;
+  description: string;
+  kind: "in-process" | "out-of-process";
+  tier: "official" | "community" | "local";
+  status: PluginStatus;
+  installedVersion?: string;
+  latestVersion?: string;
+  sizeBytes?: number;
+  enabled: boolean;
+  running: boolean;
+  verified: boolean;
+  tools: string[];
+  commands: string[];
+  permissions?: { network: string[]; secrets: string[] };
+  disabled?: { code: string; message: string; at: string };
+  lastError?: string;
+  incompatibleReason?: string;
+  settings?: PluginSetting[];
+  channel?: { type: string; state?: string; detail?: string; account?: string };
+  missing?: Array<{ key: string; unlocks: string; needs: string; fix: string }>;
+  settingGroups?: Array<{ id: string; label: string; description?: string; ready: boolean }>;
+}
+
+export interface PluginChannelStatus {
+  state: string;
+  detail?: string;
+  account?: string;
+  pairCode?: string;
+  qrImage?: string;
+}
+
+export const plugins = {
+  list: (refresh = false) =>
+    get<{ items: PluginItem[]; catalogError?: string; stale: boolean; safeMode: boolean }>(`/api/plugins${refresh ? "?refresh=1" : ""}`),
+  info: (id: string) => get<{ plugin: PluginItem | null }>(`/api/plugins/${encodeURIComponent(id)}`),
+  install: (source: string) =>
+    post<{ id: string; name: string; version: string; previousVersion?: string; verified: boolean; unchanged: boolean; tier: string }>("/api/plugins/install", { source }),
+  enable: (id: string) => post<{ ok: boolean }>(`/api/plugins/${encodeURIComponent(id)}/enable`),
+  disable: (id: string) => post<{ ok: boolean }>(`/api/plugins/${encodeURIComponent(id)}/disable`),
+  update: (id: string) => post<{ changed: Array<{ id: string; from: string; to: string }> }>(`/api/plugins/${encodeURIComponent(id)}/update`),
+  rollback: (id: string) => post<{ from: string; to: string }>(`/api/plugins/${encodeURIComponent(id)}/rollback`),
+  uninstall: (id: string, purge = false) => del<{ ok: boolean }>(`/api/plugins/${encodeURIComponent(id)}${purge ? "?purge=1" : ""}`),
+  setSetting: (id: string, key: string, value: unknown) =>
+    post<{ ok: boolean }>(`/api/plugins/${encodeURIComponent(id)}/settings`, { key, value }),
+  channel: (id: string) => get<{ status: PluginChannelStatus | null }>(`/api/plugins/${encodeURIComponent(id)}/channel`),
+  pair: (id: string, method: "qr" | "code", phone?: string) =>
+    post<{ status: PluginChannelStatus }>(`/api/plugins/${encodeURIComponent(id)}/pair`, { method, phone }),
+  unlink: (id: string) => post<{ ok: boolean }>(`/api/plugins/${encodeURIComponent(id)}/unlink`, {}),
 };
 
 // ── Permissions ──
@@ -265,6 +384,10 @@ export const usage = {
 };
 
 // ── Schedules ──
+export const mcp = {
+  list: () => get<{ available: boolean; servers: McpServer[] }>("/api/mcp"),
+};
+
 export const schedules = {
   list: () => get<{ schedules: Schedule[]; total: number }>("/api/schedules"),
   update: (id: string, data: Partial<Schedule>) =>
@@ -423,6 +546,7 @@ export interface AppConfig {
 
 export interface ProviderInfo {
   name: string;
+  recommended?: boolean;
   maskedKey: string;
   baseUrl: string;
   model: string;
@@ -469,9 +593,25 @@ export interface ToolStep {
   result?: string;
 }
 
+export type ReasoningLevel = "off" | "low" | "medium" | "high";
+export type ReasoningChoice = ReasoningLevel | "auto";
+
+/** Plain-language view of a model (see src/utils/model-prefs.ts). */
+export interface ModelDescription {
+  /** Custom label if set, else the generated friendly name. */
+  label: string;
+  autoLabel: string;
+  customLabel: string | null;
+  /** Heading the model is grouped under, e.g. "ChatGPT". */
+  group: string;
+  reasoning: ReasoningChoice;
+  /** Levels this provider honours; empty means no reasoning control. */
+  reasoningLevels: ReasoningLevel[];
+}
+
 export interface ModelsResponse {
-  current: string;
-  providers: { name: string; model: string; available: boolean }[];
+  current: { name: string; model: string } & ModelDescription;
+  providers: ({ name: string; model: string; available: boolean; isCurrent?: boolean } & ModelDescription)[];
 }
 
 export interface CodeStatus {
@@ -575,6 +715,37 @@ export interface MemoryCreate {
   durability?: string;
 }
 
+export type BeliefStatus = "candidate" | "held" | "confirmed" | "contested" | "retired" | "forgotten";
+
+export interface Belief {
+  id: string;
+  kind: string;
+  dimension: string | null;
+  level: string | null;
+  statement: string;
+  detail: string | null;
+  context: string;
+  support: number;
+  against: number;
+  status: BeliefStatus;
+  ownerStated: boolean;
+  confidence: number;
+  lastSupportedAt: number;
+  createdAt: number;
+  updatedAt: number;
+  evidence?: BeliefEvidence[];
+}
+
+export interface BeliefEvidence {
+  id: string;
+  kind: string;
+  excerpt: string;
+  weight: number;
+  at: number;
+}
+
+export type BeliefCounts = Record<BeliefStatus, number>;
+
 export interface Person {
   id: string;
   name: string;
@@ -631,6 +802,102 @@ export interface BgTask {
   completedAt?: string;
 }
 
+// ── Mercury Bots ──
+export interface BotStatus {
+  id: string;
+  name: string;
+  enabled: boolean;
+  state: "disabled" | "idle" | "queued" | "running" | "paused";
+  activity?: string;
+  lastRunAt?: number;
+  lastRunState?: string;
+  needsYou: boolean;
+  fleetRole?: "lead" | "crew";
+  parent?: string;
+  crewWorking?: number;
+}
+
+export interface BotManifest {
+  id: string;
+  name: string;
+  description?: string;
+  enabled: boolean;
+  fleetRole?: "lead" | "crew";
+  parent?: string;
+  model?: { provider?: string; model?: string };
+  memory?: { scope: string };
+  comms?: { canMessage?: string[] };
+  schedules?: Array<{ name: string; cron: string; prompt: string }>;
+  autonomy?: { maxSteps?: number; dailyTokenBudget?: number };
+}
+
+export interface BotRunRecord {
+  runId: string;
+  botId: string;
+  trigger: string;
+  state: string;
+  startedAt: number;
+  durationMs: number;
+  tokensIn: number;
+  tokensOut: number;
+  summary?: string;
+  error?: string;
+  reasonCode?: string;
+}
+
+export interface BotDlqEntry {
+  id: string;
+  botId: string;
+  trigger: string;
+  prompt: string;
+  attempts: number;
+  reasonCode?: string;
+}
+
+export interface BotActivityEvent {
+  botId: string;
+  jobId: string;
+  kind: "turn-start" | "step" | "tool" | "turn-end";
+  label: string;
+  detail?: string;
+  stepIndex: number;
+  elapsedMs: number;
+  status?: "running" | "done" | "error";
+}
+
+export interface DeliverableInfo {
+  botId: string;
+  /** File name; stage work carries a `work/` prefix. */
+  name: string;
+  bytes: number;
+  mtimeMs: number;
+  /** Absolute path on the owner's machine. */
+  path: string;
+  /** A finished result at the top of the folder (vs. a stage under work/). */
+  final: boolean;
+}
+
+export interface DeliverablesFolder {
+  path: string;
+  display: string;
+  exists: boolean;
+}
+
+export interface BotTierInfo {
+  id: string;
+  label: string;
+  description: string;
+  deny: string[];
+}
+
+export interface BotPermissionsFile {
+  paths?: Array<{ scope: string; mode?: string; note?: string }>;
+  tools?: { allow?: string[]; deny?: string[] };
+  autoApproveCommands?: string[];
+  blockedCommands?: string[];
+  [key: string]: unknown;
+}
+
 export interface Skill {
   name: string;
   path: string;
@@ -658,6 +925,25 @@ export interface UsageData {
   }[];
   byProvider: Record<string, number>;
   byChannel: Record<string, number>;
+}
+
+export interface McpTool {
+  name: string;
+  exposedName: string;
+  allowed: boolean;
+  autoApprove: boolean;
+  skipped: string | null;
+}
+
+export interface McpServer {
+  id: string;
+  transport: "stdio" | "http";
+  enabled: boolean;
+  state: "disabled" | "connecting" | "connected" | "reconnecting" | "failed";
+  target: string;
+  error: string | null;
+  toolCount: number;
+  tools: McpTool[];
 }
 
 export interface Schedule {
@@ -779,11 +1065,57 @@ const api = {
   agents,
   bgTasks,
   skills,
+  plugins,
   permissions,
   usage,
   schedules,
+  mcp,
   spotify,
   boards,
+  bots: {
+    list: () => get<{ bots: BotStatus[]; available: boolean }>("/api/bots"),
+    get: (id: string) =>
+      get<{ bot: BotManifest; state: BotStatus | null; journal: BotRunRecord[]; inbox: unknown[] }>(`/api/bots/${id}`),
+    create: (body: { id: string; name: string; description?: string }) =>
+      post<{ bot: BotManifest }>("/api/bots", body),
+    message: (id: string, message: string) =>
+      post<{ accepted: boolean; jobId?: string; reasonCode?: string }>(`/api/bots/${id}/message`, { message }),
+    patch: (id: string, body: Partial<BotManifest>) => patch<unknown>(`/api/bots/${id}`, body),
+    enable: (id: string) => post<{ ok: boolean }>(`/api/bots/${id}/enable`),
+    disable: (id: string) => post<{ ok: boolean }>(`/api/bots/${id}/disable`),
+    stop: (id: string) => post<{ ok: boolean }>(`/api/bots/${id}/stop`),
+    dlq: (id: string) => get<{ dlq: BotDlqEntry[] }>(`/api/bots/${id}/dlq`),
+    replay: (id: string, jobId: string) => post<{ accepted: boolean }>(`/api/bots/${id}/replay/${jobId}`),
+    storage: () =>
+      get<{ usage: Array<{ id: string; bytes: number; journalBytes: number }>; queue: { pending: number; claimed: number; dlq: number } }>("/api/bots-storage"),
+    // ── Cockpit additions ──
+    tiers: () => get<{ tiers: BotTierInfo[] }>("/api/bots/tiers"),
+    createFull: (body: { id: string; name: string; description?: string; persona?: string; tier: string; manifest?: Partial<BotManifest> }) =>
+      post<{ bot: BotManifest }>("/api/bots", body),
+    addCrewFull: (leadId: string, body: { id: string; name: string; description?: string; persona?: string; tier?: string }) =>
+      post<{ bot: BotManifest }>(`/api/bots/${leadId}/crew`, body),
+    promote: (id: string) => post<{ ok: boolean; message: string }>(`/api/bots/${id}/promote`),
+    autocrew: (id: string) => post<{ accepted: boolean; status: string }>(`/api/bots/${id}/autocrew`),
+    crew: (id: string) =>
+      get<{ lead: BotManifest; crew: BotManifest[]; maxCrew: number }>(`/api/bots/${id}/crew`),
+    persona: (id: string) => get<{ persona: string }>(`/api/bots/${id}/persona`),
+    setPersona: (id: string, persona: string) => put<{ ok: boolean }>(`/api/bots/${id}/persona`, { persona }),
+    permissions: (id: string) => get<{ permissions: BotPermissionsFile }>(`/api/bots/${id}/permissions`),
+    setPermissions: (id: string, body: { tier?: string; permissions?: BotPermissionsFile }) =>
+      put<{ permissions: BotPermissionsFile }>(`/api/bots/${id}/permissions`, body),
+    start: (id: string) => post<{ ok: boolean; resumed: number; message: string }>(`/api/bots/${id}/start`),
+    run: (id: string, routine?: string) => post<{ accepted: boolean; jobId?: string; reasonCode?: string }>(`/api/bots/${id}/run`, { routine }),
+    folder: (id?: string) => get<DeliverablesFolder>(id ? `/api/bots/${id}/folder` : "/api/bots/folder"),
+    openFolder: (id?: string) => post<{ ok: boolean; path: string }>(id ? `/api/bots/${id}/folder/open` : "/api/bots/folder/open"),
+    outputs: () => get<{ outputs: DeliverableInfo[] }>("/api/bots/outputs"),
+    botOutputs: (id: string) => get<{ outputs: DeliverableInfo[] }>(`/api/bots/${id}/outputs`),
+    outputPreview: (id: string, name: string) =>
+      get<{ preview: string; truncated: boolean }>(`/api/bots/${id}/outputs/${encodeURIComponent(name)}/preview`),
+    outputDownloadUrl: (id: string, name: string) => `/api/bots/${id}/outputs/${encodeURIComponent(name)}/download`,
+    deleteOutput: (id: string, name: string) => del<{ ok: boolean }>(`/api/bots/${id}/outputs/${encodeURIComponent(name)}`),
+    bundleUrl: (id: string) => `/api/bots/${id}/bundle`,
+    importBundle: (bundle: unknown) => post<{ report: { created: string[]; skipped: string[] } }>("/api/bots/import?overwrite=0", bundle),
+  },
 };
 
 export default api;

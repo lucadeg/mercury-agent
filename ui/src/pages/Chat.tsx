@@ -110,16 +110,29 @@ function WaitingIndicator() {
 function PermissionPrompt({
   data,
 }: {
-  data: { id: string; tool?: string; description?: string };
+  data: {
+    id: string;
+    tool?: string;
+    description?: string;
+    prompt?: string;
+    options?: string[];
+    targetId?: string;
+  };
 }) {
   const [resolving, setResolving] = useState(false);
+  const [outcome, setOutcome] = useState<string | null>(null);
+
+  // The server offers yes / always / no (see WebChannel.askPermission).
+  const options = data.options?.length ? data.options : ["yes", "always", "no"];
+  const labels: Record<string, string> = { yes: "Allow", always: "Always allow", no: "Deny" };
 
   async function handle(action: string) {
     setResolving(true);
     try {
-      await api.chat.permission(data.id, action);
+      const res = await api.chat.permission(data.id, action, data.targetId);
+      setOutcome(res.resolved ? labels[action] ?? action : "expired");
     } catch {
-      // ignore
+      setOutcome("expired");
     } finally {
       setResolving(false);
     }
@@ -137,34 +150,38 @@ function PermissionPrompt({
             Tool: <span className="font-medium text-foreground">{data.tool}</span>
           </p>
         )}
-        {data.description && (
-          <p className="mt-1 text-sm text-foreground">{data.description}</p>
+        {(data.description || data.prompt) && (
+          <p className="mt-1 whitespace-pre-wrap text-sm text-foreground">
+            {data.description ?? data.prompt}
+          </p>
         )}
-        <div className="mt-3 flex items-center gap-2">
-          <Button
-            size="sm"
-            className="h-7 gap-1 text-xs"
-            disabled={resolving}
-            onClick={() => handle("allow")}
-          >
-            {resolving ? (
-              <Loader2 className="h-3 w-3 animate-spin" />
-            ) : (
-              <Check className="h-3 w-3" />
-            )}
-            Allow
-          </Button>
-          <Button
-            size="sm"
-            variant="outline"
-            className="h-7 gap-1 text-xs"
-            disabled={resolving}
-            onClick={() => handle("deny")}
-          >
-            <X className="h-3 w-3" />
-            Deny
-          </Button>
-        </div>
+        {outcome ? (
+          <p className="mt-3 text-xs text-muted-foreground">
+            {outcome === "expired" ? "This request expired or was already answered." : `Answered: ${outcome}`}
+          </p>
+        ) : (
+          <div className="mt-3 flex items-center gap-2">
+            {options.map((opt) => (
+              <Button
+                key={opt}
+                size="sm"
+                variant={opt === "no" ? "outline" : "default"}
+                className="h-7 gap-1 text-xs"
+                disabled={resolving}
+                onClick={() => handle(opt)}
+              >
+                {resolving ? (
+                  <Loader2 className="h-3 w-3 animate-spin" />
+                ) : opt === "no" ? (
+                  <X className="h-3 w-3" />
+                ) : (
+                  <Check className="h-3 w-3" />
+                )}
+                {labels[opt] ?? opt}
+              </Button>
+            ))}
+          </div>
+        )}
       </div>
     </div>
   );
@@ -411,6 +428,10 @@ function ChatInput({
 
 // ─── Main Page ───────────────────────────────────────────────
 
+function newWebThreadId(): string {
+  return `web:${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+}
+
 export function ChatPage() {
   const { threadId: urlThreadId } = useParams<{ threadId?: string }>();
   const navigate = useNavigate();
@@ -436,9 +457,13 @@ export function ChatPage() {
   const resetSteps = useChatStore((s) => s.resetSteps);
   const bumpThreadVersion = useChatStore((s) => s.bumpThreadVersion);
 
-  // Sync URL param → active thread
+  // Sync URL param → active thread. Bare /chat starts a fresh conversation:
+  // it renders empty, so silently reusing the stored thread id appended new
+  // messages to the previous conversation.
   useEffect(() => {
-    if (urlThreadId && urlThreadId !== activeThreadId) {
+    if (!urlThreadId) {
+      handleNewThread(true);
+    } else if (urlThreadId !== activeThreadId) {
       setActiveThread(urlThreadId);
     }
   }, [urlThreadId]); // eslint-disable-line react-hooks/exhaustive-deps
@@ -476,7 +501,8 @@ export function ChatPage() {
     // Ensure we have a thread ID — create one if needed
     let threadId = activeThreadId;
     if (!threadId) {
-      threadId = `web:${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+      const thread = await api.chat.threads.create();
+      threadId = thread.id;
       setActiveThread(threadId);
     }
 
@@ -491,13 +517,16 @@ export function ChatPage() {
     // Immediately show waiting state
     setWaiting(true);
 
-    // Persist user message to backend thread
-    api.chat.threads.addMessage(threadId, "user", content)
-      .then(() => bumpThreadVersion())
-      .catch(() => {});
-
     try {
-      await api.chat.send(content, threadId);
+      const res = await api.chat.send(content, threadId);
+      // A client-made "web:..." id is rebound to a server session id. Follow
+      // it, or the SSE stream stays on the old id and never receives this
+      // turn's replies or permission prompts.
+      if (res.sessionId && res.sessionId !== threadId) {
+        setActiveThread(res.sessionId);
+        navigate(`/chat/${res.sessionId}`, { replace: true });
+      }
+      bumpThreadVersion();
       // Reload threads in background to pick up new thread
       reloadThreads();
     } catch {
@@ -526,12 +555,12 @@ export function ChatPage() {
     }
   }
 
-  function handleNewThread() {
-    const newId = `web:${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  function handleNewThread(replace = false) {
+    const newId = newWebThreadId();
     setActiveThread(newId);
     clearMessages();
     reloadThreads();
-    navigate(`/chat/${newId}`);
+    navigate(`/chat/${newId}`, { replace });
   }
 
   function handleSelectThread(id: string) {
@@ -574,7 +603,7 @@ export function ChatPage() {
             activeThreadId={activeThreadId}
             onSelect={handleSelectThread}
             onDelete={handleDeleteThread}
-            onNew={handleNewThread}
+            onNew={() => handleNewThread()}
             onExport={handleExportThread}
           />
         </div>
@@ -706,7 +735,7 @@ export function ChatPage() {
                     if (msg.role === "system") {
                       try {
                         const parsed = JSON.parse(msg.content);
-                        if (parsed.id && (parsed.tool || parsed.description)) {
+                        if (parsed.id && (parsed.tool || parsed.description || parsed.prompt)) {
                           return <PermissionPrompt key={msg.id} data={parsed} />;
                         }
                       } catch {

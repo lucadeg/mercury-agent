@@ -19,11 +19,113 @@ export function getCategoryLabel(category: string): string {
   return CATEGORY_LABELS[category] || category.charAt(0).toUpperCase() + category.slice(1);
 }
 
-export const DEFAULT_SKILL_SEEDS: DefaultSkillSeed[] = [
-  {
-    dirName: 'web-search',
-    fileName: 'SKILL.md',
-    content: `---
+/**
+ * Earlier contents of built-in skills. A user's copy that still matches one
+ * exactly was never edited, so it is upgraded to the current seed.
+ */
+export const PREVIOUS_SEED_CONTENTS: Record<string, string[]> = {
+  'web-search': [`---
+name: web-search
+description: Search the web and the news with the web_search tool, read the best sources, and answer with links.
+version: 1.2.0
+category: web
+categories:
+  - web
+  - research
+intents:
+  - search the web
+  - look up
+  - find online
+  - what is
+  - current news
+  - search for
+  - find information about
+  - research
+  - web search
+  - latest news
+  - what's happening
+tags:
+  - search
+  - web
+  - research
+  - news
+allowed-tools:
+  - web_search
+  - fetch_url
+---
+
+# Web Search
+
+Use this skill when the user asks for current events, external facts, or web research.
+
+## Workflow
+
+1. Call web_search with a focused query of a few key words (names, product, place, year).
+   For news and recent events use kind "news" (an empty query gives today's top stories).
+2. Open the most relevant one to three results with fetch_url when the snippets aren't enough.
+3. Nothing useful? Rephrase once (synonyms, the official name, fewer words) and search again
+   before saying you could not find it.
+4. Cross-check key facts across at least 2 sources when possible.
+5. Return a concise answer with source links and clear caveats.
+
+## Rules
+
+- Prefer reliable sources (official docs, primary sources, reputable publications).
+- If information is uncertain or conflicting, say so explicitly.
+- Include source URLs in the response (on phone chats, keep it to the one or two that matter).
+- Avoid fabricated citations.
+- Never fetch a search engine's results page (DuckDuckGo, Google, Bing) with fetch_url: they block
+  automated reads. web_search already tries several free engines (Brave, Wikipedia, Hacker News,
+  news feeds) and keeps only results that match the query.
+`, `---
+name: web-search
+description: Search the web and the news with the web_search tool, read the best sources, and answer with links.
+version: 1.1.0
+category: web
+categories:
+  - web
+  - research
+intents:
+  - search the web
+  - look up
+  - find online
+  - what is
+  - current news
+  - search for
+  - find information about
+  - research
+  - web search
+  - latest news
+  - what's happening
+tags:
+  - search
+  - web
+  - research
+  - news
+allowed-tools:
+  - web_search
+  - fetch_url
+---
+
+# Web Search
+
+Use this skill when the user asks for current events, external facts, or web research.
+
+## Workflow
+
+1. Call web_search with a focused query. For news and recent events use kind "news"
+   (an empty query gives today's top stories).
+2. Open the most relevant one to three results with fetch_url when the snippets aren't enough.
+3. Cross-check key facts across at least 2 sources when possible.
+4. Return a concise answer with source links and clear caveats.
+
+## Rules
+
+- Prefer reliable sources (official docs, primary sources, reputable publications).
+- If information is uncertain or conflicting, say so explicitly.
+- Include source URLs in the response (on phone chats, keep it to the one or two that matter).
+- Avoid fabricated citations.
+`, `---
 name: web-search
 description: Perform web searches using DuckDuckGo HTML and summarize sources.
 version: 1.0.0
@@ -69,6 +171,81 @@ Use this skill when the user asks for current events, external facts, or web res
 - If information is uncertain or conflicting, say so explicitly.
 - Include source URLs in the response.
 - Avoid fabricated citations.
+`],
+};
+
+export const DEFAULT_SKILL_SEEDS: DefaultSkillSeed[] = [
+  {
+    dirName: 'web-search',
+    fileName: 'SKILL.md',
+    content: `---
+name: web-search
+description: Search the web and the news with the web_search tool, read the best sources, and answer with links.
+version: 1.3.0
+category: web
+categories:
+  - web
+  - research
+intents:
+  - search the web
+  - look up
+  - find online
+  - what is
+  - current news
+  - search for
+  - find information about
+  - research
+  - web search
+  - latest news
+  - what's happening
+tags:
+  - search
+  - web
+  - research
+  - news
+allowed-tools:
+  - web_search
+  - fetch_url
+---
+
+# Web Search
+
+Use this skill when the user asks for current events, external facts, or web research.
+
+## Workflow
+
+1. Call web_search with a focused query of a few key words (names, product, place, year).
+   For news and recent events use kind "news" (an empty query gives today's top stories).
+2. Open the most relevant one to three results with fetch_url when the snippets aren't enough.
+3. Nothing useful? Rephrase once (synonyms, the official name, fewer words) and search again
+   before saying you could not find it.
+4. Cross-check key facts across at least 2 sources when possible.
+5. Return a concise answer with source links and clear caveats.
+
+## Rules
+
+- Prefer reliable sources (official docs, primary sources, reputable publications).
+- If information is uncertain or conflicting, say so explicitly.
+- Include source URLs in the response (on phone chats, keep it to the one or two that matter).
+- Avoid fabricated citations.
+- Never fetch a search engine's results page (DuckDuckGo, Google, Bing) with fetch_url: they block
+  automated reads. web_search already does it properly.
+
+## Where results come from
+
+web_search needs no key and works with any model. For web searches it asks, in order:
+
+1. Parallel search (search.parallel.ai), a search index built for agents, with excerpts and dates.
+2. DuckDuckGo's html page.
+3. DuckDuckGo's lite page.
+
+News searches ask Parallel (article links only), then Bing News, Google News and Hacker News.
+Only results that mention the query are kept, and sources are combined until there are enough.
+
+Every result ends with a "Searched:" trail, for example
+"Parallel: timed out → DuckDuckGo: 8 results". If web_search returns an error, every source failed:
+tell the user which ones and why (blocked, timed out, no results) instead of guessing an answer,
+then try one shorter or rephrased query.
 `,
   },
   {
@@ -203,6 +380,128 @@ Store each tweet as a memory with:
 - Detail: \`{"content": "full tweet text", "scheduledAt": "ISO time", "status": "draft|scheduled|pending_approval|approved|posted|cancelled", "id": "unique-id"}\`
 - Confidence: 0.95
 - Importance: 0.8
+`,
+  },
+  {
+    dirName: 'screenshot',
+    fileName: 'SKILL.md',
+    content: `---
+name: screenshot
+description: Take full-page screenshots of any website with configurable viewport and color scheme (dark/light mode).
+version: 1.0.0
+category: media
+categories:
+  - media
+  - web
+  - productivity
+intents:
+  - take a screenshot
+  - screenshot
+  - capture website
+  - screenshot website
+  - web screenshot
+  - capture page
+  - screenshot of
+  - take screenshot of
+  - mobile screenshot
+  - desktop screenshot
+  - dark mode screenshot
+  - light mode screenshot
+tags:
+  - screenshot
+  - website
+  - capture
+  - playwright
+  - browser
+  - viewport
+  - dark mode
+  - light mode
+allowed-tools:
+  - run_command
+  - create_file
+  - write_file
+  - send_file
+  - cd
+  - send_message
+---
+
+# Screenshot
+
+Take full-page screenshots of any website with Playwright. Supports configurable viewport dimensions and dark/light display modes.
+
+## Prerequisites
+
+Playwright and Chromium are already installed globally on this system. The skill will create and run a temporary Node.js script to handle each screenshot request.
+
+## Workflow
+
+When the user asks for a screenshot:
+
+1. **Ask for the URL** if not provided — ensure it includes the protocol (https://).
+2. **Ask for viewport / dimensions** if not specified:
+   - \`mobile\` — iPhone-like viewport (375 × 812)
+   - \`desktop\` — Standard desktop viewport (1280 × 800)
+   - \`custom\` — Ask for specific width × height in pixels
+   - Default: desktop (1280 × 800)
+3. **Ask for display mode** if not specified:
+   - \`light\` — Light color scheme
+   - \`dark\` — Dark color scheme (emulates prefers-color-scheme: dark)
+   - Default: light
+4. **Generate a unique filename** — use the domain and a timestamp (e.g., \`example.com-2025-05-30-14-30-00.png\`). Store in \`~/Desktop/\` for easy access.
+5. **Create a temporary Playwright script** using \`create_file\` or \`write_file\`, then execute it with \`run_command\`.
+
+## Playwright Script Template
+
+Use this exact template, substituting the user's parameters:
+
+\`\`\`javascript
+import { chromium } from 'playwright';
+
+const url = '{{URL}}';
+const outputPath = '{{OUTPUT_PATH}}';
+const width = {{WIDTH}};
+const height = {{HEIGHT}};
+const colorScheme = '{{COLOR_SCHEME}}'; // 'light' or 'dark'
+
+const browser = await chromium.launch({ headless: true });
+const context = await browser.newContext({
+  viewport: { width, height },
+  colorScheme,
+});
+const page = await context.newPage();
+await page.goto(url, { waitUntil: 'networkidle', timeout: 30000 });
+await page.screenshot({ path: outputPath, fullPage: true });
+await browser.close();
+console.log('Screenshot saved to:', outputPath);
+\`\`\`
+
+### Dark Mode Details
+
+To emulate dark mode, set \`colorScheme: 'dark'\` in the browser context options. This triggers \`prefers-color-scheme: dark\` media queries on the target website.
+
+## Preset Viewport Dimensions
+
+| Preset | Width | Height | Notes |
+|---|---|---|---|
+| Mobile | 375 | 812 | iPhone X/11/12/13/14 proportions |
+| Mobile Small | 320 | 568 | iPhone SE |
+| Mobile Large | 414 | 896 | iPhone Plus/Pro Max |
+| Tablet | 768 | 1024 | iPad portrait |
+| Desktop (default) | 1280 | 800 | Standard laptop |
+| Desktop Wide | 1440 | 900 | Standard desktop |
+| Desktop HD | 1920 | 1080 | Full HD |
+
+## Output
+
+- Screenshots are saved as PNG files to \`~/Desktop/\` with the naming pattern: \`<domain>-<YYYY-MM-DD-HH-MM-SS>.png\`
+- After the screenshot is taken, use \`send_file\` to deliver the image to the user.
+- If the user is on Telegram, the image will be sent as a photo attachment.
+
+## Error Handling
+
+- If the page fails to load (timeout, DNS error, etc.), retry once with \`waitUntil: 'domcontentloaded'\` instead of \`networkidle\`.
+- If Playwright encounters an installation issue, run \`npx playwright install chromium\` and retry.
+- Inform the user if a site blocks automated screenshots (e.g., CAPTCHA, bot detection).
 `,
   },
 ];

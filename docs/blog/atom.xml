@@ -1,0 +1,132 @@
+<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+    <id>https://mercuryagent.sh/blog</id>
+    <title>Mercury Blog</title>
+    <updated>2026-10-24T00:00:00.000Z</updated>
+    <generator>https://github.com/jpmonette/feed</generator>
+    <link rel="alternate" href="https://mercuryagent.sh/blog"/>
+    <subtitle>News, engineering notes and field reports from the team building Mercury.</subtitle>
+    <icon>https://mercuryagent.sh/img/logo-light.png</icon>
+    <rights>© 2026 Cosmic Stack</rights>
+    <entry>
+        <title type="html"><![CDATA[How Optimus works: an agent that uses your computer]]></title>
+        <id>https://mercuryagent.sh/blog/how-optimus-works</id>
+        <link href="https://mercuryagent.sh/blog/how-optimus-works"/>
+        <updated>2026-10-24T00:00:00.000Z</updated>
+        <summary type="html"><![CDATA[Inside Optimus, the Mercury plugin that sees your screen, moves the mouse and types: its processes, how it looks and acts, voice control, and the safety rails.]]></summary>
+        <author>
+            <name>Salman Qureshi</name>
+            <uri>https://github.com/hotheadhacker</uri>
+        </author>
+        <category label="Engineering" term="Engineering"/>
+        <category label="Product" term="Product"/>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[Mercury 1.4: plugins, WhatsApp calls, and an agent at your desk]]></title>
+        <id>https://mercuryagent.sh/blog/mercury-1-4</id>
+        <link href="https://mercuryagent.sh/blog/mercury-1-4"/>
+        <updated>2026-10-23T00:00:00.000Z</updated>
+        <summary type="html"><![CDATA[Mercury 1.4 adds isolated plugins and two official ones: WhatsApp chat with voice calls both ways, and Optimus, which sees your screen and uses your mouse.]]></summary>
+        <author>
+            <name>Salman Qureshi</name>
+            <uri>https://github.com/hotheadhacker</uri>
+        </author>
+        <category label="News" term="News"/>
+        <category label="Releases" term="Releases"/>
+        <category label="Product" term="Product"/>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[The new bottleneck in AI coding isn't code generation. It's verification.]]></title>
+        <id>https://mercuryagent.sh/blog/ai-coding-verification-bottleneck</id>
+        <link href="https://mercuryagent.sh/blog/ai-coding-verification-bottleneck"/>
+        <updated>2026-10-20T00:00:00.000Z</updated>
+        <summary type="html"><![CDATA[A Harvard working paper finds coding agents raised code output while review time rose 49%. Why verification, not generation, should decide whether an agent is useful.]]></summary>
+        <author>
+            <name>tashiriskhan</name>
+            <uri>https://github.com/tashiriskhan</uri>
+        </author>
+        <category label="Engineering" term="Engineering"/>
+        <category label="News" term="News"/>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[Agents exceeded their permissions: how to scope them]]></title>
+        <id>https://mercuryagent.sh/blog/agent-permissions-least-privilege</id>
+        <link href="https://mercuryagent.sh/blog/agent-permissions-least-privilege"/>
+        <updated>2026-10-17T00:00:00.000Z</updated>
+        <summary type="html"><![CDATA[CERT-In says AI agents read live business records at Indian firms. Here is how least privilege, scoped access, approvals and audit logs should limit them.]]></summary>
+        <author>
+            <name>tashiriskhan</name>
+            <uri>https://github.com/tashiriskhan</uri>
+        </author>
+        <category label="Security" term="Security"/>
+        <category label="News" term="News"/>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[Mercury Bots: an agent fleet that runs on your machine]]></title>
+        <id>https://mercuryagent.sh/blog/mercury-bots</id>
+        <link href="https://mercuryagent.sh/blog/mercury-bots"/>
+        <updated>2026-10-16T00:00:00.000Z</updated>
+        <summary type="html"><![CDATA[Always-on agents shipped everywhere this autumn. How Mercury Bots work, what we measured, how they compare with Grok Bot, OpenAI dots, Meta Muse, OpenClaw and Hermes Agent, and the commits behind it.]]></summary>
+        <author>
+            <name>Salman Qureshi</name>
+            <uri>https://github.com/hotheadhacker</uri>
+        </author>
+        <category label="Product" term="Product"/>
+        <category label="Engineering" term="Engineering"/>
+        <category label="Runtime" term="Runtime"/>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[The setup wizard that quit at the first menu]]></title>
+        <id>https://mercuryagent.sh/blog/the-wizard-that-quit-at-the-menu</id>
+        <link href="https://mercuryagent.sh/blog/the-wizard-that-quit-at-the-menu"/>
+        <updated>2026-10-15T00:00:00.000Z</updated>
+        <summary type="html"><![CDATA[For six releases, a brand-new Mercury install asked for your name, showed one menu, and exited without an error. A walkthrough of a one-tick race between two readers of the same terminal, and the test that now keeps it from coming back.]]></summary>
+        <author>
+            <name>Mercury Engineering</name>
+            <uri>https://github.com/cosmicstack-labs/mercury-agent</uri>
+        </author>
+        <category label="Engineering" term="Engineering"/>
+        <category label="Postmortem" term="Postmortem"/>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[We were running Mercury twice and didn't know it]]></title>
+        <id>https://mercuryagent.sh/blog/we-were-running-mercury-twice</id>
+        <link href="https://mercuryagent.sh/blog/we-were-running-mercury-twice"/>
+        <updated>2026-10-14T00:00:00.000Z</updated>
+        <summary type="html"><![CDATA[Typing felt sluggish on every machine, and the terminal renderer took the blame. The real cause was a second full copy of the agent, started quietly by the launcher. How we found it, and why the fix was an architecture change rather than a performance tweak.]]></summary>
+        <author>
+            <name>Salman Qureshi</name>
+            <uri>https://github.com/hotheadhacker</uri>
+        </author>
+        <category label="Engineering" term="Engineering"/>
+        <category label="Postmortem" term="Postmortem"/>
+        <category label="Runtime" term="Runtime"/>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[Mercury 1.3: an agent you can actually leave running]]></title>
+        <id>https://mercuryagent.sh/blog/mercury-1-3</id>
+        <link href="https://mercuryagent.sh/blog/mercury-1-3"/>
+        <updated>2026-10-12T00:00:00.000Z</updated>
+        <summary type="html"><![CDATA[One background runtime that every terminal attaches to, bots that deliver real files and stay online, and a fleet you can run from Telegram. What changed in the 1.3 line and why.]]></summary>
+        <author>
+            <name>Salman Qureshi</name>
+            <uri>https://github.com/hotheadhacker</uri>
+        </author>
+        <category label="News" term="News"/>
+        <category label="Releases" term="Releases"/>
+        <category label="Runtime" term="Runtime"/>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[Asks before it acts: how Mercury's permission model works]]></title>
+        <id>https://mercuryagent.sh/blog/asks-before-it-acts</id>
+        <link href="https://mercuryagent.sh/blog/asks-before-it-acts"/>
+        <updated>2026-10-09T00:00:00.000Z</updated>
+        <summary type="html"><![CDATA[An agent with a shell, a file system and network access is only useful if you can trust what it will do with them. A tour of the layers between the model and your machine: scopes, approvals, a blocklist nothing can override, an SSRF guard, and tiers for unattended bots.]]></summary>
+        <author>
+            <name>Mercury Engineering</name>
+            <uri>https://github.com/cosmicstack-labs/mercury-agent</uri>
+        </author>
+        <category label="Product" term="Product"/>
+        <category label="Security" term="Security"/>
+    </entry>
+</feed>

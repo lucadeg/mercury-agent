@@ -1,4 +1,5 @@
 import { Hono } from 'hono';
+import { isBunVirtualPath } from '../utils/bun-path.js';
 import { createAdaptorServer } from '@hono/node-server';
 import { readFileSync, existsSync, readdirSync, statSync } from 'node:fs';
 import { join, dirname, extname } from 'node:path';
@@ -12,19 +13,42 @@ import providerRoutes from './api/providers.js';
 import configRoutes from './api/config.js';
 import systemRoutes, { setScheduler } from './api/system.js';
 import brainRoutes, { setUserMemory } from './api/brain.js';
-import chatRoutes, { setWebChannel, setProgrammingMode, setModelSwitchCallback, setCurrentProviderCallback } from './api/chat.js';
+import chatRoutes, { setWebChannel, setProgrammingMode, setModelSwitchCallback, setCurrentProviderCallback, setStatusSnapshotCallback, setSessionRepository, setSessionSyncEnabledCallback } from './api/chat.js';
 import agentRoutes, { setAgentSupervisor, setBackgroundTaskManager } from './api/agents.js';
+import botsRoutes, { setBotManager, setBotsWebhookSecret } from './api/bots.js';
 import spotifyRoutes, { setSpotifyClient } from './api/spotify.js';
 import kanbanRoutes, { setKanbanSupervisor, setKanbanBoardManager, setKanbanProviders } from './api/kanban.js';
 import ideRoutes, { setIDEProviders } from './api/workspace-ide.js';
+import lifecycleRoutes, { setShutdownHandler } from './api/lifecycle.js';
+import mcpRoutes, { setMcpManager } from './api/mcp.js';
+import pluginRoutes from './api/plugins.js';
 import { BoardManager } from '../core/board-manager.js';
 import { isBetterSqlite3Available } from '../memory/second-brain-db.js';
+
+export { setSessionRepository };
+export { setSessionSyncEnabledCallback };
 
 const app = new Hono();
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const staticDir = process.env.MERCURY_WEB_STATIC || join(__dirname, 'web', 'static');
-const uiDir = process.env.MERCURY_UI_DIR || join(__dirname, 'web', 'ui');
+
+function resolveWebDir(subpath: string): string {
+  const envVar = subpath === 'static' ? process.env.MERCURY_WEB_STATIC : process.env.MERCURY_UI_DIR;
+  if (envVar) return envVar;
+
+  // When running as a Bun --compile standalone binary, __dirname points to
+  // Bun's virtual filesystem ($bunfs).  The web assets are shipped alongside
+  // the binary in a `web/` directory, so resolve relative to the binary itself.
+  // On Windows the virtual root is `B:\~BUN\root` rather than `$bunfs`.
+  if (isBunVirtualPath(__dirname)) {
+    return join(dirname(process.execPath), 'web', subpath);
+  }
+
+  return join(__dirname, 'web', subpath);
+}
+
+const staticDir = resolveWebDir('static');
+const uiDir = resolveWebDir('ui');
 
 const MIME_TYPES: Record<string, string> = {
   css: 'text/css',
@@ -56,9 +80,13 @@ app.route('/', systemRoutes);
 app.route('/', brainRoutes);
 app.route('/', chatRoutes);
 app.route('/', agentRoutes);
+app.route('/', botsRoutes);
 app.route('/', spotifyRoutes);
 app.route('/', kanbanRoutes);
 app.route('/', ideRoutes);
+app.route('/', lifecycleRoutes);
+app.route('/', mcpRoutes);
+app.route('/', pluginRoutes);
 
 // ── Legacy static assets (vendor fonts, icons, wasm — still needed by React SPA) ──
 app.get('/vendor/*', (c) => {
@@ -169,11 +197,12 @@ if (spaAvailable) {
   // React SPA not built — return helpful message for all routes
   app.get('*', (c) => {
     if (c.req.path.startsWith('/api/')) return c.notFound();
-    return c.text('Mercury React UI not built. Run: cd ui && npm install && npm run build', 500);
+    return c.text('Mercury web UI not found. If running from source, run: npm run build\nIf running a standalone binary, ensure the web/ directory is next to the binary.', 500);
   });
 }
 
-export { updateStatus, setUserMemory, setWebChannel, setScheduler, setAgentSupervisor, setBackgroundTaskManager, setSpotifyClient, setProgrammingMode, setModelSwitchCallback, setCurrentProviderCallback, setKanbanSupervisor, setKanbanBoardManager, setKanbanProviders, setIDEProviders };
+export { setShutdownHandler, setMcpManager };
+export { updateStatus, setUserMemory, setWebChannel, setScheduler, setAgentSupervisor, setBackgroundTaskManager, setSpotifyClient, setProgrammingMode, setModelSwitchCallback, setCurrentProviderCallback, setStatusSnapshotCallback, setKanbanSupervisor, setKanbanBoardManager, setKanbanProviders, setIDEProviders, setBotManager, setBotsWebhookSecret };
 
 let webServer: ReturnType<typeof createAdaptorServer> | null = null;
 
@@ -187,12 +216,29 @@ process.on('exit', () => {
 
 process.on('uncaughtException', (err) => {
   logger.error({ err: err.message }, 'Uncaught exception in web server');
-  // Don't exit — let Mercury's main process handler decide
+  // Write crash flag so next startup can report to the user.
+  try {
+    const { writeCrashFlag } = require('../core/crash-flag.js');
+    writeCrashFlag({ reason: `Uncaught exception: ${err.message}`.slice(0, 300), timestamp: Date.now() });
+  } catch { /* best effort */ }
 });
 
 process.on('unhandledRejection', (reason: any) => {
-  logger.warn({ err: reason?.message || reason }, 'Unhandled rejection in web server (non-fatal)');
-  // Don't exit — unhandled rejections from API routes should not kill Mercury
+  // Never swallow fatal boot errors (e.g. "runtime already running") here —
+  // a silent exit(0) with no user-visible reason is worse than a crash.
+  logger.error({ err: reason?.message || reason }, 'Unhandled rejection');
+  try {
+    const { writeCrashFlag } = require('../core/crash-flag.js');
+    writeCrashFlag({ reason: `Unhandled rejection: ${reason?.message || reason}`.slice(0, 300), timestamp: Date.now() });
+  } catch { /* best effort */ }
+  const message = String(reason?.message || reason || '');
+  const fatal = /already running|EADDRINUSE|registerRuntimeProcess/i.test(message);
+  if (fatal) {
+    try {
+      process.stderr.write(`\n✗ Mercury cannot start: ${message}\n  Attach to it with \`mercury attach\`, or stop it with \`mercury stop\` / \`kill <pid>\`.\n`);
+    } catch { /* stderr gone */ }
+    process.exit(1);
+  }
 });
 
 export function startWebServer(): { port: number; url: string } {
@@ -208,9 +254,20 @@ export function startWebServer(): { port: number; url: string } {
   const server = createAdaptorServer({ fetch: app.fetch });
   webServer = server;
 
+  let bindAttempts = 0;
   server.on('error', (err: any) => {
+    if (err?.code === 'EADDRINUSE' && bindAttempts < 10) {
+      // A previous instance shutting down keeps the port for a moment;
+      // retry before declaring the dashboard unavailable.
+      bindAttempts++;
+      setTimeout(() => server.listen(port, '127.0.0.1'), 500);
+      return;
+    }
     if (err?.code === 'EADDRINUSE') {
-      logger.warn(`Port ${port} is already in use. Web dashboard unavailable.`);
+      // The runtime stays alive for its channels, but with no web listener
+      // every attach health check fails — the launcher treats that as an
+      // unresponsive runtime and restarts it. Log the shape of that state.
+      logger.warn(`Port ${port} is already in use — web dashboard unavailable. Attach/launch will report the runtime as unresponsive and restart it.`);
     } else {
       logger.error({ err: err.message }, 'Web server error');
     }

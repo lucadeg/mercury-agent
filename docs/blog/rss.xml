@@ -1,0 +1,98 @@
+<?xml version="1.0" encoding="utf-8"?>
+<rss version="2.0">
+    <channel>
+        <title>Mercury Blog</title>
+        <link>https://mercuryagent.sh/blog</link>
+        <description>News, engineering notes and field reports from the team building Mercury.</description>
+        <lastBuildDate>Sat, 24 Oct 2026 00:00:00 GMT</lastBuildDate>
+        <docs>https://validator.w3.org/feed/docs/rss2.html</docs>
+        <generator>https://github.com/jpmonette/feed</generator>
+        <language>en</language>
+        <copyright>© 2026 Cosmic Stack</copyright>
+        <item>
+            <title><![CDATA[How Optimus works: an agent that uses your computer]]></title>
+            <link>https://mercuryagent.sh/blog/how-optimus-works</link>
+            <guid>https://mercuryagent.sh/blog/how-optimus-works</guid>
+            <pubDate>Sat, 24 Oct 2026 00:00:00 GMT</pubDate>
+            <description><![CDATA[Inside Optimus, the Mercury plugin that sees your screen, moves the mouse and types: its processes, how it looks and acts, voice control, and the safety rails.]]></description>
+            <category>Engineering</category>
+            <category>Product</category>
+        </item>
+        <item>
+            <title><![CDATA[Mercury 1.4: plugins, WhatsApp calls, and an agent at your desk]]></title>
+            <link>https://mercuryagent.sh/blog/mercury-1-4</link>
+            <guid>https://mercuryagent.sh/blog/mercury-1-4</guid>
+            <pubDate>Fri, 23 Oct 2026 00:00:00 GMT</pubDate>
+            <description><![CDATA[Mercury 1.4 adds isolated plugins and two official ones: WhatsApp chat with voice calls both ways, and Optimus, which sees your screen and uses your mouse.]]></description>
+            <category>News</category>
+            <category>Releases</category>
+            <category>Product</category>
+        </item>
+        <item>
+            <title><![CDATA[The new bottleneck in AI coding isn't code generation. It's verification.]]></title>
+            <link>https://mercuryagent.sh/blog/ai-coding-verification-bottleneck</link>
+            <guid>https://mercuryagent.sh/blog/ai-coding-verification-bottleneck</guid>
+            <pubDate>Tue, 20 Oct 2026 00:00:00 GMT</pubDate>
+            <description><![CDATA[A Harvard working paper finds coding agents raised code output while review time rose 49%. Why verification, not generation, should decide whether an agent is useful.]]></description>
+            <category>Engineering</category>
+            <category>News</category>
+        </item>
+        <item>
+            <title><![CDATA[Agents exceeded their permissions: how to scope them]]></title>
+            <link>https://mercuryagent.sh/blog/agent-permissions-least-privilege</link>
+            <guid>https://mercuryagent.sh/blog/agent-permissions-least-privilege</guid>
+            <pubDate>Sat, 17 Oct 2026 00:00:00 GMT</pubDate>
+            <description><![CDATA[CERT-In says AI agents read live business records at Indian firms. Here is how least privilege, scoped access, approvals and audit logs should limit them.]]></description>
+            <category>Security</category>
+            <category>News</category>
+        </item>
+        <item>
+            <title><![CDATA[Mercury Bots: an agent fleet that runs on your machine]]></title>
+            <link>https://mercuryagent.sh/blog/mercury-bots</link>
+            <guid>https://mercuryagent.sh/blog/mercury-bots</guid>
+            <pubDate>Fri, 16 Oct 2026 00:00:00 GMT</pubDate>
+            <description><![CDATA[Always-on agents shipped everywhere this autumn. How Mercury Bots work, what we measured, how they compare with Grok Bot, OpenAI dots, Meta Muse, OpenClaw and Hermes Agent, and the commits behind it.]]></description>
+            <category>Product</category>
+            <category>Engineering</category>
+            <category>Runtime</category>
+        </item>
+        <item>
+            <title><![CDATA[The setup wizard that quit at the first menu]]></title>
+            <link>https://mercuryagent.sh/blog/the-wizard-that-quit-at-the-menu</link>
+            <guid>https://mercuryagent.sh/blog/the-wizard-that-quit-at-the-menu</guid>
+            <pubDate>Thu, 15 Oct 2026 00:00:00 GMT</pubDate>
+            <description><![CDATA[For six releases, a brand-new Mercury install asked for your name, showed one menu, and exited without an error. A walkthrough of a one-tick race between two readers of the same terminal, and the test that now keeps it from coming back.]]></description>
+            <category>Engineering</category>
+            <category>Postmortem</category>
+        </item>
+        <item>
+            <title><![CDATA[We were running Mercury twice and didn't know it]]></title>
+            <link>https://mercuryagent.sh/blog/we-were-running-mercury-twice</link>
+            <guid>https://mercuryagent.sh/blog/we-were-running-mercury-twice</guid>
+            <pubDate>Wed, 14 Oct 2026 00:00:00 GMT</pubDate>
+            <description><![CDATA[Typing felt sluggish on every machine, and the terminal renderer took the blame. The real cause was a second full copy of the agent, started quietly by the launcher. How we found it, and why the fix was an architecture change rather than a performance tweak.]]></description>
+            <category>Engineering</category>
+            <category>Postmortem</category>
+            <category>Runtime</category>
+        </item>
+        <item>
+            <title><![CDATA[Mercury 1.3: an agent you can actually leave running]]></title>
+            <link>https://mercuryagent.sh/blog/mercury-1-3</link>
+            <guid>https://mercuryagent.sh/blog/mercury-1-3</guid>
+            <pubDate>Mon, 12 Oct 2026 00:00:00 GMT</pubDate>
+            <description><![CDATA[One background runtime that every terminal attaches to, bots that deliver real files and stay online, and a fleet you can run from Telegram. What changed in the 1.3 line and why.]]></description>
+            <category>News</category>
+            <category>Releases</category>
+            <category>Runtime</category>
+        </item>
+        <item>
+            <title><![CDATA[Asks before it acts: how Mercury's permission model works]]></title>
+            <link>https://mercuryagent.sh/blog/asks-before-it-acts</link>
+            <guid>https://mercuryagent.sh/blog/asks-before-it-acts</guid>
+            <pubDate>Fri, 09 Oct 2026 00:00:00 GMT</pubDate>
+            <description><![CDATA[An agent with a shell, a file system and network access is only useful if you can trust what it will do with them. A tour of the layers between the model and your machine: scopes, approvals, a blocklist nothing can override, an SSRF guard, and tiers for unattended bots.]]></description>
+            <category>Product</category>
+            <category>Security</category>
+        </item>
+    </channel>
+</rss>

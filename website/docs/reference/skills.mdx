@@ -23,7 +23,21 @@ A skill bundles:
     └── references/   # optional
 ```
 
-On first run, Mercury seeds a `_template` directory and a built-in `web-search` skill. If `web-search/SKILL.md` already exists, it is left alone — your customizations are never overwritten.
+On first run, Mercury seeds a `_template` directory and a curated set of built-in skills. If a seeded `SKILL.md` already exists, it is left alone — your customizations are never overwritten.
+
+### Bundled default skills
+
+As of `v1.1.11`, fresh installs (or `mercury doctor --seed-skills`) come with three built-in skills:
+
+| Skill | What it does | Tools used |
+|---|---|---|
+| `web-search` | DuckDuckGo HTML search + summarized sources with cross-referencing. | `fetch_url` |
+| `tweet-notifier` | Schedule tweets with founder approval and supporter notifications. | `schedule_task`, `send_message`, `save_memory`, `search_memory`, `fetch_url`, `github_api` |
+| `screenshot` | Full-page website screenshots via Playwright with configurable viewport (mobile/desktop/HD/custom) and dark/light color scheme. Output goes to `~/Desktop/<domain>-<timestamp>.png`. | `run_command`, `create_file`, `write_file`, `send_file`, `cd`, `send_message` |
+
+The `screenshot` skill requires Playwright/Chromium (`npx playwright install chromium`). On Telegram, the captured image is sent as a photo attachment.
+
+Browse and install community skills at **[skills.mercuryagent.sh](https://skills.mercuryagent.sh)**.
 
 ## SKILL.md format
 
@@ -78,20 +92,88 @@ Mercury uses **progressive disclosure**: only the frontmatter and a short summar
 
 ## Installing skills
 
+The fastest path is the [Mercury Skills registry](https://skills.mercuryagent.sh) — a community catalog of 126+ vetted skills across 23 categories. Every skill on the registry has a public detail page you should review before installing; skills run with elevated permissions when invoked.
+
+> See the [Skills command reference](../cli-commands/skills) for the complete CLI / in-chat / dashboard / Telegram surface in one place. The summary below is a quickstart.
+
+### From the CLI (recommended)
+
+The `mercury skills` command tree talks to the registry directly. No browser required.
+
+```bash
+# Discover
+mercury skills categories                   # 23 categories
+mercury skills browse finance-legal         # paginated list, with --page / --limit
+mercury skills search "contract review"     # full-text search
+
+# Inspect before installing
+mercury skills view finance-legal/contract-review
+mercury skills view finance-legal/contract-review --web    # opens the registry page
+mercury skills view finance-legal/contract-review --raw    # prints raw SKILL.md
+
+# Install / update / remove
+mercury skills install finance-legal/contract-review
+mercury skills install <id1> <id2> <id3>                    # batch
+mercury skills install <id> --force                         # reinstall same version
+mercury skills install --from ./local-skill.md              # install from a local file or URL
+mercury skills update                                       # update all installed
+mercury skills update finance-legal/contract-review         # update one
+mercury skills remove finance-legal/contract-review
+
+# Observability
+mercury skills list                          # what's installed locally
+mercury skills info                          # registry stats
+mercury skills doctor                        # check registry reachability + cache
+```
+
+Shared flags:
+
+- `--json` — emit machine-readable output (useful for scripting).
+- `--registry <url>` — point at a different registry (also `MERCURY_SKILLS_REGISTRY`).
+- `-q, --quiet` — suppress progress output.
+- `-y, --yes` — skip confirmations.
+
+Registry skills install into a nested layout to avoid name collisions:
+
+```
+~/.mercury/skills/
+├── <category>/<slug>/SKILL.md     # registry skills (new)
+├── _template/                     # seeded template
+├── web-search/                    # legacy flat layout still works
+└── .index.json                    # source of truth for `list` and `update`
+```
+
+The CLI never executes a skill's body during install — only writes the `SKILL.md` to disk after validating its frontmatter. Always review the registry page (`mercury skills view <id> --web`) before installing.
+
 ### From the web dashboard
 
-Open **Configure → Skills** (`/skills`) in the dashboard.
+Open **Skills** in the dashboard at `http://127.0.0.1:6174/skills`.
 
-- The page lists every installed skill with its description, version, active state, and `allowed-tools`.
-- Click **Install from URL** and paste a URL pointing to a raw `SKILL.md` file. Mercury fetches it (`http://` or `https://`), validates the frontmatter, and saves it to `~/.mercury/skills/<name>/SKILL.md`.
-- Use the **toggle** to activate or deactivate a skill without deleting it. Deactivated skills are not loaded into Mercury's intent router.
-- Use the **trash icon** to delete a skill (removes the directory from disk).
+- **Install from registry** — paste a `category/slug` id (e.g. `finance-legal/contract-review`) and click Install. The toast reports the install status (`installed`, `updated`, `reinstalled`, `already-installed`).
+- **Install from URL** — paste a URL pointing to a raw `SKILL.md`. Mercury fetches it, validates the frontmatter, and saves it to disk.
+- Use the **toggle** to activate or deactivate a skill without deleting it.
+- Use the **trash icon** to delete a skill (removes its directory and its index entry).
+- The header has a **Browse skills.mercuryagent.sh** link that opens the registry in a new tab.
+
+### From Telegram
+
+If you've paired a Telegram bot, the `/skills` command is available to every approved user. Install is admin-only.
+
+```
+/skills                            # list installed skills + counts
+/skills search <query>             # top 5 registry matches with their URLs
+/skills view <id>                  # title, version, description, registry URL
+/skills install <id>               # admin only — installs to ~/.mercury/skills/
+/skills remove <id>                # admin only
+```
+
+Every result includes the `https://skills.mercuryagent.sh/skills/<id>` URL so you can review the skill on a real browser before installing it.
 
 ### From chat
 
-Tell Mercury in any channel:
+You can also tell Mercury in any channel:
 
-- "Install skill from https://example.com/my-skill.md"
+- "Install skill from `https://example.com/my-skill.md`"
 - Or paste the SKILL.md content directly into a message and ask Mercury to install it.
 
 ### Manually
@@ -110,12 +192,38 @@ When invoked, Mercury injects the skill's Markdown body into context as guidance
 The web dashboard talks to the skill loader through these endpoints:
 
 ```
-GET    /api/skills                    # list installed skills with active state
-POST   /api/skills/install            # { url } — fetch and install from a URL
+GET    /api/skills                          # list installed skills with active state
+POST   /api/skills/install                  # { url } — fetch and install from a URL
+POST   /api/skills/install-from-registry    # { id, force? } — install by registry id
 POST   /api/skills/:name/activate
 POST   /api/skills/:name/deactivate
 DELETE /api/skills/:name
 ```
+
+## Self-made skills
+
+Mercury can write skills for itself. After a multi-step task it would do again — a recurring report, a conversion pipeline, a deploy, a site or device it operates — has worked end-to-end, it saves the procedure (exact commands, paths, checks, pitfalls) with `create_skill` and tells you in one line:
+
+```
+☿ Skill saved: weekly-sales-report — say /skills self-made to review or remove it.
+```
+
+Next time, the task is one `use_skill` away. These skills are deliberately kept apart from the ones you install:
+
+- They live in `~/.mercury/skills/self-made/<name>/SKILL.md` with `category: self-made`, `origin: mercury`, `made`, `verified`, `uses` and `last_used` in the frontmatter.
+- They are listed under their own **Self-made** label and count as *unverified* until used again; Mercury is told to trust the result, not the text, and to update the skill when a step fails.
+- Mercury never saves one for a one-off, for anything a single tool does, for anything it did not verify, or with credentials inside; a self-made skill never shadows an installed one with the same name.
+- Unused ones go **dormant** after 30 days (disabled, never deleted) and the shelf is capped at 40 live skills.
+- Only your own sessions can create them — not bots, not channel members.
+
+```
+/skills self-made                       # list, with use counts and dormancy
+/skills self-made enable <name>
+/skills self-made disable <name>
+/skills self-made remove <name>
+```
+
+To keep one for good, move its folder out of `self-made/` and drop the `origin`/`uses` fields — it becomes an ordinary skill.
 
 ## Writing your own
 

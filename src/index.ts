@@ -1,8 +1,10 @@
-import { readFileSync, writeFileSync, existsSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, statSync, chmodSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
-import { dirname, join } from 'node:path';
+import { dirname, join, resolve as pathResolve } from 'node:path';
 import { Command } from 'commander';
-import readline from 'node:readline';
+import { publishStatus, setStatusPublisher } from './core/provider-status.js';
+import { loadPermissionMode, savePermissionMode } from './capabilities/permission-mode-store.js';
 import chalk from 'chalk';
 
 import {
@@ -23,14 +25,42 @@ import {
   promoteTelegramUserToAdmin,
   demoteTelegramAdmin,
   hasTelegramAdmins,
+  getSignalAccessSummary,
+  hasSignalAdmins as hasSignalAdminsFn,
+  findSignalPendingRequest,
+  approveSignalPendingRequestByPairingCode,
+  clearSignalAccess,
+  getDiscordAccessSummary,
+  hasDiscordAdmins as hasDiscordAdminsFn,
+  findDiscordPendingRequest,
+  approveDiscordPendingRequest,
+  approveDiscordPendingRequestByPairingCode,
+  rejectDiscordPendingRequest,
+  removeDiscordUser,
+  clearDiscordAccess,
+  getSlackAccessSummary,
+  findSlackPendingRequest,
+  approveSlackPendingRequest,
+  rejectSlackPendingRequest,
+  removeSlackUser,
+  clearSlackAccess,
 } from './utils/config.js';
 import type { MercuryConfig } from './utils/config.js';
 import type { ProviderName } from './utils/config.js';
 import { logger } from './utils/logger.js';
+import { devBuildLabel, isDevBuild } from './utils/dev-build.js';
+import { redactPhone } from './utils/redact.js';
 import { Identity } from './soul/identity.js';
 import { ShortTermMemory, LongTermMemory, EpisodicMemory, migrateLegacyMemory } from './memory/store.js';
+import { buildConversationHistoryPayload, CloudSessionSynchronizer, SessionRepository } from './sessions/index.js';
 import { UserMemoryStore } from './memory/user-memory.js';
-import { isBetterSqlite3Available } from './memory/second-brain-db.js';
+import { BotManager } from './bots/bot-manager.js';
+import { getPluginManager, peekPluginManager, setProviderLookup } from './plugins/manager.js';
+import { setCallLearning, setChannelHost, setDesktopActivityHook, setVoiceBriefing, setWorkStopper } from './plugins/channel-bridge.js';
+import { registerPluginsCli } from './cli/plugins-cli.js';
+import { SECOND_BRAIN_UNAVAILABLE_MESSAGE } from './memory/second-brain-db.js';
+import { isSqliteAvailable } from './utils/sqlite-driver.js';
+import { runStorageDoctor } from './utils/storage-doctor.js';
 import { ProviderRegistry } from './providers/registry.js';
 import { Agent } from './core/agent.js';
 import { Scheduler } from './core/scheduler.js';
@@ -40,22 +70,65 @@ import { SpotifyClient } from './spotify/client.js';
 import { ChannelRegistry } from './channels/registry.js';
 import { CLIChannel } from './channels/cli.js';
 import { TelegramChannel } from './channels/telegram.js';
+import { SignalChannel } from './channels/signal.js';
+import { DiscordChannel } from './channels/discord.js';
 import { WebChannel } from './channels/web.js';
 import { TokenBudget } from './utils/tokens.js';
 import { CapabilityRegistry } from './capabilities/registry.js';
 import { SkillLoader } from './skills/loader.js';
+import { registerSkillsCommand } from './skills/cli.js';
+import { registerBotsCommand } from './bots/cli.js';
 import { getManual } from './utils/manual.js';
-import { startBackground, stopDaemon, showLogs, getDaemonStatus, restartDaemon, tryAutoDaemonize } from './cli/daemon.js';
-import { installService, uninstallService, showServiceStatus, isServiceInstalled } from './cli/service.js';
+import { ask, InputClosedError } from './cli/ask.js';
+import { startBackground, stopDaemon, showLogs, getDaemonStatus, registerRuntimeProcess, releaseRuntimeProcess, restartDaemon, tryAutoDaemonize, isStandaloneBinary, getForegroundRuntimeStatus, stopForegroundRuntime } from './cli/daemon.js';
+import { runUninstall } from './cli/uninstall.js';
+import { runAttach, type AttachResult } from './cli/attach.js';
+import { installService, uninstallService, showServiceStatus, isServiceInstalled, pinDaemonPathOnWindows, serviceDrift } from './cli/service.js';
+import { detectInkPatch, describeInkPatch, inkPatchFixCommand } from './ui/ink-patch-check.js';
 import { runWithWatchdog } from './cli/watchdog.js';
 import { setGitHubToken } from './utils/github.js';
 import { selectWithArrowKeys } from './utils/arrow-select.js';
 import { ProviderModelFetchError, fetchProviderModelCatalog } from './utils/provider-models.js';
-import { startWebServer, stopWebServer, updateStatus as updateWebStatus, setUserMemory as setWebUserMemory, setWebChannel as setWebWebChannel, setScheduler as setWebScheduler, setAgentSupervisor as setWebSupervisor, setBackgroundTaskManager as setWebBgTasks, setSpotifyClient as setWebSpotify, setProgrammingMode as setWebProgrammingMode, setModelSwitchCallback as setWebModelSwitch, setCurrentProviderCallback as setWebCurrentProvider, setKanbanSupervisor as setWebKanban, setKanbanBoardManager as setWebBoardManager, setKanbanProviders as setWebKanbanProviders, setIDEProviders as setWebIDEProviders } from './web/server.js';
-import { isWebAuthInitialized, setWebPassword } from './web/auth.js';
+import { initCloudTokenStore } from './cloud/token-store.js';
+import { clearCloudRuntimeOnline, markCloudRuntimeOnline } from './cloud/runtime-status.js';
+import { startWebServer, stopWebServer, updateStatus as updateWebStatus, setUserMemory as setWebUserMemory, setWebChannel as setWebWebChannel, setScheduler as setWebScheduler, setAgentSupervisor as setWebSupervisor, setBackgroundTaskManager as setWebBgTasks, setSpotifyClient as setWebSpotify, setProgrammingMode as setWebProgrammingMode, setModelSwitchCallback as setWebModelSwitch, setCurrentProviderCallback as setWebCurrentProvider, setStatusSnapshotCallback as setWebStatusSnapshot, setKanbanSupervisor as setWebKanban, setKanbanBoardManager as setWebBoardManager, setKanbanProviders as setWebKanbanProviders, setIDEProviders as setWebIDEProviders, setSessionRepository as setWebSessions, setSessionSyncEnabledCallback as setWebSessionSyncEnabled, setBotManager as setWebBotManager, setBotsWebhookSecret, setShutdownHandler, setMcpManager as setWebMcpManager } from './web/server.js';
+import { isWebAuthInitialized, setWebPassword, writeAttachToken } from './web/auth.js';
+import { startLoopLagMonitor } from './utils/loop-lag.js';
+import { McpManager, probeMcpServer, validateMcpConfig, type McpServerStatus } from './capabilities/mcp/index.js';
+import {
+  addServer as addMcpServer,
+  allowTools as allowMcpTools,
+  buildServerConfig as buildMcpServerConfig,
+  disallowTools as disallowMcpTools,
+  formatServerList as formatMcpServerList,
+  formatStatusLine as formatMcpStatusLine,
+  formatStdioCommand as formatMcpStdioCommand,
+  formatToolLines as formatMcpToolLines,
+  getServer as getMcpServer,
+  removeServer as removeMcpServer,
+  setServerEnabled as setMcpServerEnabled,
+} from './capabilities/mcp/admin.js';
+import { runMcpDoctor, summarizeMcpConfig } from './capabilities/mcp/doctor.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const pkgVersion = JSON.parse(readFileSync(join(__dirname, '..', 'package.json'), 'utf8')).version;
+let pkgVersion: string;
+try {
+  // Dev-channel builds are stamped at compile time (MERCURY_CHANNEL_VERSION →
+  // tsup define). This wins over whatever version happens to sit on disk —
+  // a dev binary run from a checkout must still report its dev stamp.
+  const channelVersion = (globalThis as any).__MERCURY_CHANNEL_VERSION__ as string | undefined;
+  if (channelVersion) {
+    pkgVersion = channelVersion;
+  } else {
+    // Normal (npm) install: package.json sits one level above dist/.
+    pkgVersion = JSON.parse(readFileSync(join(__dirname, '..', 'package.json'), 'utf8')).version;
+  }
+} catch {
+  // Standalone binary (Bun --compile / pkg / SEA): package.json is not on
+  // disk next to the embedded bundle. Use the version injected at build
+  // time, falling back to 'unknown' so the CLI still launches.
+  pkgVersion = (globalThis as any).__MERCURY_VERSION__ ?? 'unknown';
+}
 
 function hr() {
   console.log(chalk.dim('─'.repeat(50)));
@@ -76,7 +149,12 @@ function banner() {
   console.log('');
   console.log(chalk.bold.cyan('  MERCURY'));
   console.log(chalk.white('  Your soul-driven AI agent'));
-  console.log(chalk.dim(`  v${pkgVersion} · by Cosmic Stack · mercury.cosmicstack.org`));
+  console.log(chalk.dim(`  v${pkgVersion} · by Cosmic Stack · mercuryagent.sh`));
+  // Dev-channel builds announce themselves on EVERY launch — a preview
+  // binary must never be mistaken for the stable distribution.
+  if (isDevBuild(pkgVersion)) {
+    console.log(chalk.yellow(`  ⚠ ${devBuildLabel(pkgVersion)} · not for production`));
+  }
   console.log('');
 }
 
@@ -89,18 +167,11 @@ function splashScreen() {
   console.log(chalk.bold.cyan('  MERCURY'));
   console.log(chalk.dim('  Your soul-driven AI agent'));
   console.log(chalk.cyan('  by Cosmic Stack'));
-  console.log(chalk.dim('  mercury.cosmicstack.org'));
+  console.log(chalk.dim('  mercuryagent.sh'));
+  if (isDevBuild(pkgVersion)) {
+    console.log(chalk.yellow(`  ⚠ ${devBuildLabel(pkgVersion)}`));
+  }
   console.log('');
-}
-
-async function ask(prompt: string): Promise<string> {
-  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-  return new Promise((resolve) => {
-    rl.question(prompt, (answer) => {
-      rl.close();
-      resolve(answer.trim());
-    });
-  });
 }
 
 function maskKey(key: string): string {
@@ -110,16 +181,21 @@ function maskKey(key: string): string {
 }
 
 const PROVIDER_OPTIONS: Array<{ key: ProviderName; label: string }> = [
+  { key: 'aimlapi', label: 'AI/ML API (recommended — 350+ models on one key)' },
+  { key: 'mercuryCloud', label: 'Mercury Cloud (hosted — no API keys needed)' },
   { key: 'deepseek', label: 'DeepSeek' },
   { key: 'openai', label: 'OpenAI' },
   { key: 'anthropic', label: 'Anthropic' },
   { key: 'githubCopilot', label: 'GitHub Copilot' },
   { key: 'grok', label: 'Grok (xAI)' },
+  { key: 'atlascloud', label: 'Atlas Cloud' },
   { key: 'ollamaCloud', label: 'Ollama Cloud' },
   { key: 'ollamaLocal', label: 'Ollama Local' },
+  { key: 'atomicChat', label: 'Atomic Chat' },
   { key: 'openaiCompat', label: 'OpenAI Compilations' },
   { key: 'mimo', label: 'MiMo (Xiaomi)' },
   { key: 'mimoTokenPlan', label: 'MiMo Token Plan (Xiaomi)' },
+  { key: 'lmStudio', label: 'LM Studio' },
 ];
 
 function getConfiguredProviderNames(config: MercuryConfig): ProviderName[] {
@@ -133,6 +209,7 @@ function getConfiguredProviderNames(config: MercuryConfig): ProviderName[] {
 
 function getProviderLabel(name: ProviderName): string {
   if (name === 'chatgptWeb') return 'OpenAI (ChatGPT Plus/Pro)';
+  if (name === 'mercuryCloud') return 'Mercury Cloud';
   return PROVIDER_OPTIONS.find((option) => option.key === name)?.label || name;
 }
 
@@ -197,7 +274,14 @@ async function chooseDefaultProvider(config: MercuryConfig): Promise<void> {
     return;
   }
 
-  const suggested = configured.includes('deepseek') ? 'deepseek' : configured[0];
+  // Suggest the CURRENT default when it's still configured — on reconfig,
+  // pressing Enter (the universal "keep current" convention in this wizard)
+  // must keep it, not jump to the hard-coded suggestion.
+  const suggested = configured.includes(config.providers.default)
+    ? config.providers.default
+    : configured.includes('deepseek')
+      ? 'deepseek'
+      : configured[0];
 
   console.log('');
   console.log(chalk.bold.white('  Default Provider'));
@@ -261,6 +345,10 @@ function validateApiKey(provider: ProviderName, value: string): string | null {
     return looksLikeToken(value)
       ? null
       : 'Ollama Cloud keys must look like a real API token: long, no spaces, and not plain text.';
+  }
+
+  if (provider === 'lmStudio') {
+    return null;
   }
 
   if (provider === 'mimo') {
@@ -468,6 +556,123 @@ async function promptOllamaLocalModelSelection(config: MercuryConfig, isReconfig
   }
 }
 
+async function promptLmStudioModelSelection(config: MercuryConfig, isReconfig: boolean): Promise<{ baseUrl?: string; model?: string; skipped: boolean }> {
+  const existingConfig = config.providers.lmStudio;
+
+  const baseUrlPrompt = isReconfig && existingConfig.baseUrl
+    ? chalk.white(`  LM Studio base URL [${existingConfig.baseUrl}]: `)
+    : chalk.white('  LM Studio base URL [Enter for http://127.0.0.1:1234/v1]: ');
+  const baseUrlInput = await ask(baseUrlPrompt);
+  if (!baseUrlInput || baseUrlInput.toLowerCase() === 'none') {
+    if (isReconfig && existingConfig.baseUrl) {
+      return { baseUrl: existingConfig.baseUrl, model: existingConfig.model, skipped: true };
+    }
+    return { skipped: true };
+  }
+  const baseUrlError = validateBaseUrl(baseUrlInput);
+  if (baseUrlError) {
+    console.log(chalk.red(`  ${baseUrlError}`));
+    if (isReconfig && existingConfig.baseUrl) {
+      return { baseUrl: existingConfig.baseUrl, model: existingConfig.model, skipped: true };
+    }
+    return { skipped: true };
+  }
+  const baseUrl = baseUrlInput;
+
+  console.log(chalk.dim('  Fetching LM Studio models...'));
+  try {
+    const catalog = await fetchProviderModelCatalog('lmStudio', {
+      ...existingConfig,
+      baseUrl,
+    });
+    const model = await chooseProviderModel(
+      'LM Studio',
+      catalog.recommendedModel,
+      catalog.models,
+    );
+    return { baseUrl, model, skipped: false };
+  } catch (error) {
+    const message = error instanceof ProviderModelFetchError
+      ? error.message
+      : 'Mercury could not fetch LM Studio models.';
+    console.log(chalk.yellow(`  ${message}`));
+    console.log(chalk.dim('  Make sure LM Studio is running and the Developer API is enabled.'));
+    console.log(chalk.dim('  You can run `mercury doctor` later to configure LM Studio after starting it.'));
+
+    const manualModel = await ask(chalk.white(`  LM Studio model name (Enter to skip LM Studio for now): `));
+    if (!manualModel) {
+      return { skipped: true };
+    }
+
+    const modelError = validateModelName(manualModel);
+    if (modelError) {
+      console.log(chalk.red(`  ${modelError}`));
+      return { skipped: true };
+    }
+
+    return { baseUrl, model: manualModel, skipped: false };
+  }
+}
+
+async function promptAtomicChatModelSelection(config: MercuryConfig, isReconfig: boolean): Promise<{ baseUrl?: string; model?: string; skipped: boolean }> {
+  const existingConfig = config.providers.atomicChat;
+  const defaultBaseUrl = existingConfig.baseUrl || 'http://127.0.0.1:1337/v1';
+
+  const baseUrlPrompt = isReconfig && existingConfig.baseUrl
+    ? chalk.white(`  Atomic Chat base URL [${existingConfig.baseUrl}]: `)
+    : chalk.white(`  Atomic Chat base URL [${defaultBaseUrl}]: `);
+  const baseUrlInput = await ask(baseUrlPrompt);
+  if (baseUrlInput.toLowerCase() === 'none') {
+    if (isReconfig && existingConfig.baseUrl) {
+      return { baseUrl: existingConfig.baseUrl, model: existingConfig.model, skipped: true };
+    }
+    return { skipped: true };
+  }
+  const baseUrl = baseUrlInput || defaultBaseUrl;
+  const baseUrlError = validateBaseUrl(baseUrl);
+  if (baseUrlError) {
+    console.log(chalk.red(`  ${baseUrlError}`));
+    if (isReconfig && existingConfig.baseUrl) {
+      return { baseUrl: existingConfig.baseUrl, model: existingConfig.model, skipped: true };
+    }
+    return { skipped: true };
+  }
+
+  console.log(chalk.dim('  Fetching Atomic Chat models...'));
+  try {
+    const catalog = await fetchProviderModelCatalog('atomicChat', {
+      ...existingConfig,
+      baseUrl,
+    });
+    const model = await chooseProviderModel(
+      'Atomic Chat',
+      catalog.recommendedModel,
+      catalog.models,
+    );
+    return { baseUrl, model, skipped: false };
+  } catch (error) {
+    const message = error instanceof ProviderModelFetchError
+      ? error.message
+      : 'Mercury could not fetch Atomic Chat models.';
+    console.log(chalk.yellow(`  ${message}`));
+    console.log(chalk.dim('  Make sure Atomic Chat is running and a model is loaded, or enter the model id manually.'));
+    console.log(chalk.dim('  You can run `mercury doctor` later after starting Atomic Chat.'));
+
+    const manualModel = await ask(chalk.white('  Atomic Chat model id (Enter to skip Atomic Chat for now): '));
+    if (!manualModel) {
+      return { skipped: true };
+    }
+
+    const modelError = validateModelName(manualModel);
+    if (modelError) {
+      console.log(chalk.red(`  ${modelError}`));
+      return { skipped: true };
+    }
+
+    return { baseUrl, model: manualModel, skipped: false };
+  }
+}
+
 async function promptOpenAICompatSetup(config: MercuryConfig, isReconfig: boolean): Promise<{ baseUrl?: string; apiKey?: string; model?: string; skipped: boolean }> {
   const existingConfig = config.providers.openaiCompat;
 
@@ -538,7 +743,11 @@ function appendToEnv(key: string, value: string): void {
   }
   const lines = envContent.split('\n').filter((l: string) => !l.startsWith(`${key}=`) && l.trim() !== '');
   lines.push(`${key}=${value}`);
-  writeFileSync(envPath, lines.join('\n') + '\n', 'utf-8');
+  // Holds API keys and bot tokens: owner-only, like config.yaml and the web
+  // credential files. `mode` only applies on create, so chmod repairs a
+  // file an older version wrote with the default umask (0644).
+  writeFileSync(envPath, lines.join('\n') + '\n', { encoding: 'utf-8', mode: 0o600 });
+  try { chmodSync(envPath, 0o600); } catch { /* best effort (Windows ACLs) */ }
   process.env[key] = value;
 }
 
@@ -561,6 +770,35 @@ function formatTelegramUser(user: {
   return `${user.userId}${username}${firstName}`;
 }
 
+function formatSignalUser(user: {
+  phoneNumber: string;
+  name?: string;
+  role?: string;
+}): string {
+  const name = user.name ? ` (${user.name})` : '';
+  const role = user.role ? ` [${user.role}]` : '';
+  return `${redactPhone(user.phoneNumber)}${name}${role}`;
+}
+
+function printSignalAccessState(config: MercuryConfig): void {
+  const admins = config.channels.signal.admins;
+  const members = config.channels.signal.members;
+  const pending = config.channels.signal.pending;
+  const pendingSummary = pending.length > 0
+    ? pending.map((entry) => `${entry.phoneNumber} [code: ${entry.pairingCode}]`).join(', ')
+    : '';
+
+  console.log('');
+  console.log(`  Signal Access: ${chalk.white(getSignalAccessSummary(config))}`);
+  console.log(`  Mode:            ${chalk.white(config.channels.signal.mode)}`);
+  if (config.channels.signal.groupId) {
+    console.log(`  Group:           ${chalk.white(config.channels.signal.groupName || config.channels.signal.groupId)}`);
+  }
+  console.log(`  Admins:          ${admins.length > 0 ? chalk.green(admins.map(formatSignalUser).join(', ')) : chalk.dim('none')}`);
+  console.log(`  Members:         ${members.length > 0 ? chalk.green(members.map(formatSignalUser).join(', ')) : chalk.dim('none')}`);
+  console.log(`  Pending:         ${pending.length > 0 ? chalk.yellow(pendingSummary) : chalk.dim('none')}`);
+}
+
 function printTelegramAccessState(config: MercuryConfig): void {
   const admins = config.channels.telegram.admins;
   const members = config.channels.telegram.members;
@@ -574,9 +812,96 @@ function printTelegramAccessState(config: MercuryConfig): void {
 
   console.log('');
   console.log(`  Telegram Access: ${chalk.white(getTelegramAccessSummary(config))}`);
+  console.log(`  Enabled:         ${config.channels.telegram.enabled ? chalk.green('yes') : chalk.red('no')}`);
+  console.log(`  Bot Token:       ${config.channels.telegram.botToken ? chalk.green('configured') : chalk.red('missing')}`);
   console.log(`  Admins:          ${admins.length > 0 ? chalk.green(admins.map(formatTelegramUser).join(', ')) : chalk.dim('none')}`);
   console.log(`  Members:         ${members.length > 0 ? chalk.green(members.map(formatTelegramUser).join(', ')) : chalk.dim('none')}`);
   console.log(`  Pending:         ${pending.length > 0 ? chalk.yellow(pendingSummary) : chalk.dim('none')}`);
+
+  if (!config.channels.telegram.enabled && config.channels.telegram.botToken) {
+    console.log(chalk.yellow('  Warning:         Telegram has a bot token but is disabled. Run `mercury telegram enable`.'));
+  }
+  if (config.channels.telegram.enabled && !config.channels.telegram.botToken) {
+    console.log(chalk.yellow('  Warning:         Telegram is enabled but has no bot token. Run `mercury doctor`.'));
+  }
+  if (config.channels.telegram.enabled && config.channels.telegram.botToken && admins.length === 0 && pending.length === 0) {
+    console.log(chalk.yellow('  Pairing:         Send /start to the bot, then run `mercury telegram approve <pairing-code>`.'));
+  }
+}
+
+function formatDiscordUser(user: {
+  userId: string;
+  username?: string;
+  displayName?: string;
+  role?: string;
+}): string {
+  const username = user.username ? ` (@${user.username})` : '';
+  const displayName = user.displayName ? ` ${user.displayName}` : '';
+  const role = user.role ? ` [${user.role}]` : '';
+  return `${user.userId}${username}${displayName}${role}`;
+}
+
+function printDiscordAccessState(config: MercuryConfig): void {
+  const admins = config.channels.discord.admins;
+  const members = config.channels.discord.members;
+  const pending = config.channels.discord.pending;
+  const pendingSummary = pending.length > 0
+    ? pending.map((entry) => {
+        const code = entry.pairingCode ? ` [code: ${entry.pairingCode}]` : '';
+        return `${formatDiscordUser(entry)}${code}`;
+      }).join(', ')
+    : '';
+
+  console.log('');
+  console.log(`  Discord Access:  ${chalk.white(getDiscordAccessSummary(config))}`);
+  if (config.channels.discord.guildId) {
+    console.log(`  Guild:            ${chalk.white(config.channels.discord.guildId)}`);
+  }
+  if (config.channels.discord.channelId) {
+    console.log(`  Channel:          ${chalk.white(config.channels.discord.channelId)}`);
+  }
+  if (config.channels.discord.adminRoleName) {
+    console.log(`  Admin Role:        ${chalk.white(config.channels.discord.adminRoleName)}`);
+  }
+  console.log(`  Admins:           ${admins.length > 0 ? chalk.green(admins.map(formatDiscordUser).join(', ')) : chalk.dim('none')}`);
+  console.log(`  Members:          ${members.length > 0 ? chalk.green(members.map(formatDiscordUser).join(', ')) : chalk.dim('none')}`);
+  console.log(`  Pending:          ${pending.length > 0 ? chalk.yellow(pendingSummary) : chalk.dim('none')}`);
+}
+
+function formatSlackUser(user: { userId: string; userName?: string; displayName?: string }): string {
+  const userName = user.userName ? ` (@${user.userName})` : '';
+  const displayName = user.displayName ? ` ${user.displayName}` : '';
+  return `${user.userId}${userName}${displayName}`;
+}
+
+function printSlackAccessState(config: MercuryConfig): void {
+  const admins = config.channels.slack.admins;
+  const members = config.channels.slack.members;
+  const pending = config.channels.slack.pending;
+  const pendingSummary = pending.length > 0
+    ? pending.map((entry) => formatSlackUser(entry)).join(', ')
+    : '';
+
+  console.log('');
+  console.log(`  Slack Access:  ${chalk.white(getSlackAccessSummary(config))}`);
+  if (config.channels.slack.teamId) {
+    console.log(`  Team:           ${chalk.white(config.channels.slack.teamId)}`);
+  }
+  if (config.channels.slack.channelId) {
+    console.log(`  Channel:        ${chalk.white(config.channels.slack.channelId)}`);
+  }
+  console.log(`  Admins:         ${admins.length > 0 ? chalk.green(admins.map(formatSlackUser).join(', ')) : chalk.dim('none')}`);
+  console.log(`  Members:        ${members.length > 0 ? chalk.green(members.map(formatSlackUser).join(', ')) : chalk.dim('none')}`);
+  console.log(`  Pending:        ${pending.length > 0 ? chalk.yellow(pendingSummary) : chalk.dim('none')}`);
+}
+
+/** Content hash of mercury.yaml — `mercury doctor` restarts the daemon only when it changed. */
+function configFingerprint(): string {
+  try {
+    return createHash('sha256').update(readFileSync(join(getMercuryHome(), 'mercury.yaml'))).digest('hex');
+  } catch {
+    return '';
+  }
 }
 
 function restartDaemonIfRunning(message?: string): void {
@@ -635,6 +960,294 @@ async function completeInitialTelegramPairing(config: MercuryConfig): Promise<vo
   }
 }
 
+async function completeInitialSignalSetup(config: MercuryConfig): Promise<void> {
+  if (!config.channels.signal.enabled || !config.channels.signal.phoneNumber) {
+    return;
+  }
+
+  // Already paired
+  if (hasSignalAdminsFn(config)) {
+    console.log(chalk.green('  ✓ Signal already paired.'));
+    if (config.channels.signal.mode === 'group' && config.channels.signal.groupName) {
+      console.log(chalk.dim(`  Group: ${config.channels.signal.groupName}`));
+    }
+    console.log(chalk.dim('  To unregister, run: mercury signal unregister'));
+    console.log('');
+    const keepConfig = await ask(chalk.white('  Keep the existing configuration? (Y/n): '));
+    if (keepConfig.toLowerCase() !== 'n' && keepConfig.toLowerCase() !== 'no') {
+      return;
+    }
+    // Clear pairing data but keep phone number — fall through to fresh pairing
+    config.channels.signal.admins = [];
+    config.channels.signal.members = [];
+    config.channels.signal.pending = [];
+    config.channels.signal.groupId = undefined;
+    config.channels.signal.groupName = undefined;
+
+    // Re-ask mode since we're starting fresh
+    const modeAnswer = await ask(chalk.white('  Mode — group or private? [group]: '));
+    config.channels.signal.mode = modeAnswer.toLowerCase().startsWith('private') ? 'private' : 'group';
+    saveConfig(config);
+    console.log(chalk.dim('  Configuration cleared. Starting fresh pairing...'));
+
+    // Kill any running signal-cli daemon so group list is fresh
+    try {
+      const { killStaleSignalCliProcesses } = await import('./signal/jsonrpc.js');
+      killStaleSignalCliProcesses();
+    } catch { /* ignore */ }
+  }
+
+  console.log('');
+  console.log(chalk.bold.white('  Signal Setup'));
+
+  const { ensureSignalCli, checkJavaAvailable, isNativeAvailable } = await import('./signal/binary.js');
+  const { checkSignalSetup, registerSignalNumber, verifySignalNumber, startLinking, waitForLinkCompletion, cancelLinking, printQrCode } = await import('./signal/setup.js');
+
+  // Step 1: Check Java if needed (macOS/Windows have no native binary)
+  if (!isNativeAvailable() && !checkJavaAvailable()) {
+    console.log(chalk.red('  ✗ Java (JRE 17+) is required for Signal on this platform.'));
+    console.log(chalk.dim('  No native signal-cli binary is available for macOS/Windows.'));
+    console.log(chalk.dim('  Install Java: https://adoptium.net/ or run: brew install openjdk'));
+    console.log(chalk.dim('  Then re-run: mercury doctor'));
+    return;
+  }
+
+  // Step 2: Download signal-cli binary
+  try {
+    const binaryPath = await ensureSignalCli();
+    const { isWrapperScript, isJarBinary: isJar } = await import('./signal/binary.js');
+    const binaryType = isWrapperScript(binaryPath) ? 'JAR (wrapper)'
+      : isJar(binaryPath) ? 'JAR'
+      : 'native binary';
+    console.log(chalk.green(`  ✓ signal-cli installed (${binaryType})`));
+  } catch (err: any) {
+    console.log(chalk.red(`  ✗ Failed to download signal-cli: ${err.message}`));
+    if (!isNativeAvailable()) {
+      console.log(chalk.dim('  Make sure Java (JRE 17+) is installed and accessible.'));
+    }
+    console.log(chalk.dim('  You can try again later with: mercury doctor'));
+    return;
+  }
+
+  // Step 3: Check if already linked
+  const status = await checkSignalSetup(config);
+  if (status.linked) {
+    console.log(chalk.green('  ✓ Signal device is already linked.'));
+  } else {
+    // Step 3b: Register number if needed
+    if (!status.registered) {
+      console.log(chalk.yellow('  This phone number is not registered with Signal.'));
+      console.log(chalk.dim('  You need to register it first:'));
+
+      const registerAnswer = await ask(chalk.white('  Register this number with Signal? (y/N): '));
+      if (registerAnswer.toLowerCase() !== 'y' && registerAnswer.toLowerCase() !== 'yes') {
+        console.log(chalk.dim('  You can register later by running: mercury signal register'));
+        return;
+      }
+
+      const voice = await ask(chalk.white('  Verify via SMS or voice call? (sms/voice) [sms]: '));
+      const useVoice = voice.toLowerCase().startsWith('voice');
+
+      console.log(chalk.dim('  Sending verification code...'));
+      const regResult = await registerSignalNumber(config.channels.signal.phoneNumber, useVoice);
+      if (!regResult.success) {
+        console.log(chalk.red(`  ✗ Registration failed: ${regResult.error}`));
+        return;
+      }
+      console.log(chalk.green('  ✓ Verification code sent.'));
+
+      const code = await ask(chalk.white('  Enter the verification code: '));
+      if (!code) {
+        console.log(chalk.red('  Verification code is required.'));
+        return;
+      }
+
+      const verifyResult = await verifySignalNumber(config.channels.signal.phoneNumber, code.trim());
+      if (!verifyResult.success) {
+        console.log(chalk.red(`  ✗ Verification failed: ${verifyResult.error}`));
+        return;
+      }
+      console.log(chalk.green('  ✓ Number verified.'));
+    }
+
+    // Step 4: Link as secondary device
+    console.log('');
+    console.log(chalk.dim('  Linking Mercury as a secondary device on your Signal account.'));
+    console.log(chalk.dim('  1. Open Signal on your phone'));
+    console.log(chalk.dim('  2. Go to Settings > Linked Devices'));
+    console.log(chalk.dim('  3. Tap "+" to add a new device'));
+    console.log('');
+
+    const linkAnswer = await ask(chalk.white('  Ready to link? Press Enter to generate a QR code...'));
+    const session = await startLinking();
+    if (!session) {
+      console.log(chalk.red('  ✗ Failed to generate linking URI.'));
+      console.log(chalk.dim('  Make sure signal-cli is installed and Java is available.'));
+      return;
+    }
+
+    console.log('');
+    console.log(chalk.cyan('  Scan this QR code with Signal:'));
+    console.log('');
+    printQrCode(session.uri);
+    console.log('');
+    console.log(chalk.dim('  Mercury is waiting for you to complete the link...'));
+
+    const linked = await waitForLinkCompletion(session, 120_000);
+    if (linked) {
+      console.log(chalk.green('  ✓ Signal device linked successfully.'));
+    } else {
+      console.log(chalk.yellow('  Linking timed out or failed.'));
+      console.log(chalk.dim('  Run mercury doctor to try again.'));
+      return;
+    }
+  }
+
+  // Step 5: Pairing — start daemon and wait for pairing code
+  console.log('');
+  console.log(chalk.bold.white('  Signal Pairing'));
+
+  const signalChannel = new SignalChannel(config);
+  try {
+    await signalChannel.start();
+  } catch (err: any) {
+    console.log(chalk.red(`  ✗ Failed to start Signal daemon: ${err.message}`));
+    console.log(chalk.dim('  Make sure signal-cli is working by running: mercury signal status'));
+    console.log(chalk.dim('  You can pair manually by sending /pair in Signal and running: mercury signal approve <code>'));
+    return;
+  }
+
+  if (!signalChannel.running) {
+    console.log(chalk.red('  ✗ Signal daemon did not start.'));
+    console.log(chalk.dim('  You can pair manually by sending /pair in Signal and running: mercury signal approve <code>'));
+    return;
+  }
+
+  // Detect Mercury group now that the daemon is running
+  let groupFound = false;
+  if (config.channels.signal.mode === 'group') {
+    if (config.channels.signal.groupId) {
+      groupFound = true;
+      console.log(chalk.dim('  Your Mercury group is already configured.'));
+    } else {
+      console.log(chalk.dim('  Searching for "Mercury" group...'));
+      try {
+        const group = await signalChannel.listGroups();
+        if (group) {
+          config.channels.signal.groupId = group.groupId;
+          config.channels.signal.groupName = group.groupName;
+          saveConfig(config);
+          groupFound = true;
+          console.log(chalk.green(`  ✓ Found group: ${group.groupName}`));
+        }
+      } catch {
+        // Group search may fail
+      }
+    }
+
+    if (groupFound) {
+      console.log(chalk.dim('  Send /pair in the Mercury group to get a pairing code.'));
+    } else {
+      console.log(chalk.dim('  1. Create a Signal group named "Mercury" (or use an existing one)'));
+      console.log(chalk.dim('  2. Add your linked number to the group'));
+      console.log(chalk.dim('  3. Send /pair in the group'));
+    }
+  } else {
+    // Private mode: auto-pair the linked number as admin
+    // In private mode, the linked number IS the admin — no need for a pairing code
+    if (!hasSignalAdminsFn(config) && config.channels.signal.phoneNumber) {
+      config.channels.signal.admins.push({
+        phoneNumber: config.channels.signal.phoneNumber,
+        role: 'admin',
+        pairedAt: new Date().toISOString(),
+      });
+      saveConfig(config);
+      console.log(chalk.green('  ✓ Auto-paired as admin (private mode).'));
+      console.log(chalk.dim('  Mercury will respond to messages in your "Note to Self" chat.'));
+      console.log('');
+      await signalChannel.stop();
+      saveConfig(config);
+      return;
+    }
+    console.log(chalk.dim('  Send /pair in your Signal "Note to Self" chat to get a pairing code.'));
+  }
+  console.log('');
+
+  try {
+    while (true) {
+      const pairingCode = await ask(chalk.white('  Signal Pairing Code (or press Enter to skip): '));
+      if (!pairingCode) {
+        console.log(chalk.dim('  You can pair later by sending /pair in Signal and running: mercury signal approve <code>'));
+        break;
+      }
+
+      // Reload config from disk — SignalChannel may have saved the pending request
+      const freshConfig = loadConfig();
+      const approved = approveSignalPendingRequestByPairingCode(freshConfig, pairingCode.trim());
+      if (!approved) {
+        console.log(chalk.red('  That pairing code is not valid. Make sure you sent /pair in Signal and enter the exact code.'));
+        continue;
+      }
+
+      Object.assign(config, freshConfig);
+      saveConfig(config);
+      console.log(chalk.green(`  ✓ Signal paired. First admin: ${formatSignalUser(approved)}.`));
+      console.log('');
+      break;
+    }
+  } finally {
+    await signalChannel.stop();
+  }
+
+  saveConfig(config);
+}
+
+async function completeInitialDiscordPairing(config: MercuryConfig): Promise<void> {
+  if (!config.channels.discord.enabled || !config.channels.discord.botToken || hasDiscordAdminsFn(config)) {
+    return;
+  }
+
+  console.log('');
+  console.log(chalk.bold.white('  Discord Pairing'));
+  console.log(chalk.dim('  1. Open Discord and DM your bot.'));
+  console.log(chalk.dim('  2. Send /start to receive your pairing code.'));
+  console.log(chalk.dim('  3. Paste that pairing code below to finish setup.'));
+  console.log('');
+
+  const discordChannel = new DiscordChannel(config);
+  try {
+    await discordChannel.start();
+  } catch (err: any) {
+    console.log(chalk.red(`\n  ✗ ${err.message || err}`));
+    console.log('');
+    await discordChannel.stop();
+    return;
+  }
+
+  try {
+    while (true) {
+      const pairingCode = await ask(chalk.white('  Discord Pairing Code: '));
+      if (!pairingCode) {
+        console.log(chalk.red('  Discord pairing code is required to continue.'));
+        continue;
+      }
+
+      const approved = approveDiscordPendingRequestByPairingCode(config, pairingCode.trim());
+      if (!approved) {
+        console.log(chalk.red('  That pairing code is not valid yet. Send /start in Discord, then paste the exact code here.'));
+        continue;
+      }
+
+      saveConfig(config);
+      console.log(chalk.green(`  ✓ Discord paired. First admin: ${formatDiscordUser(approved)}.`));
+      console.log('');
+      break;
+    }
+  } finally {
+    await discordChannel.stop();
+  }
+}
+
 async function configure(existingConfig?: MercuryConfig): Promise<void> {
   const isReconfig = !!existingConfig;
   const config = existingConfig ?? loadConfig();
@@ -659,9 +1272,23 @@ async function configure(existingConfig?: MercuryConfig): Promise<void> {
     const agentName = await ask(chalk.white(`  Agent name [${config.identity.name}]: `));
     if (agentName) config.identity.name = agentName;
   } else {
-    const ownerName = await ask(chalk.white('  Your name: '));
+    // Retry up to MAX_EMPTY_ATTEMPTS times before giving up, so an accidental
+    // Enter on the first-run "Your name" prompt doesn't immediately exit
+    // onboarding. Only exit after the user presses Enter with no value that
+    // many times in a row.
+    const MAX_EMPTY_ATTEMPTS = 3;
+    let ownerName = '';
+    let attempts = 0;
+    while (attempts < MAX_EMPTY_ATTEMPTS) {
+      ownerName = await ask(chalk.white('  Your name: '));
+      if (ownerName) break;
+      attempts++;
+      if (attempts < MAX_EMPTY_ATTEMPTS) {
+        console.log(chalk.red(`  Name is required. Please enter your name (${attempts}/${MAX_EMPTY_ATTEMPTS}).`));
+      }
+    }
     if (!ownerName) {
-      console.log(chalk.red('  Name is required.'));
+      console.log(chalk.red('  Name is required. Exiting setup — run `mercury` again to retry.'));
       process.exit(1);
     }
     config.identity.owner = ownerName;
@@ -674,16 +1301,70 @@ async function configure(existingConfig?: MercuryConfig): Promise<void> {
 
   hr();
   console.log('');
-  console.log(chalk.bold.white('  LLM Providers'));
-  if (isReconfig) {
-    console.log(chalk.dim('  Choose which providers to configure now. Existing values are shown where available.'));
-  } else {
-    console.log(chalk.dim('  Choose one or more providers. You can skip any provider by pressing Enter.'));
-    console.log(chalk.dim('  Press Enter to configure DeepSeek by default (free at platform.deepseek.com).'));
-  }
+  console.log(chalk.bold.white('  Mercury Cloud or Offline?'));
   console.log('');
+  if (!isReconfig) {
+    console.log(chalk.dim('  Mercury Cloud routes LLM calls through our servers — no API keys needed.'));
+    console.log(chalk.dim('  Offline (BYOK) uses your own API keys stored locally.'));
+    console.log('');
+  }
 
-   while (true) {
+  // Reconfig respects the current mode: the CURRENT connection mode is
+  // listed first (and therefore highlighted), so pressing Enter to "keep
+  // current" can't accidentally re-pair Mercury Cloud and reset the default
+  // provider — which used to silently override the user's last choice.
+  const inCloudMode = config.providers.default === 'mercuryCloud' || config.cloud.enabled === true;
+  const cloudOption = { value: 'cloud', label: 'Mercury Cloud (hosted — no API keys needed)' };
+  const offlineOption = { value: 'offline', label: 'Offline / BYOK (bring your own keys)' };
+  const modeOptions = isReconfig && !inCloudMode ? [offlineOption, cloudOption] : [cloudOption, offlineOption];
+  const cloudChoice = await selectWithArrowKeys(
+    isReconfig ? 'Connection Mode' : 'Choose your mode',
+    modeOptions,
+  );
+
+  let llmConfiguredByCloud = false;
+
+  if (cloudChoice === 'cloud') {
+    console.log('');
+    console.log(chalk.dim('  Connecting to Mercury Cloud...'));
+    console.log('');
+    try {
+      const { runCloudPairingFlow } = await import('./cloud/pairing-flow.js');
+      const result = await runCloudPairingFlow(config);
+      if (result) {
+        config.cloud = result.cloudConfig;
+        config.providers.mercuryCloud.apiKey = result.cloudConfig.jwt;
+        config.providers.mercuryCloud.model = result.model;
+        config.providers.mercuryCloud.enabled = true;
+        config.providers.default = 'mercuryCloud';
+        saveConfig(config);
+        console.log(chalk.green('  ✓ Mercury Cloud connected!'));
+        console.log(chalk.dim(`    Agent ID: ${result.cloudConfig.agentId}`));
+        console.log(chalk.dim(`    Tier: ${result.cloudConfig.tier}`));
+        console.log(chalk.dim(`    Model: ${result.model}`));
+        llmConfiguredByCloud = true;
+      }
+    } catch (err: any) {
+      console.log(chalk.red(`  ✗ Cloud connection failed: ${err.message || err}`));
+      console.log(chalk.yellow('  Falling back to offline (BYOK) mode.'));
+    }
+  } else {
+    config.cloud.enabled = false;
+  }
+
+  if (!llmConfiguredByCloud) {
+    hr();
+    console.log('');
+    console.log(chalk.bold.white('  LLM Providers'));
+    if (isReconfig) {
+      console.log(chalk.dim('  Choose which providers to configure now. Existing values are shown where available.'));
+    } else {
+      console.log(chalk.dim('  Choose one or more providers. You can skip any provider by pressing Enter.'));
+      console.log(chalk.dim('  Press Enter to configure DeepSeek by default (free at platform.deepseek.com).'));
+    }
+    console.log('');
+
+    while (true) {
     const selectedProviders = await chooseProvidersToConfigure(config, isReconfig);
     console.log('');
 
@@ -694,6 +1375,23 @@ async function configure(existingConfig?: MercuryConfig): Promise<void> {
     }
 
     for (const provider of selectedProviders) {
+      if (provider === 'aimlapi') {
+        const mask = isReconfig && config.providers.aimlapi.apiKey ? ` [${maskKey(config.providers.aimlapi.apiKey)}]` : '';
+        const result = await promptApiKeyWithModelSelection(
+          config,
+          'aimlapi',
+          'AI/ML API',
+          chalk.white(`  AI/ML API key${mask}${isReconfig ? '' : ' (Enter to skip)'}: `),
+          isReconfig,
+        );
+        if (!result.skipped && result.apiKey && result.model) {
+          config.providers.aimlapi.apiKey = result.apiKey;
+          config.providers.aimlapi.model = result.model;
+          config.providers.aimlapi.enabled = true;
+        }
+        continue;
+      }
+
       if (provider === 'deepseek') {
         const mask = isReconfig && config.providers.deepseek.apiKey ? ` [${maskKey(config.providers.deepseek.apiKey)}]` : '';
         const result = await promptApiKeyWithModelSelection(
@@ -839,6 +1537,23 @@ async function configure(existingConfig?: MercuryConfig): Promise<void> {
         continue;
       }
 
+      if (provider === 'atlascloud') {
+        const mask = isReconfig && config.providers.atlascloud.apiKey ? ` [${maskKey(config.providers.atlascloud.apiKey)}]` : '';
+        const result = await promptApiKeyWithModelSelection(
+          config,
+          'atlascloud',
+          'Atlas Cloud',
+          chalk.white(`  Atlas Cloud API key${mask}${isReconfig ? '' : ' (Enter to skip)'}: `),
+          isReconfig,
+        );
+        if (!result.skipped && result.apiKey && result.model) {
+          config.providers.atlascloud.apiKey = result.apiKey;
+          config.providers.atlascloud.model = result.model;
+          config.providers.atlascloud.enabled = true;
+        }
+        continue;
+      }
+
       if (provider === 'ollamaCloud') {
         const mask = isReconfig && config.providers.ollamaCloud.apiKey ? ` [${maskKey(config.providers.ollamaCloud.apiKey)}]` : '';
         const result = await promptApiKeyWithModelSelection(
@@ -862,6 +1577,26 @@ async function configure(existingConfig?: MercuryConfig): Promise<void> {
           config.providers.ollamaLocal.baseUrl = result.baseUrl;
           config.providers.ollamaLocal.model = result.model;
           config.providers.ollamaLocal.enabled = true;
+        }
+        continue;
+      }
+
+      if (provider === 'lmStudio') {
+        const result = await promptLmStudioModelSelection(config, isReconfig);
+        if (!result.skipped && result.baseUrl && result.model) {
+          config.providers.lmStudio.baseUrl = result.baseUrl;
+          config.providers.lmStudio.model = result.model;
+          config.providers.lmStudio.enabled = true;
+        }
+        continue;
+      }
+
+      if (provider === 'atomicChat') {
+        const result = await promptAtomicChatModelSelection(config, isReconfig);
+        if (!result.skipped && result.baseUrl && result.model) {
+          config.providers.atomicChat.baseUrl = result.baseUrl;
+          config.providers.atomicChat.model = result.model;
+          config.providers.atomicChat.enabled = true;
         }
         continue;
       }
@@ -980,42 +1715,34 @@ async function configure(existingConfig?: MercuryConfig): Promise<void> {
 
     const configuredProviders = getConfiguredProviderNames(config);
     if (configuredProviders.length === 0) {
+      saveConfig(config);
       console.log('');
-      console.log(chalk.yellow('  No LLM providers were configured.'));
-      console.log(chalk.dim('  Mercury needs at least one provider to work.'));
-      console.log(chalk.dim('  DeepSeek offers a free API key at platform.deepseek.com'));
+      console.log(chalk.yellow('  No LLM provider configured yet. Run `mercury doctor` when ready to add one.'));
       console.log('');
-      console.log(chalk.white('  Options:'));
-      console.log(chalk.white('    1. Try again — choose a provider and enter an API key'));
-      console.log(chalk.white('    2. Skip for now — you can run `mercury doctor` later'));
-      console.log('');
-
-      const skipChoice = await ask(chalk.white('  Press Enter to try again, or type "skip" to exit setup: '));
-      if (skipChoice.toLowerCase() === 'skip') {
-        saveConfig(config);
-        const home = getMercuryHome();
-        console.log('');
-        console.log(chalk.green(`  ✓ Config saved to ${home}/mercury.yaml`));
-        console.log(chalk.yellow('  No providers configured yet. Run `mercury doctor` when ready.'));
-        console.log('');
-        process.exit(0);
-      }
-
-      console.log('');
-      continue;
+    } else {
+      await chooseDefaultProvider(config);
     }
-
-    await chooseDefaultProvider(config);
     break;
+  }
+  } else {
+    console.log('');
+    console.log(chalk.dim('  Continuing with shared Mercury setup: channels, integrations, budget, and web dashboard.'));
   }
 
   hr();
   console.log('');
   console.log(chalk.bold.white('  Telegram (optional)'));
+  // On first run, show the how-to guide so the user knows how to get a bot
+  // token. On reconfig (e.g. `mercury doctor`), skip the guide for an
+  // already-configured channel — only re-show it if the user clears the
+  // existing token (by entering "none" or a new value).
+  const tgAlreadyConfigured = isReconfig && !!config.channels.telegram.botToken;
   if (isReconfig) {
     console.log(chalk.dim('  Leave empty to keep current value. Enter "none" to disable.'));
   } else {
     console.log(chalk.dim('  Leave empty to skip. You can add it later.'));
+  }
+  if (!tgAlreadyConfigured) {
     console.log(chalk.dim('  To create a bot token:'));
     console.log(chalk.dim('    1. Open Telegram and message @BotFather'));
     console.log(chalk.dim('    2. Run /newbot and follow the prompts'));
@@ -1041,6 +1768,304 @@ async function configure(existingConfig?: MercuryConfig): Promise<void> {
   }
 
   await completeInitialTelegramPairing(config);
+
+  hr();
+  console.log('');
+  console.log(chalk.bold.white('  Signal (optional)'));
+  const sigAlreadyConfigured = isReconfig && !!config.channels.signal.phoneNumber;
+  if (isReconfig && config.channels.signal.phoneNumber) {
+    console.log(chalk.dim('  Leave empty to keep current number. Enter "none" to disable Signal.'));
+    console.log(chalk.dim('  Enter "reset" to start fresh (clear config, optionally delete binary).'));
+    console.log(chalk.dim('  Enter "unregister" to unlink this device from Signal and clear all data.'));
+  } else {
+    console.log(chalk.dim('  Leave empty to skip. You can add it later with mercury doctor.'));
+  }
+  if (!sigAlreadyConfigured) {
+    console.log(chalk.dim('  Include country code, e.g. +1 for US, +44 for UK, +91 for India.'));
+    console.log(chalk.dim('  Signal lets you chat with Mercury through a Signal group or private chat.'));
+  }
+  console.log('');
+
+  const signalPhoneCurrent = isReconfig && config.channels.signal.phoneNumber ? ` [${redactPhone(config.channels.signal.phoneNumber)}]` : '';
+  const signalPhoneInput = await ask(chalk.white(`  Signal phone number${signalPhoneCurrent}: `));
+
+  if (isReconfig && signalPhoneInput.toLowerCase() === 'none') {
+    config.channels.signal.enabled = false;
+    config.channels.signal.phoneNumber = '';
+    clearSignalAccess(config);
+    saveConfig(config);
+  } else if (isReconfig && signalPhoneInput.toLowerCase() === 'unregister') {
+    console.log('');
+    console.log(chalk.yellow('  ⚠️  This will unlink this device from Signal and clear all Mercury Signal data.'));
+    console.log(chalk.yellow('  Mercury will no longer be able to send or receive Signal messages.'));
+    console.log('');
+    const confirmUnregister = await ask(chalk.white('  Continue? (y/N): '));
+    if (confirmUnregister.toLowerCase() !== 'y' && confirmUnregister.toLowerCase() !== 'yes') {
+      console.log(chalk.dim('  Cancelled.'));
+    } else {
+      const phoneNumberToDelete = config.channels.signal.phoneNumber;
+
+      // Send goodbye message (best effort, skip if signal-cli not installed or target gone)
+      const { findSignalCli, sendSignalMessage } = await import('./signal/setup.js');
+      if (findSignalCli()) {
+        const target: { groupId?: string; recipient?: string } = {};
+        if (config.channels.signal.mode === 'group' && config.channels.signal.groupId) {
+          target.groupId = config.channels.signal.groupId;
+        } else if (config.channels.signal.admins.length > 0) {
+          target.recipient = config.channels.signal.admins[0].phoneNumber;
+        }
+        if (target.groupId || target.recipient) {
+          try {
+            await sendSignalMessage(config.channels.signal.phoneNumber, 'Mercury has been unregistered from this conversation. It will no longer respond here. To reconnect, the admin needs to set up Signal again with: mercury doctor', target);
+          } catch { /* best effort */ }
+        }
+      }
+
+      const { killStaleSignalCliProcesses } = await import('./signal/jsonrpc.js');
+      killStaleSignalCliProcesses();
+
+      // Unregister from Signal server
+      console.log(chalk.dim('  Unlinking device from Signal...'));
+      const { unregisterSignalNumber } = await import('./signal/setup.js');
+      const unregResult = await unregisterSignalNumber(config.channels.signal.phoneNumber);
+      if (unregResult.success) {
+        console.log(chalk.green('  ✓ Device unlinked from Signal server.'));
+      } else {
+        console.log(chalk.yellow('  ⚠ Could not reach Signal server to unlink device.'));
+        console.log(chalk.dim('  Local data has been cleared. The device will be unlinked automatically.'));
+      }
+
+      clearSignalAccess(config);
+      config.channels.signal.enabled = false;
+      config.channels.signal.phoneNumber = '';
+      config.channels.signal.groupId = undefined;
+      config.channels.signal.groupName = undefined;
+      saveConfig(config);
+
+      const { deleteSignalCliAccountData } = await import('./signal/setup.js');
+      if (phoneNumberToDelete) {
+        deleteSignalCliAccountData(phoneNumberToDelete);
+      }
+
+      console.log(chalk.green('  ✓ Signal data cleared.'));
+
+      const setupNew = await ask(chalk.white('  Set up Signal with a new number now? (y/N): '));
+      if (setupNew.toLowerCase() === 'y' || setupNew.toLowerCase() === 'yes') {
+        const newPhone = await ask(chalk.white('  New Signal phone number (e.g. +1234567890): '));
+        if (newPhone) {
+          config.channels.signal.phoneNumber = newPhone.trim();
+          config.channels.signal.enabled = true;
+          const modeAnswer = await ask(chalk.white('  Mode — group or private? [group]: '));
+          config.channels.signal.mode = modeAnswer.toLowerCase().startsWith('private') ? 'private' : 'group';
+          saveConfig(config);
+        }
+      }
+    }
+  } else if (isReconfig && signalPhoneInput.toLowerCase() === 'reset') {
+    clearSignalAccess(config);
+    config.channels.signal.enabled = false;
+    config.channels.signal.phoneNumber = '';
+    saveConfig(config);
+
+    console.log('');
+    console.log(chalk.yellow('  ⚠️  This will clear all Signal access and group connection.'));
+    const deleteBinary = await ask(chalk.white('  Also delete the signal-cli binary? (y/N): '));
+    if (deleteBinary.toLowerCase() === 'y' || deleteBinary.toLowerCase() === 'yes') {
+      const { removeSignalCli, getSignalCliDir } = await import('./signal/setup.js');
+      const { existsSync } = await import('node:fs');
+      if (existsSync(getSignalCliDir())) {
+        removeSignalCli();
+        console.log(chalk.green('  ✓ Signal binary removed.'));
+      }
+    }
+
+    console.log(chalk.green('  ✓ Signal config reset.'));
+    console.log(chalk.dim('  Continue below to set up Signal with a new number.'));
+    console.log('');
+
+    const newPhone = await ask(chalk.white('  New Signal phone number (e.g. +1234567890): '));
+    if (newPhone) {
+      config.channels.signal.phoneNumber = newPhone.trim();
+      config.channels.signal.enabled = true;
+
+      const modeAnswer = await ask(chalk.white('  Mode — group or private? [group]: '));
+      config.channels.signal.mode = modeAnswer.toLowerCase().startsWith('private') ? 'private' : 'group';
+
+      saveConfig(config);
+    }
+  } else if (signalPhoneInput) {
+    if (signalPhoneInput !== config.channels.signal.phoneNumber) {
+      clearSignalAccess(config);
+    }
+    config.channels.signal.phoneNumber = signalPhoneInput.trim();
+    config.channels.signal.enabled = true;
+
+    const modeAnswer = await ask(chalk.white('  Mode — group or private? [group]: '));
+    config.channels.signal.mode = modeAnswer.toLowerCase().startsWith('private') ? 'private' : 'group';
+
+    saveConfig(config);
+  } else if (!config.channels.signal.phoneNumber) {
+    config.channels.signal.enabled = false;
+    saveConfig(config);
+  }
+
+  await completeInitialSignalSetup(config);
+
+  hr();
+  console.log('');
+  console.log(chalk.bold.white('  Discord (optional)'));
+  const dcAlreadyConfigured = isReconfig && !!config.channels.discord.botToken;
+  if (isReconfig) {
+    console.log(chalk.dim('  Leave empty to keep current value. Enter "none" to disable.'));
+  } else {
+    console.log(chalk.dim('  Leave empty to skip. You can add it later.'));
+  }
+  if (!dcAlreadyConfigured) {
+    console.log(chalk.dim('  To create a Discord bot:'));
+    console.log(chalk.dim('    1. Go to https://discord.com/developers/applications'));
+    console.log(chalk.dim('    2. Click "New Application" → give it a name'));
+    console.log(chalk.dim('    3. Navigate to Bot → Click "Reset Token" → Copy the token'));
+    console.log(chalk.dim('    4. Enable Privileged Gateway Intents:'));
+    console.log(chalk.dim('       - Message Content Intent'));
+    console.log(chalk.dim('    5. Go to OAuth2 → URL Generator:'));
+    console.log(chalk.dim('       Scopes: bot, applications.commands'));
+    console.log(chalk.dim('       Bot Permissions: Send Messages, Read Message History,'));
+    console.log(chalk.dim('       Use Slash Commands, Attach Files, Embed Links'));
+    console.log(chalk.dim('    6. Open the generated URL to invite the bot to your server'));
+    console.log(chalk.dim('    7. Optionally create a "Mercury Admin" role in your server'));
+    console.log(chalk.dim('  Guild members can chat openly. DMs require pairing (like Telegram).'));
+  }
+  console.log('');
+
+  const dcMask = isReconfig && config.channels.discord.botToken ? ` [${maskKey(config.channels.discord.botToken)}]` : '';
+  const discordToken = await ask(chalk.white(`  Discord Bot Token${dcMask}: `));
+  if (isReconfig && discordToken.toLowerCase() === 'none') {
+    config.channels.discord.enabled = false;
+    config.channels.discord.botToken = '';
+    clearDiscordAccess(config);
+  } else if (discordToken) {
+    if (discordToken !== config.channels.discord.botToken) {
+      clearDiscordAccess(config);
+    }
+    config.channels.discord.botToken = discordToken;
+    appendToEnv('DISCORD_BOT_TOKEN', discordToken);
+    config.channels.discord.enabled = true;
+  }
+
+  if (config.channels.discord.enabled && config.channels.discord.botToken) {
+    if (!config.channels.discord.guildId) {
+      console.log('');
+      console.log(chalk.dim('  To find your Server ID: in Discord, go to Settings → App Settings →'));
+      console.log(chalk.dim('  Advanced → toggle Developer Mode ON. Then right-click your server'));
+      console.log(chalk.dim('  name in the sidebar → Copy Server ID.'));
+      const guildId = await ask(chalk.white('  Discord Guild/Server ID (optional — leave empty for all servers): '));
+      if (guildId.trim()) {
+        config.channels.discord.guildId = guildId.trim();
+      }
+    }
+
+    if (!config.channels.discord.channelId) {
+      console.log(chalk.dim('  To find a Channel ID: right-click the channel name in the sidebar → Copy Channel ID.'));
+      const channelId = await ask(chalk.white('  Discord Channel ID (optional — leave empty for all channels): '));
+      if (channelId.trim()) {
+        config.channels.discord.channelId = channelId.trim();
+      }
+    }
+
+    const adminRoleCurrent = isReconfig && config.channels.discord.adminRoleName ? ` [${config.channels.discord.adminRoleName}]` : '';
+    const adminRoleName = await ask(chalk.white(`  Admin role name${adminRoleCurrent} [Mercury Admin]: `));
+    if (adminRoleName.trim()) {
+      config.channels.discord.adminRoleName = adminRoleName.trim();
+    } else if (!config.channels.discord.adminRoleName) {
+      config.channels.discord.adminRoleName = 'Mercury Admin';
+    }
+
+    saveConfig(config);
+  } else if (!config.channels.discord.botToken) {
+    config.channels.discord.enabled = false;
+    saveConfig(config);
+  }
+
+  await completeInitialDiscordPairing(config);
+
+  hr();
+  console.log('');
+  console.log(chalk.bold.white('  Slack (optional)'));
+  const slAlreadyConfigured = isReconfig && !!config.channels.slack.botToken;
+  if (isReconfig) {
+    console.log(chalk.dim('  Leave empty to keep current value. Enter "none" to disable.'));
+  } else {
+    console.log(chalk.dim('  Leave empty to skip. You can add it later.'));
+  }
+  if (!slAlreadyConfigured) {
+    console.log(chalk.dim('  To create a Slack app:'));
+    console.log(chalk.dim('    1. Go to https://api.slack.com/apps → Create New App → From scratch'));
+    console.log(chalk.dim('    2. Under "Socket Mode", enable it and generate an App-Level Token'));
+    console.log(chalk.dim('       with connections:write scope → copy the xapp- token'));
+    console.log(chalk.dim('    3. Under "OAuth & Permissions", add Bot Token Scopes:'));
+    console.log(chalk.dim('       chat:write, chat:write.public, chat:write.customize,'));
+    console.log(chalk.dim('       channels:history, groups:history, im:history, im:write,'));
+    console.log(chalk.dim('       files:write, commands, app_mentions:read'));
+    console.log(chalk.dim('    4. Install app to workspace → copy Bot User OAuth Token (xoxb-)'));
+    console.log(chalk.dim('    5. Under "Event Subscriptions", enable and subscribe to:'));
+    console.log(chalk.dim('       message.channels, message.groups, message.im, app_mention'));
+    console.log(chalk.dim('    6. Under "Interactivity & Shortcuts", enable interactivity'));
+    console.log(chalk.dim('    7. Under "Slash Commands", create /mercury command'));
+    console.log(chalk.dim('    8. Under "App Home", check "Allow users to send Slash commands'));
+    console.log(chalk.dim('       and messages from the messages tab"'));
+    console.log(chalk.dim('    9. Invite the bot to your channel: /invite @Mercury'));
+    console.log(chalk.dim('    10. DM the bot /mercury start to become the first admin.'));
+    console.log(chalk.dim('  Channel members can chat openly. DMs require admin approval.'));
+  }
+
+  const slMask = isReconfig && config.channels.slack.botToken ? ` [${maskKey(config.channels.slack.botToken)}]` : '';
+  const slackBotToken = await ask(chalk.white(`  Slack Bot Token${slMask} (starts with xoxb-): `));
+  if (isReconfig && slackBotToken.toLowerCase() === 'none') {
+    config.channels.slack.enabled = false;
+    config.channels.slack.botToken = '';
+    clearSlackAccess(config);
+  } else if (slackBotToken) {
+    if (slackBotToken !== config.channels.slack.botToken) {
+      clearSlackAccess(config);
+    }
+    config.channels.slack.botToken = slackBotToken;
+    appendToEnv('SLACK_BOT_TOKEN', slackBotToken);
+  }
+
+  if (config.channels.slack.enabled || config.channels.slack.botToken) {
+    const slAppMask = isReconfig && config.channels.slack.appToken ? ` [${maskKey(config.channels.slack.appToken)}]` : '';
+    const slackAppToken = await ask(chalk.white(`  Slack App-Level Token${slAppMask} (starts with xapp-): `));
+    if (slackAppToken && slackAppToken.toLowerCase() !== 'none') {
+      config.channels.slack.appToken = slackAppToken;
+      appendToEnv('SLACK_APP_TOKEN', slackAppToken);
+    } else if (slackAppToken.toLowerCase() === 'none') {
+      config.channels.slack.appToken = '';
+    }
+
+    if (config.channels.slack.botToken) {
+      config.channels.slack.enabled = true;
+
+      if (!config.channels.slack.channelId) {
+        console.log(chalk.dim('  To find a Channel ID: right-click the channel name → Copy Channel ID.'));
+        const slChannelId = await ask(chalk.white('  Slack Channel ID (optional — leave empty for all channels): '));
+        if (slChannelId.trim()) {
+          config.channels.slack.channelId = slChannelId.trim();
+        }
+      }
+
+      if (!config.channels.slack.teamId) {
+        const slTeamId = await ask(chalk.white('  Slack Team/Workspace ID (optional): '));
+        if (slTeamId.trim()) {
+          config.channels.slack.teamId = slTeamId.trim();
+        }
+      }
+
+      saveConfig(config);
+    }
+  } else if (!config.channels.slack.botToken) {
+    config.channels.slack.enabled = false;
+    saveConfig(config);
+  }
 
   hr();
   console.log('');
@@ -1204,6 +2229,21 @@ async function configure(existingConfig?: MercuryConfig): Promise<void> {
     console.log(chalk.dim('  Web dashboard disabled. You can enable it later with `mercury doctor`.'));
   }
 
+  // Permission mode: asked once here and remembered by every surface
+  // (terminal, attached terminal, dashboard). /permissions changes it later.
+  console.log('');
+  const currentMode = loadPermissionMode();
+  const permissionChoice = await selectWithArrowKeys(
+    currentMode ? `Permissions (now: ${currentMode === 'allow-all' ? 'Allow All' : 'Ask Me'})` : 'How should Mercury handle risky actions?',
+    [
+      { value: 'ask-me', label: 'Ask Me — confirm before it writes files or runs commands' },
+      { value: 'allow-all', label: 'Allow All — just do it (blocked commands stay blocked)' },
+    ],
+  );
+  const permissionMode = permissionChoice === 'allow-all' ? 'allow-all' : 'ask-me';
+  savePermissionMode(permissionMode);
+  console.log(chalk.dim(`  ${permissionMode === 'allow-all' ? 'Allow All' : 'Ask Me'} saved · change any time with /permissions`));
+
   saveConfig(config);
 
   const home = getMercuryHome();
@@ -1218,22 +2258,90 @@ async function configure(existingConfig?: MercuryConfig): Promise<void> {
   }
   console.log('');
   console.log(chalk.cyan(`  ${config.identity.name} is ready. Run \`mercury start\` to chat.`));
-  console.log(chalk.dim('  mercury.cosmicstack.org'));
+  console.log(chalk.dim('  mercuryagent.sh'));
   console.log('');
 }
 
-function autoDaemonize(): void {
+/**
+ * The runtime passed the PID-liveness check but its web endpoint is dead — a
+ * hung process, or a web server that failed to bind (EADDRINUSE leaves the
+ * daemon alive but web-less). Without this, the single-runtime rule bricked
+ * the launcher: every `mercury` invocation attached into the dead end and
+ * exited, and only a user who knew to run `mercury stop` could recover.
+ * The user's intent when typing `mercury` is to chat, so restart and boot.
+ */
+/**
+ * Auto-attach entry for launch paths that found a "running" runtime. Attach,
+ * or — when the runtime proved unresponsive — heal it and boot fresh.
+ */
+/**
+ * Attach, and if the user asks for Mercury Code from inside the attach TUI,
+ * boot it here: runAgent() beside the live daemon is a terminal for the
+ * main agent only (ADR-024) and honours MERCURY_BOOT_CODE.
+ */
+async function attachOrCode(opts?: Parameters<typeof runAttach>[0]): Promise<AttachResult> {
+  const result = await runAttach(opts);
+  if (result === 'code') {
+    await runAgent();
+    return 'attached';
+  }
+  return result;
+}
+
+async function attachOrHeal(): Promise<void> {
+  const result = await attachOrCode();
+  if (result === 'attached') return;
+  if (result !== 'unhealthy') { process.exitCode = 1; return; }
+  await healRuntimeAndBoot();
+}
+
+async function healRuntimeAndBoot(): Promise<void> {
+  console.log(chalk.yellow('  Runtime is not responding — restarting it...'));
+  await stopForegroundRuntime();
+  await stopDaemon();
+  await bootDaemonThenAttach();
+}
+
+/**
+ * The daemon is the runtime; the terminal attaches to it. Only when no
+ * daemon can run here (Termux, unsupported platform) does the terminal
+ * become the runtime itself.
+ */
+async function bootDaemonThenAttach(): Promise<void> {
+  if (!autoDaemonize()) {
+    await runAgent();
+    return;
+  }
+  const result = await attachOrCode();
+  if (result === 'attached') return;
+  // The daemon came up but we could not attach (web disabled, port taken):
+  // a terminal for the main agent only — runAgent() sees the live daemon
+  // and leaves channels, bots and the port to it.
+  await runAgent();
+}
+
+function autoDaemonize(): boolean {
   const daemon = getDaemonStatus();
   if (daemon.running && daemon.pid) {
-    return;
+    return true;
   }
 
   console.log(chalk.dim('  Setting up background mode...'));
 
+  // installService() never exits the process (Termux / unsupported platforms
+  // print a hint and return false) \u2014 the daemon is still started below so
+  // the wizard flow completes on phones too.
+  let serviceInstalled = false;
   try {
-    if (!isServiceInstalled()) {
-      installService();
+    // A service left behind by a previous install (npm global, an older
+    // binary) resurrects THAT daemon on every login — the new build then
+    // never owns the port. Re-point it before starting anything.
+    const drift = serviceDrift();
+    if (drift) {
+      console.log(chalk.yellow(`  Login service launches an older install: ${drift.installed}`));
+      console.log(chalk.yellow(`  Re-pointing it to this build: ${drift.expected}`));
     }
+    serviceInstalled = (isServiceInstalled() && !drift) || installService();
   } catch {
     console.log(chalk.dim('  Service install skipped (can run `mercury service install` later).'));
   }
@@ -1242,12 +2350,17 @@ function autoDaemonize(): void {
   if (ok) {
     const status = getDaemonStatus();
     console.log(chalk.green(`  \u2713 Mercury is running in background (PID: ${status.pid})`));
-    console.log(chalk.green('  \u2713 Auto-starts on login. Auto-restarts on crash.'));
+    if (serviceInstalled) {
+      console.log(chalk.green('  \u2713 Auto-starts on login. Auto-restarts on crash.'));
+    } else {
+      console.log(chalk.dim('  No login service on this platform \u2014 run `mercury up` after a reboot.'));
+    }
     console.log(chalk.dim('  Use `mercury stop` to stop. `mercury restart` to restart.'));
   } else {
     console.log(chalk.yellow('  Background mode not available. Run `mercury start` to set it up.'));
   }
   console.log('');
+  return getDaemonStatus().running;
 }
 
 function runPlatformDoctor(): void {
@@ -1265,7 +2378,7 @@ function runPlatformDoctor(): void {
   console.log(chalk.dim('  Cross-platform runtime compatibility report'));
   console.log('');
   console.log(`  OS:                 ${chalk.white(process.platform)} (${process.arch})`);
-  console.log(`  Node.js:            ${chalk.white(process.version)} (required >= 20)`);
+  console.log(`  Node.js:            ${chalk.white(process.version)} (required >= 22)`);
   console.log(`  Terminal program:   ${chalk.white(termProgram)}`);
   console.log(`  TERM:               ${chalk.white(term)}`);
   console.log(`  Interactive TTY:    ${isTTY ? chalk.green('yes') : chalk.yellow('no')}`);
@@ -1273,7 +2386,13 @@ function runPlatformDoctor(): void {
   console.log(`  SSH session:        ${sshSession ? chalk.yellow('yes') : chalk.green('no')}`);
   console.log(`  CI environment:     ${ci ? chalk.yellow('yes') : chalk.green('no')}`);
   console.log(`  Daemon:             ${daemon.running ? chalk.green(`running (PID: ${daemon.pid})`) : chalk.dim('not running')}`);
+  {
+    const drift = serviceDrift();
+    console.log(`  Login service:      ${!isServiceInstalled() ? chalk.dim('not installed') : drift ? chalk.red(`STALE — launches ${drift.installed} (run mercury service install)`) : chalk.green('points at this install')}`);
+  }
   console.log(`  Spotify inline art: ${canInlineArt ? chalk.green('supported (iTerm local)') : chalk.dim('disabled/fallback mode')}`);
+  const inkPatch = detectInkPatch();
+  console.log(`  Ink TUI patch:      ${inkPatch.patched ? chalk.green(describeInkPatch(inkPatch)) : chalk.red(describeInkPatch(inkPatch))}`);
   console.log('');
   console.log(chalk.bold.white('  Keybinding Notes'));
   console.log(`  • View toggle:      ${chalk.white('Ctrl+T')} (fallback: ${chalk.white('/view')})`);
@@ -1286,12 +2405,98 @@ function runPlatformDoctor(): void {
     console.log(chalk.dim('  Try a local terminal session with TTY support for the best experience.'));
     console.log('');
   }
+
+  if (!inkPatch.patched) {
+    console.log(chalk.yellow('  Warning: the ink patch set is not active — the TUI stops rendering new messages after ~100 and may crash on long sessions.'));
+    console.log(chalk.dim(`  Fix: ${inkPatchFixCommand()}  (then restart Mercury)`));
+    console.log('');
+  }
 }
 
 async function runAgent(isDaemon: boolean = false): Promise<void> {
+  const runtimeMode = isDaemon ? 'daemon' : 'foreground';
+  // launchd/systemd units carry a pinned PATH; Task Scheduler cannot.
+  if (isDaemon) pinDaemonPathOnWindows();
+  registerRuntimeProcess(runtimeMode);
+  // ONE runtime owns channels, bots and the web port. A foreground runtime
+  // beside a live daemon (mercury code, a recovery boot) is a terminal for
+  // the main agent only: a second fleet in the TUI process ran every bot
+  // turn on the thread that paints keystrokes, and a second Telegram poller
+  // made Telegram answer 409 to both. (ADR-024)
+  const daemonOwnsRuntime = !isDaemon && getDaemonStatus().running;
+  startLoopLagMonitor();
+
+  // Crash forensics: V8 fatal errors (heap OOM etc.) print a native stack
+  // that scrolls away with the TUI. Ask V8 to keep a stack trace for the
+  // exception and dump JS reason + recent state to a file we can read
+  // after the abort. Best-effort by design.
+  try {
+    const { writeCrashFlag } = await import('./core/crash-flag.js');
+    const { getMercuryHome } = await import('./utils/config.js');
+    const { appendFileSync } = await import('node:fs');
+    const dumpFile = join(getMercuryHome(), 'crash-report.log');
+    const line = (m: string) => appendFileSync(dumpFile, `[${new Date().toISOString()}] ${m}\n`);
+    removeBootCrashHandlers();
+    Error.stackTraceLimit = 50;
+    if (typeof (process as any).report !== 'undefined') {
+      try { (process as any).report.uncaughtException = true; } catch { /* unsupported */ }
+    }
+    process.on('uncaughtException', (err) => {
+      try { line(`UNCAUGHT: ${err?.stack || err}`); } catch { /* disk full */ }
+      // A throw from a plugin's own code (a stray timer, an event handler)
+      // disables that plugin instead of taking Mercury down with it.
+      try { if (peekPluginManager()?.attributeFault(err)) return; } catch { /* fall through to exit */ }
+      try { writeCrashFlag({ reason: `Uncaught: ${String(err?.message || err)}`.slice(0, 300), timestamp: Date.now() }); } catch {}
+      // A TUI-crashed process must not linger headless: it would hold the
+      // runtime pid files and silently block every future launch. Print,
+      // persist, and exit — durable recovery replays any interrupted work.
+      try {
+        process.stderr.write(`\n⚠ Mercury hit an uncaught error: ${String(err?.message || err)}\n  Details: ~/.mercury/crash-report.log\n`);
+      } catch { /* stderr gone */ }
+      process.exit(1);
+    });
+    process.on('unhandledRejection', (reason) => {
+      try { line(`REJECTION: ${reason instanceof Error ? reason.stack : String(reason)}`); } catch {}
+      try { if (peekPluginManager()?.attributeFault(reason)) return; } catch { /* keep going */ }
+      // A rejected boot (e.g. "runtime already running") must fail loudly,
+      // not exit(0) as if nothing happened.
+      const message = String(reason instanceof Error ? reason.message : reason || '');
+      if (/already running|EADDRINUSE|registerRuntimeProcess/i.test(message)) {
+        try {
+          process.stderr.write(`\n✗ Mercury cannot start: ${message}\n  Attach to it with \`mercury attach\`, or stop it with \`mercury stop\` / \`kill <pid>\`.\n`);
+        } catch { /* stderr gone */ }
+        process.exit(1);
+      }
+    });
+    process.on('SIGABRT', () => {
+      try { line('SIGABRT received — V8 fatal error (likely OOM). Heap stats follow.'); } catch {}
+      try {
+        const mu = process.memoryUsage();
+        line(`heapUsed=${(mu.heapUsed / 1048576).toFixed(1)}MB heapTotal=${(mu.heapTotal / 1048576).toFixed(1)}MB rss=${(mu.rss / 1048576).toFixed(1)}MB`);
+      } catch {}
+    });
+  } catch { /* forensics must never block boot */ }
+
   let config = loadConfig();
   config = ensureCreatorField(config);
   const name = config.identity.name;
+
+  // Check for crash flag from previous run — if Mercury crashed mid-task,
+  // report it to the user immediately so they don't have to investigate.
+  const { readCrashFlag, clearCrashFlag } = await import('./core/crash-flag.js');
+  const crashFlag = readCrashFlag();
+  if (crashFlag) {
+    clearCrashFlag();
+    const age = Math.round((Date.now() - crashFlag.timestamp) / 1000);
+    const timeAgo = age >= 60 ? `${Math.floor(age / 60)}m ago` : `${age}s ago`;
+    const msg = `⚠ Mercury crashed ${timeAgo}: ${crashFlag.reason}`;
+    if (!isDaemon) {
+      console.log(chalk.yellow(`  ${msg}`));
+      console.log(chalk.dim('  If you had an active task, it was interrupted. You can retry.\n'));
+    } else {
+      logger.warn({ crashFlag }, 'Previous crash detected');
+    }
+  }
 
   if (!isDaemon) {
     logger.info(`${name} is waking up...`);
@@ -1299,8 +2504,16 @@ async function runAgent(isDaemon: boolean = false): Promise<void> {
     logger.info(`${name} is waking up (daemon mode)...`);
   }
 
+  if (daemonOwnsRuntime) logger.info({ daemonPid: getDaemonStatus().pid }, 'Background daemon owns channels, bots and web — this terminal runs the main agent only');
   const tokenBudget = new TokenBudget(config);
-  const providers = await ProviderRegistry.create(config);
+
+  // Initialize the shared cloud token store before providers so the
+  // MercuryCloud provider can read from / write back to the single source of
+  // truth for the access + (single-use) refresh token.
+  const cloudTokenStore = config.cloud.enabled && config.cloud.jwt && config.cloud.agentId
+    ? initCloudTokenStore(config)
+    : null;
+  const providers = await ProviderRegistry.create(config, cloudTokenStore);
 
   if (!providers.hasProviders()) {
     if (isDaemon) {
@@ -1340,11 +2553,13 @@ async function runAgent(isDaemon: boolean = false): Promise<void> {
   const identity = new Identity();
   migrateLegacyMemory();
   const shortTerm = new ShortTermMemory(config);
+  const sessions = new SessionRepository();
+  setWebSessions(sessions);
   const longTerm = new LongTermMemory(config);
   const episodic = new EpisodicMemory(config);
 
   let userMemory: UserMemoryStore | null = null;
-  if (config.memory.secondBrain?.enabled !== false && isBetterSqlite3Available()) {
+  if (config.memory.secondBrain?.enabled !== false && isSqliteAvailable()) {
     try {
       userMemory = new UserMemoryStore(config);
       setWebUserMemory(userMemory);
@@ -1357,17 +2572,21 @@ async function runAgent(isDaemon: boolean = false): Promise<void> {
       logger.warn({ err }, 'Second brain initialization failed, continuing without it');
       userMemory = null;
     }
-  } else if (config.memory.secondBrain?.enabled !== false && !isBetterSqlite3Available()) {
-    logger.warn(
-      'Second brain dependency issue: better-sqlite3 is not available. ' +
-      'Memory/brain features require SQLite via better-sqlite3. Install build tools and reinstall dependencies.'
-    );
+  } else if (config.memory.secondBrain?.enabled !== false && !isSqliteAvailable()) {
+    logger.warn(`Second brain disabled: ${SECOND_BRAIN_UNAVAILABLE_MESSAGE}`);
   }
 
-  const channels = new ChannelRegistry(config);
+  const channels = new ChannelRegistry(config, { cliOnly: daemonOwnsRuntime });
   const webChannel = new WebChannel(config.identity.name);
   channels.register('web', webChannel);
+  // Bits of the bottom-bar status that are pushed rather than read.
+  const liveStatus = { desktop: '' };
   const capabilities = new CapabilityRegistry(skillLoader, scheduler, tokenBudget, undefined, userMemory ?? undefined);
+  // "Always" on a shell prompt covers the command family in the owner's own
+  // terminal, attached terminal and dashboard; remote Mercury Cloud requests
+  // stay exact-match.
+  capabilities.permissions.setFamilyApprovalPolicy((ctx) =>
+    ctx.channelType === 'cli' || (ctx.channelType === 'web' && !webChannel.hasCloudEventHandler(ctx.channelId)));
 
   let supervisor: SubAgentSupervisor | undefined;
   if (config.subagents.enabled) {
@@ -1405,19 +2624,53 @@ async function runAgent(isDaemon: boolean = false): Promise<void> {
     memorySetLearningPaused: (paused: boolean) => { if (userMemory) userMemory.setLearningPaused(paused); },
     memoryClear: () => userMemory ? userMemory.clear() : 0,
     memoryGetSubconscious: (limit?: number) => userMemory ? userMemory.getSubconscious(limit) : [],
+    memoryIsShareLearning: () => userMemory ? userMemory.isShareLearning() : false,
+    memorySetShareLearning: (enabled: boolean) => { if (userMemory) userMemory.setShareLearning(enabled); },
+    mcpStatus: () => capabilities.getMcpManager()?.status() ?? [],
   });
 
-  capabilities.setSendFileHandler(async (filePath: string) => {
+  capabilities.setSendFileHandler(async (filePath: string, channel?: string) => {
     const { channelId, channelType } = capabilities.getChannelContext();
     const telegram = channels.get('telegram');
+    const signal = channels.get('signal');
+
+    // Explicit channel override from the user
+    if (channel === 'signal' && signal) {
+      await signal.sendFile(filePath, channelType === 'signal' ? channelId : undefined);
+      return;
+    }
+    if (channel === 'telegram' && telegram) {
+      await telegram.sendFile(filePath, channelType === 'telegram' ? channelId : undefined);
+      return;
+    }
 
     if (channelType === 'telegram' && telegram) {
       await telegram.sendFile(filePath, channelId);
       return;
     }
 
+    if (channelType === 'signal' && signal) {
+      await signal.sendFile(filePath, channelId);
+      return;
+    }
+
+    // Any other chat channel (plugin channels such as WhatsApp): the file goes
+    // back to the chat that asked for it.
+    if (channelType !== 'cli' && channelType !== 'web' && channelType !== 'internal') {
+      const current = channels.get(channelType as Parameters<typeof channels.get>[0]);
+      if (current) {
+        await current.sendFile(filePath, channelId);
+        return;
+      }
+    }
+
     if (config.channels.telegram.enabled && telegram && getTelegramApprovedUsers(config).length > 0) {
       await telegram.sendFile(filePath);
+      return;
+    }
+
+    if (config.channels.signal.enabled && signal && hasSignalAdminsFn(config)) {
+      await signal.sendFile(filePath);
       return;
     }
 
@@ -1446,14 +2699,118 @@ async function runAgent(isDaemon: boolean = false): Promise<void> {
 
   capabilities.registerAll();
 
+  const mcpConfig = validateMcpConfig(config.mcp);
+  for (const problem of mcpConfig.problems) logger.warn({ problem }, 'MCP server skipped');
+  for (const warning of mcpConfig.warnings) logger.warn({ warning }, 'MCP config warning');
+  // Like plugins (ADR-025), only the runtime owner connects MCP servers: a
+  // terminal attached to a live daemon must not start every stdio server twice.
+  const mcpManager = daemonOwnsRuntime ? undefined : new McpManager(mcpConfig.servers, {
+    gate: (request) => capabilities.permissions.checkMcpTool(request),
+  });
+  if (mcpManager) {
+    capabilities.attachMcp(mcpManager);
+    setWebMcpManager(mcpManager);
+    void mcpManager.connectAll();
+  }
+
   const agent = new Agent(
-    config, providers, identity, shortTerm, longTerm, episodic, userMemory, channels, tokenBudget, capabilities, scheduler,
+    config, providers, identity, shortTerm, longTerm, episodic, userMemory, channels, tokenBudget, capabilities, scheduler, sessions,
+    async ({ userMessage, assistantMessage, providerName }) => {
+      const provider = providers.get(providerName) ?? providers.getDefault();
+      const result = await provider.generateText(
+        `User: ${userMessage.slice(0, 1500)}\nAssistant: ${assistantMessage.slice(0, 1500)}`,
+        'Create a concise 3-7 word title for this conversation. Return only the title with no quotes, markdown, prefix, or punctuation.',
+      );
+      return result.text;
+    },
   );
 
   agent.setSkillLoader(skillLoader);
+  agent.terminalOnly = daemonOwnsRuntime;
 
   if (supervisor) {
     agent.setSupervisor(supervisor);
+  }
+
+  // Plugins run only in the process that owns the runtime (ADR-024); an
+  // attached terminal forwards /plugins to it. Boot is fire-and-forget:
+  // a broken plugin is disabled, never a reason for Mercury not to start.
+  const pluginManager = daemonOwnsRuntime ? undefined : getPluginManager();
+  if (pluginManager) {
+    // Plugin API 1.1: channels provided by plugins (e.g. WhatsApp) join the registry while they run.
+    setChannelHost({
+      register: (type, channel) => channels.register(type, channel),
+      unregister: (type, channel) => channels.unregister(type, channel),
+    });
+    // Plugins that use a Mercury provider (e.g. OpenAI for WhatsApp calls)
+    // get the same credentials this runtime uses: one place to set a key.
+    setProviderLookup((id) => (config.providers as unknown as Record<string, { apiKey?: string; baseUrl?: string } | undefined>)[id]);
+    // Calls know what chats know (identity, about, the owner's profile) and learn like chats do.
+    setVoiceBriefing(() => agent.voiceBriefing());
+    setCallLearning((ownerSaid, mercurySaid) => agent.learnFromConversation(ownerSaid, mercurySaid));
+    setWorkStopper((prefix) => agent.stopWorkFor(prefix, 'Stopped by the owner on a voice call.'));
+    setDesktopActivityHook((label) => {
+      const cli = channels.get('cli');
+      if (cli instanceof CLIChannel) cli.setDesktopActivity(label);
+      liveStatus.desktop = label ?? '';
+      publishStatus();
+    });
+    pluginManager.setRunsPlugins(true);
+    pluginManager.setNotifier((m) => agent.notifyAllChannels(m));
+    void pluginManager.boot().catch((err) => logger.error({ err }, 'Plugin boot failed'));
+  }
+
+  // Mercury Bots: fleet manager runs outside the main message queue.
+  let botManager: BotManager | undefined;
+  if (config.bots?.enabled && !daemonOwnsRuntime) {
+    const bot = new BotManager({
+      config,
+      providers,
+      tokenBudget,
+      userMemoryFactory: (_botId, manifest) => {
+        const scope = manifest.memory?.scope ?? 'own';
+        if (scope === 'none') return null;
+        if (!userMemory) return null; // second brain unavailable — bots run stateless
+        // Bots share the second-brain DB but are namespaced per bot.
+        return new UserMemoryStore(config, `bot:${manifest.id}`);
+      },
+    });
+    botManager = bot;
+    bot.setScheduler(scheduler);
+    // Startup migrations must run before routines register: fleet layout
+    // (crew nesting + orphan cascade) and permission consolidation to the
+    // single permissions.yaml source.
+    void bot.migrateFleetLayout()
+      .then(() => bot.migratePermissions())
+      .then(() => bot.migrateDeliverables())
+      .then(() => bot.registerRoutines(scheduler));
+    agent.setBotManager(bot);
+    setWebBotManager(bot);
+    // Real-time bot activity bus → surfaces: the CLI bot-thread live region
+    // (what the bot is doing RIGHT NOW while you watch its thread) and the
+    // web SSE feed (dashboards / third-party backends). The roster's activity
+    // label is updated inside the manager itself.
+    const botCliChannel = channels.get('cli');
+    bot.onBotActivity((ev) => {
+      if (botCliChannel instanceof CLIChannel) botCliChannel.setBotLiveActivity(ev.botId, ev);
+      webChannel.broadcastBotActivity(ev);
+    });
+    if (config.bots?.webhookSecret) {
+      setBotsWebhookSecret(config.bots.webhookSecret);
+    }
+    // Main-agent awareness: bots section in the system prompt + dispatch tool.
+    capabilities.setBotDispatchHandler((botIdOrName, message, ctx) => {
+      const botId = bot.resolveBotId(botIdOrName);
+      if (!botId) return { accepted: false, reasonCode: 'target_unknown' };
+      const result = bot.enqueue(botId, {
+        trigger: 'chat',
+        prompt: message,
+        source: { channelType: ctx.channelType, channelId: ctx.channelId },
+      });
+      return result.accepted
+        ? { accepted: true, jobId: result.jobId }
+        : { accepted: false, reasonCode: result.reasonCode };
+    }, () => capabilities.getChannelContext());
   }
 
   let spotifyClient: SpotifyClient | undefined;
@@ -1486,12 +2843,69 @@ async function runAgent(isDaemon: boolean = false): Promise<void> {
       bootCli.setSkills(skillInfos);
       bootCli.setProvider(getProviderLabel(defaultProvider), defaultModel);
       bootCli.setTokenInfo(tokenBudget.getDailyUsed(), tokenBudget.getBudget(), Math.round(tokenBudget.getUsagePercentage()));
+      bootCli.setSaverMode(agent.saverMode.getState(), tokenBudget.getSavedToday(), tokenBudget.getSavedLifetime());
       bootCli.setWebInfo(config.web.enabled, config.web.port);
+      // Wire live status providers so the bottom bar refreshes every 2s
+      // without waiting for an LLM call or queue completion.
+      bootCli.setStatusProviders({
+        tokens: () => ({
+          used: tokenBudget.getDailyUsed(),
+          budget: tokenBudget.getBudget(),
+          percentage: Math.round(tokenBudget.getUsagePercentage()),
+        }),
+        saver: () => ({
+          state: agent.saverMode.getState(),
+          savedToday: tokenBudget.getSavedToday(),
+          savedLifetime: tokenBudget.getSavedLifetime(),
+        }),
+        subAgents: () => supervisor ? supervisor.getActiveAgents().map((a) => ({
+          id: a.id,
+          task: a.task,
+          status: a.status,
+          progress: a.progress,
+          startedAt: 0,
+        })) : [],
+        bgTasks: () => agent.backgroundTasks.getAllSummaries(),
+        botRoster: () => agent.getBotManager()?.getStatusSummaries().map((b) => ({
+          id: b.id,
+          name: b.name,
+          state: b.state,
+          needsYou: b.needsYou,
+          fleetRole: b.fleetRole,
+          parent: b.parent,
+        })) ?? [],
+      });
+      bootCli.startStatusPoller(2000);
+      // Esc during a turn: the same stop routine `/stop` runs.
+      bootCli.setInterruptHandler(() => agent.stopAllWork('stopped'));
       bootCli.mountTUI((inputText: string) => {
         bootCli.sendUserMessage(inputText);
       }, spotifyClient, () => {
+        // Deliberate TUI exit (Ctrl+C / onExit): mark any queued or running
+        // work cancelled so the next launch does NOT silently resume a task
+        // the user chose to kill.
+        try { agent.cancelActiveWork('Mercury Code was exited from the TUI.'); } catch { /* best effort */ }
         process.exit(0);
       });
+      // `mercury code [dir]`: boot straight into the Mercury Code TUI in the
+      // requested (default: current) directory with a FRESH session. The flag
+      // is set by the `code` command action and consumed here, in the
+      // foreground process only (the daemon child ignores it).
+      if (process.env.MERCURY_BOOT_CODE) {
+        const bootDir = process.env.MERCURY_BOOT_CODE === '1' ? process.cwd() : process.env.MERCURY_BOOT_CODE;
+        delete process.env.MERCURY_BOOT_CODE;
+        const fresh = sessions.create();
+        sessions.bind(fresh.id, 'cli', 'current');
+        const activeSession = sessions.get(fresh.id);
+        if (activeSession) bootCli.setCurrentSession(activeSession);
+        agent.programmingMode.setAuto();
+        agent.programmingMode.setProjectContext(bootDir);
+        const entered = bootCli.enterMercuryCode(bootDir, pkgVersion);
+        bootCli.setProgrammingStatus(agent.programmingMode.getState(), agent.programmingMode.getProjectContext());
+        await bootCli.send(entered.ok
+          ? 'Mercury Code active (AUTO). Describe the change — I will plan and build in one flow, confirming with you only before large or consequential changes.'
+          : `Mercury Code could not start: ${entered.message}`);
+      }
     } else {
       await channels.startAll();
     }
@@ -1500,18 +2914,626 @@ async function runAgent(isDaemon: boolean = false): Promise<void> {
   await agent.birth();
   await agent.wake();
 
+  let cloudClient: import('./cloud/client.js').MercuryCloudClient | undefined;
+  let sessionSynchronizer: CloudSessionSynchronizer | undefined;
+  if (config.cloud.enabled && config.cloud.jwt && config.cloud.agentId) {
+    try {
+      const { MercuryCloudClient } = await import('./cloud/client.js');
+      cloudClient = new MercuryCloudClient(config.cloud.wsUrl, cloudTokenStore!, (connected) => {
+        if (connected) markCloudRuntimeOnline(config.cloud.agentId, runtimeMode);
+        else clearCloudRuntimeOnline(process.pid);
+      });
+      const activeSessionSynchronizer = new CloudSessionSynchronizer(sessions, () => ({
+        apiUrl: config.cloud.apiUrl,
+        agentId: config.cloud.agentId,
+        token: cloudTokenStore!.getJwt(),
+      }));
+      sessionSynchronizer = activeSessionSynchronizer;
+
+      let syncSettingReceived = false;
+      let syncFallbackTimer: ReturnType<typeof setTimeout> | undefined;
+      cloudClient.on('conversation.sync.toggle', (msg) => {
+        syncSettingReceived = true;
+        if (syncFallbackTimer) clearTimeout(syncFallbackTimer);
+        const enabled = msg.payload?.enabled === true;
+        logger.info({ enabled }, 'Cloud command: toggle conversation persistence');
+        agent.setSessionSyncEnabled(enabled);
+        if (enabled) activeSessionSynchronizer.start();
+        else {
+          activeSessionSynchronizer.stop();
+          sessions.purgeDeleted(sessions.dump().filter((session) => session.status === 'deleted').map((session) => session.id));
+        }
+      });
+
+      // The shared token store already persists rotations to disk and
+      // notifies the provider via its listener. This legacy synthetic event
+      // only needs to mirror the new JWT into the in-memory config object
+      // used by closures above and keep the provider's apiKey in sync.
+      cloudClient.on('token.refreshed' as any, (msg: any) => {
+        const payload = msg.payload as { jwt: string; refreshToken: string } | undefined;
+        if (payload) {
+          config.cloud.jwt = payload.jwt;
+          config.cloud.refreshToken = payload.refreshToken;
+          const llmKey = config.cloud.accessKey || payload.jwt;
+          config.providers.mercuryCloud.apiKey = llmKey;
+          providers.updateApiKey('mercuryCloud', llmKey);
+          logger.info('Mercury Cloud token refreshed and saved');
+        }
+      });
+
+      cloudClient.on('agent.restart', async (msg) => {
+        const reason = typeof msg.payload?.reason === 'string' ? msg.payload.reason : undefined;
+        if (reason === 'server_shutdown') {
+          logger.info('Mercury Cloud server is shutting down; staying alive for reconnect');
+          return;
+        }
+        // A detached Mercury process has no parent supervisor. Exiting here
+        // would turn a remote restart request into a permanent outage.
+        logger.warn({ reason }, 'Cloud restart request ignored; use a process supervisor or `mercury restart` on the host');
+      });
+
+      cloudClient.on('agent.event.ack', (msg) => {
+        const requestId = typeof msg.payload?.requestId === 'string' ? msg.payload.requestId : undefined;
+        if (requestId) agent.acknowledgeCloudDelivery(requestId);
+      });
+
+      cloudClient.on('agent.status', () => {
+        cloudClient!.send({
+          type: 'agent.state',
+          agentId: config.cloud.agentId,
+          payload: {
+            status: 'online',
+            provider: getProviderLabel(config.providers.default),
+            model: config.providers[config.providers.default]?.model ?? 'unknown',
+            uptime: process.uptime(),
+          },
+          timestamp: new Date().toISOString(),
+        });
+      });
+
+      cloudClient.on('skill.install', async (msg) => {
+        const skillUrl = msg.payload?.skillUrl as string | undefined;
+        if (skillUrl) {
+          logger.info({ skillUrl }, 'Cloud command: install skill');
+          try {
+            await skillLoader.installFromUrl(skillUrl);
+            cloudClient!.send({
+              type: 'skill.ack',
+              agentId: config.cloud.agentId,
+              payload: { success: true, skillUrl },
+              timestamp: new Date().toISOString(),
+            });
+          } catch (err: any) {
+            cloudClient!.send({
+              type: 'skill.ack',
+              agentId: config.cloud.agentId,
+              payload: { success: false, error: err.message },
+              timestamp: new Date().toISOString(),
+            });
+          }
+        }
+      });
+
+      cloudClient.on('skill.remove', async (msg) => {
+        const skillName = msg.payload?.skillName as string | undefined;
+        if (skillName) {
+          logger.info({ skillName }, 'Cloud command: remove skill');
+          try {
+            skillLoader.deleteSkill(skillName);
+            cloudClient!.send({
+              type: 'skill.ack',
+              agentId: config.cloud.agentId,
+              payload: { success: true, action: 'remove', skillName },
+              timestamp: new Date().toISOString(),
+            });
+          } catch (err: any) {
+            cloudClient!.send({
+              type: 'skill.ack',
+              agentId: config.cloud.agentId,
+              payload: { success: false, error: err.message },
+              timestamp: new Date().toISOString(),
+            });
+          }
+        }
+      });
+
+      cloudClient.on('memory.extract', async () => {
+        logger.info('Cloud command: extract memory');
+        const memData: Record<string, unknown> = {};
+        const syncEntries: { type: string; content: string; metadata?: Record<string, unknown>; timestamp?: string }[] = [];
+
+        try {
+          const ltFacts = longTerm.getAll();
+          memData['long-term'] = ltFacts;
+          for (const fact of ltFacts) {
+            syncEntries.push({
+              type: 'long-term',
+              content: `${fact.topic}: ${fact.fact}`,
+              metadata: { topic: fact.topic, confidence: (fact as any).confidence },
+              timestamp: new Date(fact.timestamp).toISOString(),
+            });
+          }
+
+          const epEvents = episodic.getRecent(100);
+          memData['episodic'] = epEvents;
+          for (const event of epEvents) {
+            syncEntries.push({
+              type: 'episodic',
+              content: event.summary || JSON.stringify(event),
+              metadata: { type: event.type, channelType: event.channelType, important: event.metadata?.important },
+              timestamp: new Date(event.timestamp).toISOString(),
+            });
+          }
+
+          if (userMemory) {
+            const summary = userMemory.getSummary();
+            memData['second-brain'] = summary;
+            const recent = userMemory.getRecent(100);
+            for (const mem of recent) {
+              syncEntries.push({
+                type: 'second-brain',
+                content: mem.summary || mem.detail || JSON.stringify(mem),
+                metadata: { type: mem.type, confidence: mem.confidence, importance: mem.importance, scope: mem.scope },
+                timestamp: new Date(mem.createdAt).toISOString(),
+              });
+            }
+          }
+        } catch (err: any) {
+          memData['error'] = err.message;
+        }
+
+        cloudClient!.send({
+          type: 'memory.dump',
+          agentId: config.cloud.agentId,
+          payload: memData,
+          timestamp: new Date().toISOString(),
+        });
+
+        if (syncEntries.length > 0 && config.cloud.apiUrl) {
+          try {
+            await fetch(`${config.cloud.apiUrl}/v1/memory/sync`, {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                Authorization: `Bearer ${config.cloud.jwt}`,
+              },
+              body: JSON.stringify({ agentId: config.cloud.agentId, entries: syncEntries }),
+            });
+            logger.info({ count: syncEntries.length }, 'Memory synced to Mercury Cloud');
+          } catch (syncErr: any) {
+            logger.warn({ err: syncErr.message }, 'Failed to sync memory to cloud');
+          }
+        }
+      });
+
+      // Cloud → agent: fetch shareable memories newer than a cursor (incremental).
+      // Returns only shareable=1, non-dismissed rows with updated_at > since.
+      cloudClient.on('memory.fetch', async (msg) => {
+        const since = (msg.payload?.since as number) ?? 0;
+        const limit = (msg.payload?.limit as number) ?? 500;
+        const requestId = (msg.payload?.requestId as string) ?? '';
+
+        logger.info({ since, limit, requestId }, 'Cloud command: fetch shareable memories');
+
+        try {
+          const memories = userMemory
+            ? userMemory.getShareableSince(since, limit).map((m) => ({
+                id: m.id,
+                type: m.type,
+                categories: m.categories,
+                summary: m.summary,
+                detail: m.detail ?? null,
+                scope: m.scope,
+                evidenceKind: m.evidenceKind,
+                source: m.source,
+                confidence: m.confidence,
+                importance: m.importance,
+                durability: m.durability,
+                evidenceCount: m.evidenceCount,
+                provenance: m.provenance ?? null,
+                createdAt: m.createdAt,
+                updatedAt: m.updatedAt,
+              }))
+            : [];
+
+          cloudClient!.send({
+            type: 'memory.fetch.result',
+            agentId: config.cloud.agentId,
+            payload: { requestId, memories },
+            timestamp: new Date().toISOString(),
+          });
+
+          logger.info({ count: memories.length, requestId }, 'Cloud fetch: sent shareable memories');
+        } catch (err: any) {
+          logger.warn({ err: err.message }, 'Cloud fetch: failed to gather memories');
+          cloudClient!.send({
+            type: 'memory.fetch.result',
+            agentId: config.cloud.agentId,
+            payload: { requestId, memories: [] },
+            timestamp: new Date().toISOString(),
+          });
+        }
+      });
+
+      // Cloud → agent: toggle shared learning on/off. When on, new memories
+      // extracted via remember() are marked shareable so the cloud fetch can
+      // pull them into the collaborative pool. Persisted to config on the agent.
+      cloudClient.on('memory.share-learning.toggle', async (msg) => {
+        const enabled = Boolean(msg.payload?.enabled);
+        logger.info({ enabled }, 'Cloud command: toggle shared learning');
+        if (userMemory) {
+          userMemory.setShareLearning(enabled);
+          try {
+            if (!config.memory.collaborativeKnowledge) config.memory.collaborativeKnowledge = {};
+            config.memory.collaborativeKnowledge.shareLearning = enabled;
+            const { saveConfig } = await import('./utils/config.js');
+            saveConfig(config);
+          } catch { /* best-effort */ }
+        }
+      });
+
+      cloudClient.on('conversation.history', async (msg) => {
+        logger.info('Cloud command: conversation history');
+        const requestId = typeof msg.payload?.requestId === 'string' ? msg.payload.requestId : '';
+        try {
+          const payload = buildConversationHistoryPayload(sessions, {
+            requestId,
+            sessionId: typeof msg.payload?.sessionId === 'string' ? msg.payload.sessionId : undefined,
+            cursor: typeof msg.payload?.cursor === 'string' ? msg.payload.cursor : undefined,
+            limit: typeof msg.payload?.limit === 'number' ? msg.payload.limit : undefined,
+          }, config.cloud.agentId);
+          cloudClient!.send({
+            type: 'conversation.dump',
+            agentId: config.cloud.agentId,
+            payload,
+            timestamp: new Date().toISOString(),
+          });
+        } catch (err: any) {
+          cloudClient!.send({
+            type: 'conversation.dump',
+            agentId: config.cloud.agentId,
+            payload: { requestId, error: err.message },
+            timestamp: new Date().toISOString(),
+          });
+        }
+      });
+
+      cloudClient.on('agent.command', async (msg) => {
+        const message = msg.payload?.message as string | undefined;
+        const fromAgentId = msg.payload?.fromAgentId as string | undefined;
+        const conversationId = msg.payload?.conversationId as string | undefined;
+        const suppliedSessionId = msg.payload?.sessionId as string | undefined;
+        const requestId = (msg.payload?.requestId as string | undefined) || crypto.randomUUID();
+        const messageId = msg.payload?.messageId as string | undefined;
+        const providerOverride = msg.payload?.provider as string | undefined;
+        const controlType = msg.payload?.controlType as string | undefined;
+
+        const allowedControlTypes = new Set([
+          'session.create', 'session.delete', 'session.archive', 'permission.resolve', 'choice.resolve',
+          'interaction.cancel', 'permission.mode', 'model.list', 'model.select', 'task.stop',
+        ]);
+        if ((msg.agentId && msg.agentId !== config.cloud.agentId)
+          || (controlType && (!allowedControlTypes.has(controlType) || typeof message === 'string'))
+          || (!controlType && typeof message !== 'string')) {
+          logger.warn({ type: controlType, agentId: msg.agentId }, 'Rejected invalid or mixed Cloud command envelope');
+          cloudClient!.sendStream({ conversationId, sessionId: suppliedSessionId, requestId, event: 'error', data: { message: 'Invalid Cloud command envelope.' } });
+          return;
+        }
+
+        if (controlType === 'session.delete') {
+          if (!suppliedSessionId || msg.payload?.confirmation !== suppliedSessionId) {
+            cloudClient!.sendStream({ conversationId, sessionId: suppliedSessionId, requestId, event: 'error', data: { message: 'Session deletion requires the exact session ID as confirmation.' } });
+            return;
+          }
+          try {
+            const target = sessions.get(suppliedSessionId);
+            if (target.id !== suppliedSessionId) throw new Error('Session deletion requires the exact canonical session ID.');
+            const deleted = sessions.deletePermanently(target.id);
+            cloudClient!.sendStream({
+              conversationId,
+              sessionId: deleted.id,
+              requestId,
+              event: 'session_deleted',
+              data: { sessionId: deleted.id },
+            });
+          } catch (error) {
+            cloudClient!.sendStream({ conversationId, sessionId: suppliedSessionId, requestId, event: 'error', data: { message: error instanceof Error ? error.message : String(error) } });
+          }
+          return;
+        }
+
+        if (controlType === 'session.create') {
+          if (!suppliedSessionId) {
+            cloudClient!.sendStream({ conversationId, requestId, event: 'error', data: { message: 'Session creation requires a canonical session ID.' } });
+            return;
+          }
+          try {
+            const alias = typeof msg.payload?.alias === 'string' ? msg.payload.alias : undefined;
+            const title = typeof msg.payload?.title === 'string' ? msg.payload.title : undefined;
+            const titleSource = msg.payload?.titleSource === 'user' || msg.payload?.titleSource === 'generated' ? msg.payload.titleSource : 'fallback';
+            const created = sessions.create({ id: suppliedSessionId, alias, title, titleSource });
+            sessions.bind(created.id, 'web', `cloud:${conversationId || suppliedSessionId}`);
+            cloudClient!.sendStream({
+              conversationId,
+              sessionId: created.id,
+              requestId,
+              event: 'session_created',
+              data: { sessionId: created.id, alias: created.alias, title: created.title, revision: created.revision },
+            });
+          } catch (error) {
+            cloudClient!.sendStream({ conversationId, sessionId: suppliedSessionId, requestId, event: 'error', data: { message: error instanceof Error ? error.message : String(error) } });
+          }
+          return;
+        }
+
+        if (controlType === 'permission.resolve' || controlType === 'choice.resolve' || controlType === 'interaction.cancel') {
+          const id = msg.payload?.id as string | undefined;
+          const value = controlType === 'permission.resolve'
+            ? msg.payload?.action as string | undefined
+            : msg.payload?.value as string | undefined;
+          if (!suppliedSessionId || !id || (controlType !== 'interaction.cancel' && typeof value !== 'string')) {
+            cloudClient!.sendStream({ conversationId, sessionId: suppliedSessionId, requestId, event: 'error', data: { message: 'Invalid or incomplete interaction resolution.' } });
+            return;
+          }
+          const resolved = controlType === 'permission.resolve'
+            ? webChannel.resolveApproval(id, value!, requestId)
+            : controlType === 'choice.resolve'
+              ? webChannel.resolveChoice(id, value!, requestId)
+              : webChannel.cancelInteraction(id, requestId);
+          const resolvedEvent = controlType === 'choice.resolve' || controlType === 'interaction.cancel' ? 'choice_resolved' : 'permission_resolved';
+          cloudClient!.sendStream({
+            conversationId,
+            sessionId: suppliedSessionId,
+            requestId,
+            event: resolved ? resolvedEvent : 'error',
+            data: resolved ? { id, value, cancelled: controlType === 'interaction.cancel' } : { message: 'Interaction expired, was already used, or does not belong to this request.' },
+          });
+          return;
+        }
+
+        if (controlType === 'permission.mode') {
+          const action = msg.payload?.action;
+          if (!suppliedSessionId || (action !== 'allow-all' && action !== 'ask-me')) {
+            cloudClient!.sendStream({ conversationId, sessionId: suppliedSessionId, requestId, event: 'error', data: { message: 'Invalid permission mode request.' } });
+            return;
+          }
+          webChannel.setSessionPermissionMode(suppliedSessionId, action);
+          cloudClient!.sendStream({
+            conversationId,
+            sessionId: suppliedSessionId,
+            requestId,
+            event: 'permission_mode_set',
+            data: { mode: action },
+          });
+          return;
+        }
+
+        if (controlType === 'task.stop') {
+          if (!suppliedSessionId) {
+            cloudClient!.sendStream({ conversationId, requestId, event: 'error', data: { message: 'Stop requires the session the task belongs to.' } });
+            return;
+          }
+          // Same semantics as the local /stop fast-path command: abort the
+          // foreground task, cancel its work-ledger entry, halt sub-agents.
+          const note = await agent.stopAllWork('stopped');
+          cloudClient!.sendStream({
+            conversationId,
+            sessionId: suppliedSessionId,
+            requestId,
+            event: 'task_stopped',
+            data: { message: note },
+          });
+          return;
+        }
+
+        const externalConversationId = `cloud:${conversationId || suppliedSessionId || 'default'}`;
+        let cloudSession;
+        try {
+          cloudSession = sessions.getOrCreateBound('web', externalConversationId, suppliedSessionId);
+        } catch (error) {
+          cloudClient!.sendStream({ conversationId, sessionId: suppliedSessionId, requestId, event: 'error', data: { message: error instanceof Error ? error.message : String(error) } });
+          return;
+        }
+        const sessionId = cloudSession.id;
+
+        if (controlType === 'session.archive') {
+          try {
+            const archived = sessions.archive(sessionId);
+            cloudClient!.sendStream({
+              conversationId,
+              sessionId,
+              requestId,
+              event: 'session_archived',
+              data: { sessionId: archived.id, revision: archived.revision },
+            });
+          } catch (error) {
+            cloudClient!.sendStream({
+              conversationId,
+              sessionId,
+              requestId,
+              event: 'error',
+              data: { message: error instanceof Error ? error.message : String(error) },
+            });
+          }
+          return;
+        }
+
+        if (controlType === 'model.list') {
+          cloudClient!.sendStream({
+            conversationId,
+            sessionId,
+            requestId,
+            event: 'model_options',
+            data: {
+              providers: await agent.listChatModelOptions(),
+              current: agent.getCurrentProvider(),
+            },
+          });
+          return;
+        }
+
+        if (controlType === 'model.select') {
+          const provider = msg.payload?.provider as string | undefined;
+          const model = msg.payload?.model as string | undefined;
+          if (!provider) {
+            cloudClient!.sendStream({ conversationId, sessionId, requestId, event: 'error', data: { message: 'No provider selected.' } });
+            return;
+          }
+
+          const result = await agent.setChannelProviderOverride(sessionId, provider, model, { persist: true });
+          cloudClient!.sendStream({
+            conversationId,
+            sessionId,
+            requestId,
+            event: result.ok ? 'model_selected' : 'error',
+            data: result.ok ? result : { message: result.message },
+          });
+          return;
+        }
+
+        if (message) {
+          if (fromAgentId) {
+            logger.info({ fromAgentId, messagePreview: message.slice(0, 50) }, 'Cloud relay: message from another agent');
+          } else {
+            logger.info({ messagePreview: message.slice(0, 50) }, 'Cloud command: send message to agent');
+          }
+          try {
+            if (providerOverride) {
+              const modelOverride = msg.payload?.model as string | undefined;
+              const override = await agent.setChannelProviderOverride(sessionId, providerOverride, modelOverride);
+              if (!override.ok) {
+                cloudClient!.sendStream({ conversationId, sessionId, requestId, event: 'error', data: { message: override.message } });
+                return;
+              }
+            }
+            webChannel.emitCloudMessage(message, requestId, sessionId, externalConversationId, messageId, (event) => {
+              const delivered = cloudClient!.sendStream({
+                conversationId,
+                sessionId,
+                requestId,
+                event: event.type,
+                data: event.data,
+              });
+
+              // When research mode produced a final article, also emit a
+              // research.artifact message so the Cloud dashboard can render it
+              // as a full research page (View Research).
+              if (
+                event.type === 'text_done' &&
+                agent.researchMode.isActive() &&
+                event.data &&
+                typeof event.data.fullText === 'string' &&
+                event.data.fullText.includes('# ')
+              ) {
+                const fullText = event.data.fullText as string;
+                const titleMatch = fullText.match(/^#\s+(.+)$/m);
+                cloudClient!.sendResearchArtifact({
+                  artifactId: `research-${conversationId || Date.now()}`,
+                  title: titleMatch ? titleMatch[1].trim() : undefined,
+                  markdown: fullText,
+                  conversationId,
+                  sessionId,
+                  requestId,
+                  topic: agent.researchMode.getTopic() || undefined,
+                });
+                // Research mode produced its artifact; exit research mode so
+                // follow-ups in the same thread become refinements, not fresh
+                // full-research passes, unless the user re-enables it.
+                agent.researchMode.setOff();
+              }
+              return delivered;
+            });
+            cloudClient!.sendCommandAck(requestId);
+          } catch (err: any) {
+            cloudClient!.sendStream({
+              conversationId,
+              sessionId,
+              requestId,
+              event: 'error',
+              data: { message: `Unable to process cloud chat message: ${err.message}` },
+            });
+          }
+        }
+      });
+
+      cloudClient.on('agent.message.relay', async (msg) => {
+        const targetAgentId = msg.payload?.targetAgentId as string | undefined;
+        const relayMessage = msg.payload?.message as string | undefined;
+        if (targetAgentId && relayMessage) {
+          logger.info({ targetAgentId, messagePreview: relayMessage.slice(0, 50) }, 'Cloud: relaying message to another agent');
+          cloudClient!.send({
+            type: 'agent.message.relay',
+            agentId: config.cloud.agentId,
+            payload: { targetAgentId, message: relayMessage, fromAgentId: config.cloud.agentId },
+            timestamp: new Date().toISOString(),
+          });
+        }
+      });
+
+      await cloudClient.connect();
+      logger.info('Mercury Cloud WebSocket connected');
+
+      // Fallback: if the server doesn't send conversation.sync.toggle within 5s
+      // (e.g. message dropped or delayed), start sync anyway. The toggle handler
+      // remains the authority and will stop it if the server says disabled.
+      if (!syncSettingReceived) {
+        syncFallbackTimer = setTimeout(() => {
+          if (!syncSettingReceived && !activeSessionSynchronizer.isEnabled()) {
+            logger.info('No conversation.sync.toggle received within 5s — starting sync as fallback');
+            agent.setSessionSyncEnabled(true);
+            activeSessionSynchronizer.start();
+          }
+        }, 5_000);
+        syncFallbackTimer.unref?.();
+      }
+    } catch (err: any) {
+      logger.warn({ err: err.message }, 'Failed to start Mercury Cloud WS client');
+    }
+  }
+
   const cliChannel = channels.get('cli') as CLIChannel | undefined;
   const tgChannel = channels.get('telegram') as TelegramChannel | undefined;
+  const sigChannel = channels.get('signal') as SignalChannel | undefined;
 
   if (tgChannel) {
     tgChannel.setChatCommandContext(capabilities.getChatCommandContext()!);
   }
 
+  if (sigChannel) {
+    sigChannel.setChatCommandContext(capabilities.getChatCommandContext()!);
+  }
+
   setWebWebChannel(webChannel);
+  setWebSessionSyncEnabled(() => agent.isSessionSyncEnabled());
   setWebProgrammingMode(agent.programmingMode);
   setWebBgTasks(agent.backgroundTasks);
-  setWebModelSwitch((provider) => agent.switchProvider(provider));
+  setWebModelSwitch((provider, model) => agent.switchProvider(provider, model));
   setWebCurrentProvider(() => agent.getCurrentProvider());
+  // Live bottom bar for attached terminals and the dashboard: one snapshot,
+  // pushed on every model switch and checked every 2 s for anything else.
+  const statusSnapshot = (): Record<string, unknown> => {
+    const current = agent.getCurrentProvider();
+    return {
+      provider: getProviderLabel(current.name as ProviderName),
+      model: current.model,
+      mode: agent.programmingMode.getState(),
+      permission: webChannel.getSettings().bypassPermissions ? 'allow-all' : 'ask-me',
+      tokensUsed: tokenBudget.getDailyUsed(),
+      tokenBudget: tokenBudget.getBudget(),
+      desktop: liveStatus.desktop,
+    };
+  };
+  setWebStatusSnapshot(statusSnapshot);
+  let lastStatusKey = '';
+  const pushStatus = (): void => {
+    const snapshot = statusSnapshot();
+    const key = JSON.stringify(snapshot);
+    if (key === lastStatusKey) return;
+    lastStatusKey = key;
+    webChannel.broadcastStatus(snapshot);
+  };
+  setStatusPublisher(pushStatus);
+  setInterval(pushStatus, 2000).unref();
   // IDE provider registry powers features like commit message generation.
   // It does not require a supervisor, so wire it up unconditionally.
   setWebIDEProviders(providers);
@@ -1682,11 +3704,20 @@ async function runAgent(isDaemon: boolean = false): Promise<void> {
 
   capabilities.permissions.onAsk(async (prompt: string) => {
     const channelType = capabilities.permissions.getCurrentChannelType();
+    const { channelId } = capabilities.getChannelContext();
     if (channelType === 'telegram' && tgChannel) {
-      return tgChannel.askPermission(prompt);
+      return tgChannel.askPermission(prompt, channelId);
+    }
+    if (channelType === 'signal' && channels.get('signal')) {
+      return (channels.get('signal') as SignalChannel).askPermission(prompt, channelId);
     }
     if (channelType === 'web' && webChannel) {
-      return webChannel.askPermission(prompt);
+      return webChannel.askPermission(prompt, channelId);
+    }
+    // Any other channel that can ask (plugin channels such as WhatsApp).
+    const asking = channels.get(channelType as Parameters<typeof channels.get>[0]) as { askPermission?: (p: string, id?: string) => Promise<string> } | undefined;
+    if (channelType !== 'cli' && typeof asking?.askPermission === 'function') {
+      return asking.askPermission(prompt, channelId);
     }
     if (cliChannel) {
       return cliChannel.askPermission(prompt);
@@ -1700,6 +3731,24 @@ async function runAgent(isDaemon: boolean = false): Promise<void> {
         capabilities.permissions.setAutoApproveAll(true);
         capabilities.permissions.addTempScope('/', true, true);
         logger.info({ chatId }, 'Telegram: Allow All mode set for session');
+      } else {
+        // Switching back used to be ignored: Allow All stayed on until restart.
+        capabilities.permissions.setAutoApproveAll(false);
+        logger.info({ chatId }, 'Telegram: Ask Me mode set for session');
+      }
+    });
+  }
+
+  if (sigChannel) {
+    sigChannel.setOnPermissionMode((mode) => {
+      if (mode === 'allow-all') {
+        capabilities.permissions.setAutoApproveAll(true);
+        capabilities.permissions.addTempScope('/', true, true);
+        logger.info('Signal: Allow All mode set for session');
+      } else {
+        // Switching back used to be ignored: Allow All stayed on until restart.
+        capabilities.permissions.setAutoApproveAll(false);
+        logger.info('Signal: Ask Me mode set for session');
       }
     });
   }
@@ -1716,8 +3765,13 @@ async function runAgent(isDaemon: boolean = false): Promise<void> {
     console.log(chalk.green(`  ${name} is live. Type a message and press Enter.`));
     console.log(chalk.dim('  Ctrl+C to exit · /help for commands'));
 
-    if (config.web.enabled) {
+    if (daemonOwnsRuntime) {
+      console.log(chalk.dim(`  Web, channels and bots are served by the background daemon (PID ${getDaemonStatus().pid}).`));
+    } else if (config.web.enabled) {
       startWebServer();
+      // Rotate the machine-local attach token for this boot so second
+      // terminals can connect without the web login flow.
+      writeAttachToken();
       updateWebStatus({
         running: true,
         pid: process.pid,
@@ -1736,15 +3790,58 @@ async function runAgent(isDaemon: boolean = false): Promise<void> {
     }
 
     // Keep CLI permission mode prompt, but do it after web server is live.
-    const mode = cliChannel && await cliChannel.askPermissionMode?.();
+    if (cliChannel) {
+      const current = sessions.getByBinding('cli', 'current');
+      const recent = sessions.list().filter((session) => session.messages.length > 0);
+      const resumable = [
+        ...(current?.messages.length ? [current] : []),
+        ...recent.filter((session) => session.id !== current?.id),
+      ].slice(0, 5);
+
+      let selected = current;
+      if (process.stdout.isTTY && resumable.length > 0) {
+        const choice = await cliChannel.presentChoicePrompt(
+          'Continue a previous session or start fresh?',
+          [
+            ...resumable.map((session) => ({
+              value: session.id,
+              label: `${session.alias} [${session.shortId}] - ${session.title} (${session.messages.length} messages)`,
+            })),
+            { value: 'new', label: 'Start a new session' },
+          ],
+        );
+        selected = choice === 'new' ? sessions.create() : sessions.get(choice);
+        sessions.bind(selected.id, 'cli', 'current');
+      }
+
+      selected ??= sessions.getOrCreateBound('cli', 'current');
+      cliChannel.setCurrentSession(selected);
+    }
+
+    // Every session starts by asking (also Mercury Code): the saved mode is
+    // listed first so Enter keeps it. The pick is remembered as the default
+    // for next time; /permissions changes it mid-session.
+    const savedMode = loadPermissionMode();
+    const mode = cliChannel && process.stdout.isTTY
+      ? await cliChannel.askPermissionMode(savedMode ?? undefined)
+      : savedMode ?? 'ask-me';
+    if ((mode === 'allow-all' || mode === 'ask-me') && process.stdout.isTTY) savePermissionMode(mode);
+    cliChannel?.setPermissionModeStatus(mode === 'allow-all' ? 'allow-all' : 'ask-me');
     if (mode === 'allow-all') {
       capabilities.permissions.setAutoApproveAll(true);
       capabilities.permissions.addTempScope('/', true, true);
     }
   } else {
-    await channels.startAll();
+    // Listener first: a second terminal attaches the moment the daemon is
+    // up, not after every channel and bot has booted. /api/health reports
+    // 'booting' until the rest is live.
     if (config.web.enabled) {
       startWebServer();
+      writeAttachToken();
+      updateWebStatus({ running: true, pid: process.pid, state: 'booting' });
+    }
+    await channels.startAll();
+    if (config.web.enabled) {
       updateWebStatus({
         running: true,
         pid: process.pid,
@@ -1762,29 +3859,58 @@ async function runAgent(isDaemon: boolean = false): Promise<void> {
     logger.info({ channels: activeCh, tools: toolNames, web: config.web.enabled }, 'Mercury is live (daemon mode)');
   }
 
-  const shutdown = async () => {
-    if (!isDaemon) {
-      console.log('');
-      console.log(chalk.dim(`  ${name} is shutting down...`));
-    } else {
-      logger.info('Mercury is shutting down (daemon mode)');
-    }
-    if (userMemory) {
+  let shutdownPromise: Promise<void> | undefined;
+  const shutdown = (): Promise<void> => {
+    if (shutdownPromise) return shutdownPromise;
+    shutdownPromise = (async () => {
+      cloudClient?.disconnect();
+      sessionSynchronizer?.stop();
+      // Always hand the terminal back in a sane state (no mouse tracking,
+      // visible cursor) — even after an abort the shell must be usable.
+      try { channels.getCliChannel()?.restoreTerminal(); } catch { /* best effort */ }
+      if (!isDaemon) {
+        console.log('');
+        console.log(chalk.dim(`  ${name} is shutting down...`));
+      } else {
+        logger.info('Mercury is shutting down (daemon mode)');
+      }
+      // Notify all channels that Mercury is stopping — users should never
+      // have to re-prompt to discover their task was killed mid-flight.
       try {
-        userMemory.consolidate();
-        userMemory.close();
-      } catch {}
-    }
-    await stopWebServer();
-    await agent.shutdown();
-    process.exit(0);
+        await agent.notifyAllChannels('⚠ Mercury is shutting down. If I was working on something, it has been interrupted. Send a message after restart to continue.');
+      } catch { /* best effort */ }
+      if (userMemory) {
+        // One last reflection pass over the sessions of this run (ADR-026);
+        // bounded so a slow provider cannot hold the shutdown.
+        try {
+          await Promise.race([agent.reflectNow(), new Promise<void>((resolve) => setTimeout(resolve, 20_000).unref())]);
+        } catch { /* best effort */ }
+        try {
+          userMemory.close();
+        } catch {}
+      }
+      await stopWebServer();
+      // Release the bots' SQLite queue handle — on Windows an open handle
+      // keeps queue.db locked against any later uninstall/replace.
+      try { botManager?.dispose(); } catch { /* best effort */ }
+      try { await mcpManager?.close(); } catch { /* best effort */ }
+      try { await pluginManager?.shutdown(); } catch { /* best effort */ }
+      await agent.shutdown();
+      clearCloudRuntimeOnline();
+      releaseRuntimeProcess(runtimeMode);
+      process.exit(0);
+    })();
+    return shutdownPromise;
   };
-
   process.on('SIGINT', shutdown);
   process.on('SIGTERM', shutdown);
+  // `mercury stop` / `restart` / `upgrade` ask over the local web API first
+  // (POST /api/shutdown) — on Windows that is the only way shutdown() runs,
+  // since process.kill there is TerminateProcess.
+  setShutdownHandler(() => { void shutdown(); });
 
   if (!isDaemon && process.platform !== 'win32') {
-    process.on('SIGHUP', () => {
+    process.on('SIGHUP', async () => {
       logger.info('SIGHUP received — terminal closed. Daemonizing.');
       try {
         const result = tryAutoDaemonize();
@@ -1792,14 +3918,61 @@ async function runAgent(isDaemon: boolean = false): Promise<void> {
           logger.info(`Forked daemon. Foreground process exiting.`);
         } else {
           logger.warn('SIGHUP received but daemonization failed. Shutting down.');
+          // Notify before forced exit
+          try {
+            await agent.notifyAllChannels('⚠ Mercury lost its terminal and could not daemonize. Shutting down — your task was interrupted.');
+          } catch { /* best effort */ }
         }
       } catch {
         logger.warn('SIGHUP received but daemonization failed. Shutting down.');
+        try {
+          await agent.notifyAllChannels('⚠ Mercury lost its terminal and could not daemonize. Shutting down — your task was interrupted.');
+        } catch { /* best effort */ }
       }
       process.exit(0);
     });
   }
 }
+
+/**
+ * Boot-time crash handlers (#64). Installed before any command runs — in
+ * particular before the setup wizard — so a failure there is loud and
+ * exits 1. Without them, web/server.ts's import-time `unhandledRejection`
+ * listener disables Node's default throw-on-rejection, and a rejected
+ * `configure()` (e.g. stdin closed mid-wizard) ended the process with
+ * exit code 0 and no message. runAgent() swaps these for its forensics
+ * handlers (crash-report.log) once the runtime boots.
+ */
+function describeBootError(err: unknown): string {
+  if (err instanceof Error) {
+    return process.env.MERCURY_DEBUG && err.stack ? err.stack : err.message;
+  }
+  return String(err);
+}
+function bootUncaughtException(err: unknown): void {
+  try { process.stderr.write(`\n✗ Mercury hit an unexpected error: ${describeBootError(err)}\n`); } catch { /* stderr gone */ }
+  process.exit(1);
+}
+function bootUnhandledRejection(reason: unknown): void {
+  if (reason instanceof InputClosedError) {
+    try { process.stderr.write(`\n✗ ${reason.message}\n`); } catch { /* stderr gone */ }
+    process.exit(1);
+  }
+  bootUncaughtException(reason);
+}
+function installBootCrashHandlers(): void {
+  process.on('uncaughtException', bootUncaughtException);
+  process.on('unhandledRejection', bootUnhandledRejection);
+}
+function removeBootCrashHandlers(): void {
+  process.off('uncaughtException', bootUncaughtException);
+  process.off('unhandledRejection', bootUnhandledRejection);
+}
+installBootCrashHandlers();
+
+// --safe-mode must reach the daemon child too, which is spawned with this
+// process's environment but its own argv.
+if (process.argv.includes('--safe-mode')) process.env.MERCURY_PLUGINS = 'off';
 
 const program = new Command();
 
@@ -1808,14 +3981,30 @@ program
   .description('Mercury — Soul-driven AI agent with permission-hardened tools, token budgets, and multi-channel access.')
   .version(pkgVersion)
   .option('-v, --verbose', 'Show debug logs')
+  .option('--safe-mode', 'Start with every plugin turned off (also MERCURY_PLUGINS=off)')
   .action(async () => {
     if (!isSetupComplete()) {
       await configure();
       autoDaemonize();
       return;
     }
-    autoDaemonize();
-    await runAgent();
+    // A second terminal joins the running runtime instead of fighting it.
+    // THE DAEMON COUNTS: booting a full foreground runtime next to it gave
+    // two schedulers and two bot pollers on one queue.db — bots got called
+    // twice and fleet-creation turns raced. Attach instead.
+    const daemon = getDaemonStatus();
+    if (daemon.running && daemon.pid) {
+      console.log(chalk.cyan(`  ⚿ Mercury is already running in the background (PID: ${daemon.pid}) — attaching.`));
+      await attachOrHeal();
+      return;
+    }
+    const foreground = getForegroundRuntimeStatus();
+    if (foreground.running && foreground.pid) {
+      console.log(chalk.cyan(`  ⚿ Mercury is already running (PID: ${foreground.pid}) — attaching.`));
+      await attachOrHeal();
+      return;
+    }
+    await bootDaemonThenAttach();
   });
 
 program
@@ -1825,6 +4014,7 @@ program
   .option('-f, --foreground', 'Run in foreground (attached to terminal)')
   .option('-d, --detached', 'Run in background (daemon mode) — same as default')
   .option('--daemon', 'Internal flag for daemon child process')
+  .option('--safe-mode', 'Start with every plugin turned off')
   .action(async (opts) => {
     if (opts.daemon) {
       await runWithWatchdog(() => runAgent(true));
@@ -1838,6 +4028,19 @@ program
     }
 
     if (opts.foreground) {
+      // Same single-runtime rule: a live daemon is already "Mercury running".
+      const daemon = getDaemonStatus();
+      if (daemon.running && daemon.pid) {
+        console.log(chalk.cyan(`  ⚿ Mercury is already running in the background (PID: ${daemon.pid}) — attaching.`));
+        await attachOrHeal();
+        return;
+      }
+      const foreground = getForegroundRuntimeStatus();
+      if (foreground.running && foreground.pid) {
+        console.log(chalk.cyan(`  ⚿ Mercury is already running (PID: ${foreground.pid}) — attaching.`));
+        await attachOrHeal();
+        return;
+      }
       await runAgent();
       return;
     }
@@ -1846,10 +4049,32 @@ program
   });
 
 program
+  .command('attach')
+  .description('Attach this terminal to an already-running Mercury runtime (chat + live streaming)')
+  .action(async () => {
+    await attachOrCode({ exitOnFailure: true });
+  });
+
+program
   .command('stop')
-  .description('Stop a background Mercury process')
-  .action(() => {
-    stopDaemon();
+  .description('Stop a running Mercury process (daemon or foreground)')
+  .action(async () => {
+    const foreground = getForegroundRuntimeStatus();
+    const daemon = getDaemonStatus();
+
+    if (!foreground.running && !daemon.running) {
+      console.log(chalk.yellow('  Mercury is not running.'));
+      console.log('');
+      return;
+    }
+
+    if (foreground.running) {
+      await stopForegroundRuntime();
+    }
+
+    if (daemon.running) {
+      await stopDaemon();
+    }
   });
 
 program
@@ -1909,15 +4134,48 @@ program
   .command('doctor')
   .description('Reconfigure Mercury setup (name, providers, channels, permissions defaults)')
   .option('--platform', 'Show platform compatibility diagnostics')
+  .option('--storage', 'Show SQLite backend, database files and row counts')
+  .option('--mcp', 'Connect to each configured MCP server and report its status')
+  .option('--plugins', 'Check installed plugins and why any are turned off')
   .action(async (opts) => {
+    {
+      // Keys that cannot be right — say so before anything is tried.
+      const { checkKeyShapes } = await import('./providers/key-shape.js');
+      const warnings = checkKeyShapes(loadConfig().providers as unknown as Record<string, { apiKey?: string; enabled?: boolean }>);
+      for (const w of warnings) console.log(chalk.yellow(`  ⚠ ${w.provider} API key looks wrong: ${w.problem}. Fix it with \`mercury doctor\` → providers, or in ~/.mercury/mercury.yaml.`));
+    }
     if (opts.platform) {
       runPlatformDoctor();
       return;
     }
+    if (opts.storage) {
+      runStorageDoctor();
+      return;
+    }
+    if (opts.mcp) {
+      const mcpDoctor = await runMcpDoctor(loadConfig().mcp);
+      for (const line of mcpDoctor.lines) console.log(line);
+      if (!mcpDoctor.ok) process.exitCode = 1;
+      return;
+    }
+    const mcpSummary = summarizeMcpConfig(loadConfig().mcp);
+    if (mcpSummary) console.log(chalk.dim(`  ${mcpSummary}`));
+    if (opts.plugins) {
+      const { runPluginDoctor } = await import('./cli/plugins-cli.js');
+      await runPluginDoctor();
+      return;
+    }
+    // The daemon reads providers, keys and channels at boot: a reconfigure
+    // that only wrote the file looked like it did nothing until a manual
+    // `mercury restart`. Restart it ourselves when something changed.
+    const before = configFingerprint();
     if (isSetupComplete()) {
       await configure(loadConfig());
     } else {
       await configure();
+    }
+    if (configFingerprint() !== before) {
+      restartDaemonIfRunning('Applying your changes — restarting the background Mercury...');
     }
   });
 
@@ -1939,6 +4197,18 @@ program
     console.log(`  Provider: ${chalk.white(getProviderLabel(config.providers.default))}`);
     console.log(`  Telegram: ${config.channels.telegram.enabled ? chalk.green('enabled') : chalk.dim('disabled')}`);
     console.log(`  Telegram Access: ${chalk.white(getTelegramAccessSummary(config))}`);
+    console.log(`  Signal:   ${config.channels.signal.enabled ? chalk.green('enabled') : chalk.dim('disabled')}`);
+    if (config.channels.signal.phoneNumber) {
+      console.log(`  Signal Access: ${chalk.white(getSignalAccessSummary(config))}`);
+    }
+    console.log(`  Discord:  ${config.channels.discord.enabled ? chalk.green('enabled') : chalk.dim('disabled')}`);
+    if (config.channels.discord.botToken) {
+      console.log(`  Discord Access: ${chalk.white(getDiscordAccessSummary(config))}`);
+    }
+    console.log(`  Slack:    ${config.channels.slack.enabled ? chalk.green('enabled') : chalk.dim('disabled')}`);
+    if (config.channels.slack.botToken) {
+      console.log(`  Slack Access: ${chalk.white(getSlackAccessSummary(config))}`);
+    }
     console.log(`  Web:      ${config.web.enabled ? chalk.green(`enabled (http://localhost:${config.web.port})`) : chalk.dim('disabled')}`);
     console.log(`  Skills:   ${skills.length > 0 ? chalk.green(skills.map(s => s.name).join(', ')) : chalk.dim('none')}`);
     console.log(`  Budget:   ${chalk.white(config.tokens.dailyBudget.toLocaleString())} tokens/day`);
@@ -1958,6 +4228,15 @@ program
     console.log(`  Daemon:   ${daemon.running ? chalk.green(`running (PID: ${daemon.pid})`) : chalk.dim('not running')}`);
     console.log(`  Home:     ${chalk.dim(home)}`);
     printTelegramAccessState(config);
+    if (config.channels.signal.phoneNumber) {
+      printSignalAccessState(config);
+    }
+    if (config.channels.discord.botToken) {
+      printDiscordAccessState(config);
+    }
+    if (config.channels.slack.botToken) {
+      printSlackAccessState(config);
+    }
     console.log('');
   });
 
@@ -1979,6 +4258,42 @@ telegramCmd
     const config = loadConfig();
     console.log('');
     printTelegramAccessState(config);
+    console.log('');
+  });
+
+telegramCmd
+  .command('enable')
+  .description('Enable Telegram channel if a bot token is configured')
+  .action(() => {
+    const config = loadConfig();
+    if (!config.channels.telegram.botToken) {
+      console.log('');
+      console.log(chalk.red('  Telegram bot token is missing. Run `mercury doctor` to configure Telegram first.'));
+      console.log('');
+      return;
+    }
+
+    config.channels.telegram.enabled = true;
+    saveConfig(config);
+    console.log('');
+    console.log(chalk.green('  ✓ Telegram channel enabled.'));
+    if (getTelegramApprovedUsers(config).length === 0) {
+      console.log(chalk.dim('  Send /start to the bot, then approve the pairing code with `mercury telegram approve <code>`.'));
+    }
+    restartDaemonIfRunning('Restarting the background daemon to apply the change immediately...');
+    console.log('');
+  });
+
+telegramCmd
+  .command('disable')
+  .description('Disable Telegram channel without removing its bot token or access list')
+  .action(() => {
+    const config = loadConfig();
+    config.channels.telegram.enabled = false;
+    saveConfig(config);
+    console.log('');
+    console.log(chalk.green('  ✓ Telegram channel disabled.'));
+    restartDaemonIfRunning('Restarting the background daemon to apply the change immediately...');
     console.log('');
   });
 
@@ -2167,6 +4482,517 @@ telegramCmd
     console.log('');
   });
 
+const signalCmd = program
+  .command('signal')
+  .description('Manage Signal channel access and setup');
+
+signalCmd
+  .command('approve <code>')
+  .description('Approve a pending Signal pairing request by code')
+  .action(async (code: string) => {
+    const config = loadConfig();
+
+    if (!hasSignalAdminsFn(config)) {
+      const approved = approveSignalPendingRequestByPairingCode(config, code.trim());
+      if (!approved) {
+        console.log('');
+        console.log(chalk.red(`  No pending Signal pairing found for code ${code.trim()}.`));
+        console.log('');
+        return;
+      }
+
+      saveConfig(config);
+      console.log('');
+      console.log(chalk.green(`  ✓ Approved first Signal admin ${approved.phoneNumber}.`));
+      restartDaemonIfRunning('Restarting the background daemon to apply the change immediately...');
+      console.log('');
+      return;
+    }
+
+    const pending = findSignalPendingRequest(config, code.trim());
+    if (!pending) {
+      console.log('');
+      console.log(chalk.red(`  No pending Signal pairing found for ${code.trim()}.`));
+      console.log('');
+      return;
+    }
+
+    console.log('');
+    console.log(chalk.yellow(`  A Signal admin already exists. New members must be approved by an admin in Signal.`));
+    console.log('');
+  });
+
+signalCmd
+  .command('unpair')
+  .description('Reset all Signal access and group connection')
+  .action(() => {
+    const config = loadConfig();
+    const hasAny = config.channels.signal.admins.length > 0
+      || config.channels.signal.members.length > 0
+      || config.channels.signal.pending.length > 0;
+
+    if (!hasAny) {
+      console.log('');
+      console.log(chalk.dim('  Signal access is already empty.'));
+      console.log('');
+      return;
+    }
+
+    clearSignalAccess(config);
+    saveConfig(config);
+
+    console.log('');
+    console.log(chalk.green('  ✓ Signal access reset.'));
+    console.log(chalk.dim('  Send /pair in Signal to reconnect.'));
+    restartDaemonIfRunning('Restarting the background daemon to apply the change immediately...');
+    console.log('');
+  });
+
+signalCmd
+  .command('reset')
+  .description('Full reset: clear Signal access, delete binary, and unlink device')
+  .option('--keep-binary', 'Keep the signal-cli binary (only clear config)')
+  .action(async (opts) => {
+    const { removeSignalCli, getSignalCliDir, checkJavaAvailable, ensureSignalCli } = await import('./signal/setup.js');
+    const config = loadConfig();
+
+    console.log('');
+    console.log(chalk.yellow('  ⚠️  This will:'));
+    console.log(chalk.yellow('  • Clear all Signal access (admins, members, pending)'));
+    console.log(chalk.yellow('  • Remove group connection'));
+    console.log(chalk.yellow('  • Disable the Signal channel'));
+    if (!opts.keepBinary) {
+      console.log(chalk.yellow('  • Delete the signal-cli binary from disk'));
+    }
+    console.log('');
+
+    const answer = await ask(chalk.white('  Continue? [y/N] '));
+    if (answer.toLowerCase() !== 'y' && answer.toLowerCase() !== 'yes') {
+      console.log(chalk.dim('  Cancelled.'));
+      console.log('');
+      return;
+    }
+
+    clearSignalAccess(config);
+    config.channels.signal.enabled = false;
+    saveConfig(config);
+
+    if (!opts.keepBinary) {
+      const signalDir = getSignalCliDir();
+      const { existsSync } = await import('node:fs');
+      if (existsSync(signalDir)) {
+        removeSignalCli();
+        console.log(chalk.green('  ✓ Signal binary removed.'));
+      }
+    }
+
+    console.log(chalk.green('  ✓ Signal reset complete.'));
+    console.log(chalk.dim('  Run `mercury doctor` to set up Signal again.'));
+    restartDaemonIfRunning('Restarting the background daemon to apply the change immediately...');
+    console.log('');
+  });
+
+signalCmd
+  .command('status')
+  .description('Show Signal configuration and connection status')
+  .action(async () => {
+    const config = loadConfig();
+    const { checkSignalSetup } = await import('./signal/setup.js');
+
+    console.log('');
+    console.log(chalk.bold.white('  Signal Status'));
+    console.log('');
+
+    if (!config.channels.signal.phoneNumber) {
+      console.log(chalk.dim('  Not configured. Run `mercury doctor` to set up Signal.'));
+      console.log('');
+      return;
+    }
+
+    console.log(`  Phone:     ${chalk.white(config.channels.signal.phoneNumber)}`);
+    console.log(`  Mode:      ${chalk.white(config.channels.signal.mode)}`);
+    console.log(`  Enabled:   ${config.channels.signal.enabled ? chalk.green('yes') : chalk.dim('no')}`);
+    console.log(`  Paired:    ${hasSignalAdminsFn(config) ? chalk.green('yes') : chalk.dim('no')}`);
+    console.log(`  Access:    ${chalk.white(getSignalAccessSummary(config))}`);
+
+    if (config.channels.signal.mode === 'group') {
+      console.log(`  Group:     ${chalk.white(config.channels.signal.groupName || config.channels.signal.groupId || 'Not set')}`);
+    }
+
+    const status = await checkSignalSetup(config);
+    console.log(`  Binary:    ${status.binaryOk ? chalk.green('found') : chalk.red('not found')}`);
+    console.log(`  Linked:    ${status.linked ? chalk.green('yes') : chalk.red('no')}`);
+
+    if (status.errors.length > 0) {
+      console.log('');
+      for (const err of status.errors) {
+        console.log(chalk.red(`  • ${err}`));
+      }
+    }
+
+    console.log('');
+  });
+
+signalCmd
+  .command('register')
+  .description('Register a phone number with Signal (sends verification code)')
+  .action(async () => {
+    const config = loadConfig();
+    if (!config.channels.signal.phoneNumber) {
+      console.log('');
+      console.log(chalk.red('  No Signal phone number configured. Run mercury doctor first.'));
+      console.log('');
+      return;
+    }
+
+    const { registerSignalNumber, verifySignalNumber } = await import('./signal/setup.js');
+    console.log('');
+    console.log(chalk.bold.white('  Signal Registration'));
+    console.log(chalk.dim(`  Phone: ${redactPhone(config.channels.signal.phoneNumber)}`));
+    console.log('');
+
+    const voice = await ask(chalk.white('  Verify via SMS or voice call? (sms/voice) [sms]: '));
+    const useVoice = voice.toLowerCase().startsWith('voice');
+
+    console.log(chalk.dim('  Sending verification code...'));
+    const result = await registerSignalNumber(config.channels.signal.phoneNumber, useVoice);
+    if (!result.success) {
+      console.log(chalk.red(`  ✗ Registration failed: ${result.error}`));
+      return;
+    }
+    console.log(chalk.green('  ✓ Verification code sent.'));
+
+    const code = await ask(chalk.white('  Enter the verification code: '));
+    if (!code) {
+      console.log(chalk.red('  Verification code is required.'));
+      return;
+    }
+
+    const verifyResult = await verifySignalNumber(config.channels.signal.phoneNumber, code.trim());
+    if (!verifyResult.success) {
+      console.log(chalk.red(`  ✗ Verification failed: ${verifyResult.error}`));
+      return;
+    }
+    console.log(chalk.green('  ✓ Number verified and registered.'));
+    console.log('');
+  });
+
+signalCmd
+  .command('unregister')
+  .description('Unlink this device from Signal and clear all Mercury Signal data')
+  .action(async () => {
+    const config = loadConfig();
+    if (!config.channels.signal.phoneNumber) {
+      console.log('');
+      console.log(chalk.dim('  No Signal phone number configured.'));
+      console.log('');
+      return;
+    }
+
+    console.log('');
+    console.log(chalk.yellow('  ⚠️  This will:'));
+    console.log(chalk.yellow('  • Send a goodbye message to your Signal group/chat'));
+    console.log(chalk.yellow('  • Unlink this device from the Signal server'));
+    console.log(chalk.yellow('  • Clear all Signal access data (admins, members, group connection)'));
+    console.log('');
+
+    const answer = await ask(chalk.white('  Continue? (y/N): '));
+    if (answer.toLowerCase() !== 'y' && answer.toLowerCase() !== 'yes') {
+      console.log(chalk.dim('  Cancelled.'));
+      console.log('');
+      return;
+    }
+
+    // Send goodbye message (best effort, skip if signal-cli not installed)
+    const { findSignalCli } = await import('./signal/setup.js');
+    const { sendSignalMessage } = await import('./signal/setup.js');
+    if (findSignalCli()) {
+      const target: { groupId?: string; recipient?: string } = {};
+      if (config.channels.signal.mode === 'group' && config.channels.signal.groupId) {
+        target.groupId = config.channels.signal.groupId;
+      } else if (config.channels.signal.admins.length > 0) {
+        target.recipient = config.channels.signal.admins[0].phoneNumber;
+      }
+      if (target.groupId || target.recipient) {
+        try {
+          await sendSignalMessage(config.channels.signal.phoneNumber, 'Mercury has been unregistered from this conversation. It will no longer respond here. To reconnect, the admin needs to set up Signal again with: mercury doctor', target);
+        } catch { /* best effort */ }
+      }
+    }
+
+    const { killStaleSignalCliProcesses } = await import('./signal/jsonrpc.js');
+    killStaleSignalCliProcesses();
+
+    // Unregister from Signal server
+    console.log(chalk.dim('  Unlinking device from Signal...'));
+    const { unregisterSignalNumber } = await import('./signal/setup.js');
+    const result = await unregisterSignalNumber(config.channels.signal.phoneNumber);
+    if (result.success) {
+      console.log(chalk.green('  ✓ Device unlinked from Signal server.'));
+    } else {
+      console.log(chalk.yellow('  ⚠ Could not reach Signal server to unlink device.'));
+      console.log(chalk.dim('  Local data has been cleared. The device will be unlinked automatically.'));
+    }
+
+    // Delete signal-cli local account data so checkLocalAccountData returns false
+    const phoneNumberToDelete = config.channels.signal.phoneNumber;
+    clearSignalAccess(config);
+    config.channels.signal.enabled = false;
+    config.channels.signal.phoneNumber = '';
+    config.channels.signal.groupId = undefined;
+    config.channels.signal.groupName = undefined;
+    saveConfig(config);
+
+    const { deleteSignalCliAccountData } = await import('./signal/setup.js');
+    if (phoneNumberToDelete) {
+      deleteSignalCliAccountData(phoneNumberToDelete);
+    }
+
+    console.log(chalk.green('  ✓ Signal data cleared.'));
+    console.log(chalk.dim('  Run mercury doctor to set up Signal again.'));
+    console.log('');
+
+    restartDaemonIfRunning('Restarting the background daemon to apply the change immediately...');
+  });
+
+const discordCmd = program
+  .command('discord')
+  .description('Manage Discord channel access and setup');
+
+discordCmd
+  .command('list')
+  .description('Show approved Discord users and pending access requests')
+  .action(() => {
+    const config = loadConfig();
+    console.log('');
+    printDiscordAccessState(config);
+    console.log('');
+  });
+
+discordCmd
+  .command('approve <code>')
+  .description('Approve a pending Discord pairing request by code')
+  .action(async (code: string) => {
+    const config = loadConfig();
+
+    if (!hasDiscordAdminsFn(config)) {
+      const approved = approveDiscordPendingRequestByPairingCode(config, code.trim());
+      if (!approved) {
+        console.log('');
+        console.log(chalk.red(`  No pending Discord pairing found for code ${code.trim()}.`));
+        console.log('');
+        return;
+      }
+
+      saveConfig(config);
+      console.log('');
+      console.log(chalk.green(`  ✓ Approved first Discord admin ${formatDiscordUser(approved)}.`));
+      restartDaemonIfRunning('Restarting the background daemon to apply the change immediately...');
+      console.log('');
+      return;
+    }
+
+    const pending = findDiscordPendingRequest(config, code.trim());
+    if (!pending) {
+      console.log('');
+      console.log(chalk.red(`  No pending Discord request found for ${code.trim()}.`));
+      console.log('');
+      return;
+    }
+
+    const approved = approveDiscordPendingRequest(config, pending.userId);
+    if (!approved) {
+      console.log(chalk.red('  Failed to approve request.'));
+      return;
+    }
+
+    saveConfig(config);
+    console.log('');
+    console.log(chalk.green(`  ✓ Approved Discord user ${formatDiscordUser(approved)}.`));
+    restartDaemonIfRunning('Restarting the background daemon to apply the change immediately...');
+    console.log('');
+  });
+
+discordCmd
+  .command('reject <userId>')
+  .description('Reject a pending Discord access request')
+  .action(async (userId: string) => {
+    const config = loadConfig();
+    const rejected = rejectDiscordPendingRequest(config, userId.trim());
+    if (!rejected) {
+      console.log('');
+      console.log(chalk.red(`  No pending Discord request found for ${userId.trim()}.`));
+      console.log('');
+      return;
+    }
+
+    saveConfig(config);
+    console.log('');
+    console.log(chalk.green(`  ✓ Rejected Discord request for ${formatDiscordUser(rejected)}.`));
+    restartDaemonIfRunning('Restarting the background daemon to apply the change immediately...');
+    console.log('');
+  });
+
+discordCmd
+  .command('remove <userId>')
+  .description('Remove an approved Discord user')
+  .action(async (userId: string) => {
+    const config = loadConfig();
+    const removed = removeDiscordUser(config, userId.trim());
+    if (!removed) {
+      console.log('');
+      console.log(chalk.red(`  No Discord user found with ID ${userId.trim()}.`));
+      console.log('');
+      return;
+    }
+
+    saveConfig(config);
+    console.log('');
+    console.log(chalk.green(`  ✓ Removed Discord access for ${formatDiscordUser(removed)}.`));
+    restartDaemonIfRunning('Restarting the background daemon to apply the change immediately...');
+    console.log('');
+  });
+
+discordCmd
+  .command('reset')
+  .description('Clear all Discord access data')
+  .action(async () => {
+    const config = loadConfig();
+    clearDiscordAccess(config);
+    config.channels.discord.enabled = false;
+    saveConfig(config);
+    console.log('');
+    console.log(chalk.green('  ✓ Discord access reset complete.'));
+    console.log(chalk.dim('  Run `mercury doctor` to set up Discord again.'));
+    restartDaemonIfRunning('Restarting the background daemon to apply the change immediately...');
+    console.log('');
+  });
+
+discordCmd
+  .command('status')
+  .description('Show Discord configuration and connection status')
+  .action(() => {
+    const config = loadConfig();
+
+    console.log('');
+    console.log(chalk.bold.white('  Discord Status'));
+    console.log('');
+
+    if (!config.channels.discord.botToken) {
+      console.log(chalk.dim('  Not configured. Run `mercury doctor` to set up Discord.'));
+      console.log('');
+      return;
+    }
+
+    console.log(`  Enabled:     ${config.channels.discord.enabled ? chalk.green('yes') : chalk.dim('no')}`);
+    console.log(`  Paired:      ${hasDiscordAdminsFn(config) ? chalk.green('yes') : chalk.dim('no')}`);
+    console.log(`  Access:      ${chalk.white(getDiscordAccessSummary(config))}`);
+    if (config.channels.discord.guildId) {
+      console.log(`  Guild:       ${chalk.white(config.channels.discord.guildId)}`);
+    }
+    if (config.channels.discord.channelId) {
+      console.log(`  Channel:     ${chalk.white(config.channels.discord.channelId)}`);
+    }
+    if (config.channels.discord.adminRoleName) {
+      console.log(`  Admin Role:  ${chalk.white(config.channels.discord.adminRoleName)}`);
+    }
+    console.log(`  Streaming:   ${config.channels.discord.streaming ? chalk.green('yes') : chalk.dim('no')}`);
+
+    console.log('');
+  });
+
+const slackCmd = program
+  .command('slack')
+  .description('Manage Slack channel access and setup');
+
+slackCmd
+  .command('list')
+  .description('Show approved Slack users and pending access requests')
+  .action(() => {
+    const config = loadConfig();
+    printSlackAccessState(config);
+  });
+
+slackCmd
+  .command('approve <userId>')
+  .description('Approve a pending Slack access request')
+  .action((userId: string) => {
+    const config = loadConfig();
+
+    const approved = approveSlackPendingRequest(config, userId);
+
+    if (!approved) {
+      console.log(chalk.red(`No pending Slack request found for "${userId}".`));
+      process.exit(1);
+    }
+
+    saveConfig(config);
+    console.log(chalk.green(`Approved Slack user ${formatSlackUser(approved)}.`));
+  });
+
+slackCmd
+  .command('reject <userId>')
+  .description('Reject a pending Slack access request')
+  .action((userId: string) => {
+    const config = loadConfig();
+
+    const rejected = rejectSlackPendingRequest(config, userId);
+    if (!rejected) {
+      console.log(chalk.red(`No pending Slack request found for "${userId}".`));
+      process.exit(1);
+    }
+
+    saveConfig(config);
+    console.log(chalk.yellow(`Rejected Slack request for ${formatSlackUser(rejected)}.`));
+  });
+
+slackCmd
+  .command('remove <userId>')
+  .description('Remove an approved Slack user')
+  .action((userId: string) => {
+    const config = loadConfig();
+
+    const removed = removeSlackUser(config, userId);
+    if (!removed) {
+      console.log(chalk.red(`No approved Slack user found for "${userId}".`));
+      process.exit(1);
+    }
+
+    saveConfig(config);
+    console.log(chalk.yellow(`Removed Slack access for ${formatSlackUser(removed)}.`));
+  });
+
+slackCmd
+  .command('reset')
+  .description('Clear all Slack access data and disable Slack')
+  .action(() => {
+    const config = loadConfig();
+    clearSlackAccess(config);
+    config.channels.slack.enabled = false;
+    saveConfig(config);
+    console.log(chalk.yellow('Slack access reset. Channel disabled.'));
+  });
+
+slackCmd
+  .command('status')
+  .description('Show Slack configuration and connection status')
+  .action(() => {
+    const config = loadConfig();
+    console.log(`  Enabled:     ${config.channels.slack.enabled ? chalk.green('yes') : chalk.dim('no')}`);
+    if (!config.channels.slack.botToken) {
+      console.log(chalk.dim('  Not configured. Run mercury doctor to set up Slack.'));
+    }
+    if (config.channels.slack.channelId) {
+      console.log(`  Channel:     ${chalk.white(config.channels.slack.channelId)}`);
+    }
+    if (config.channels.slack.teamId) {
+      console.log(`  Team:         ${chalk.white(config.channels.slack.teamId)}`);
+    }
+    console.log(`  Streaming:   ${config.channels.slack.streaming ? chalk.green('yes') : chalk.dim('no')}`);
+    console.log(`  Access:       ${chalk.white(getSlackAccessSummary(config))}`);
+    console.log('');
+  });
+
 const serviceCmd = program
   .command('service')
   .description('Manage Mercury as a system service (auto-start, crash recovery)');
@@ -2192,22 +5018,95 @@ serviceCmd
     showServiceStatus();
   });
 
-program
+  program
   .command('upgrade')
-  .description('Upgrade Mercury to the latest version from npm')
-  .action(async () => {
+  .description('Upgrade Mercury to the latest version')
+  .option('--force', 'Reinstall even when already on the latest version')
+  .action(async (opts: { force?: boolean }) => {
     console.log('');
     console.log(chalk.cyan(`  Mercury ${chalk.white(`v${pkgVersion}`)}`));
+    // Already current? Say so and touch nothing — not the daemon, not the
+    // binary. (This used to stop the daemon and re-run the installer
+    // unconditionally: "upgrade" on the latest build was a restart.)
+    if (!opts.force) {
+      const { fetchLatestVersion } = await import('./cli/latest-version.js');
+      const channel = isDevBuild(pkgVersion) ? 'dev' : 'stable';
+      const latest = await fetchLatestVersion(channel);
+      if (latest && latest === pkgVersion) {
+        console.log(chalk.green(`  ✓ Already on the latest ${channel === 'dev' ? 'dev build' : 'version'} (v${pkgVersion}). Nothing to do.`));
+        console.log(chalk.dim('  Use mercury upgrade --force to reinstall anyway.'));
+        console.log('');
+        return;
+      }
+      if (latest) console.log(chalk.dim(`  Latest on the ${channel} channel: v${latest}`));
+    }
+    // A dev binary upgrades itself in place on the same channel (re-running
+    // the dev installer below); npm builds take the npm stable track.
+    if (isDevBuild(pkgVersion)) {
+      console.log(chalk.yellow('  ⚠ development build — upgrading within the dev channel (rolling mercury-dev-latest)'));
+      console.log('');
+    }
     console.log('');
 
     const daemon = getDaemonStatus();
     if (daemon.running) {
       console.log(chalk.dim('  Stopping background daemon...'));
-      stopDaemon();
-      await new Promise((r) => setTimeout(r, 1000));
+      await stopDaemon();
       console.log(chalk.green('  ✓ Daemon stopped'));
     }
 
+    const standalone = isStandaloneBinary();
+
+    if (standalone) {
+      // Standalone binary: re-run the installer script which downloads the
+      // latest release from GitHub and replaces the binary in-place. A dev
+      // build re-runs the DEV installer so `upgrade` stays on its channel —
+      // running the stable installer here would silently switch installs.
+      const isDev = isDevBuild(pkgVersion);
+      const installer = isDev ? 'install-dev' : 'install';
+      console.log(
+        isDev
+          ? chalk.dim('  Development build detected — re-running the dev installer (stays on the dev channel)...')
+          : chalk.dim('  Standalone binary detected — re-running installer...'),
+      );
+      console.log('');
+
+      const { execSync, spawn } = await import('node:child_process');
+      const platform = process.platform;
+
+      if (platform === 'win32') {
+        // Run after this process exits so Windows releases the current
+        // executable: wait on our pid (not a fixed sleep), and hand the pid
+        // to the installer so it can wait again before replacing the binary.
+        const psCmd = `$env:MERCURY_WAIT_PID='${process.pid}'; Wait-Process -Id ${process.pid} -Timeout 30 -ErrorAction SilentlyContinue; irm https://mercuryagent.sh/${installer}.ps1 | iex`;
+        try {
+          const installer2 = spawn(
+            'powershell.exe',
+            ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', psCmd],
+            { detached: true, stdio: 'inherit' },
+          );
+          installer2.unref();
+          console.log(chalk.green('  ✓ Upgrade installer started. Mercury will exit before installation begins.'));
+        } catch {
+          console.log(chalk.red('  ✗ Upgrade failed. Try manually:'));
+          console.log(chalk.dim(`    irm https://mercuryagent.sh/${installer}.ps1 | iex`));
+        }
+      } else {
+        // macOS / Linux: use shell installer
+        const shCmd = `curl -fsSL https://mercuryagent.sh/${installer}.sh | sh`;
+        try {
+          execSync(shCmd, { stdio: 'inherit' });
+        } catch {
+          console.log(chalk.red('  ✗ Upgrade failed. Try manually:'));
+          console.log(chalk.dim(`    curl -fsSL https://mercuryagent.sh/${installer}.sh | sh`));
+        }
+      }
+
+      console.log('');
+      return;
+    }
+
+    // npm install: use npm to upgrade.
     console.log(chalk.dim('  Checking for latest version...'));
     const { execSync } = await import('node:child_process');
 
@@ -2222,6 +5121,21 @@ program
 
     console.log(chalk.dim(`  Latest: v${latestVersion}`));
 
+    // Never remove a working install for one this Node cannot run: the old
+    // package is gone before `npm i -g` prints its engines warning.
+    if (!process.versions.bun) {
+      let required = '';
+      try { required = execSync(`npm view @cosmicstack/mercury-agent@${latestVersion} engines.node`, { encoding: 'utf-8' }).trim(); } catch { /* unknown — proceed */ }
+      const need = Number((required.match(/(\d+)/) || [])[1] || 0);
+      const have = Number(process.versions.node.split('.')[0]);
+      if (need && have < need) {
+        console.log(chalk.red(`  ✗ v${latestVersion} needs Node.js ${need}+ — this is Node ${process.version}. Nothing was changed.`));
+        console.log(chalk.dim(`    Upgrade Node first:  nvm install ${need} && nvm alias default ${need}`));
+        console.log(chalk.dim('    Then reinstall:      npm i -g @cosmicstack/mercury-agent'));
+        console.log('');
+        return;
+      }
+    }
     if (latestVersion === pkgVersion) {
       console.log(chalk.green(`  ✓ Already on the latest version (v${pkgVersion})`));
       console.log('');
@@ -2258,6 +5172,50 @@ program
   });
 
 program
+  .command('code')
+  .description('Open the Mercury Code TUI in a directory (default: current) with a fresh session')
+  .argument('[dir]', 'Directory to work in (defaults to the current one)')
+  .action(async (dirArg?: string) => {
+    const target = dirArg ? pathResolve(dirArg) : process.cwd();
+    if (!existsSync(target) || !statSync(target).isDirectory()) {
+      console.log(chalk.red(`  ✗ Not a directory: ${target}`));
+      console.log('');
+      process.exit(1);
+    }
+    // Consumed by runAgent() in the foreground process (the daemon child
+    // ignores it — only the TUI boots into Mercury Code).
+    process.env.MERCURY_BOOT_CODE = dirArg ? target : '1';
+    if (!isSetupComplete()) {
+      await configure();
+      delete process.env.MERCURY_BOOT_CODE;
+      autoDaemonize();
+      return;
+    }
+    const foreground = getForegroundRuntimeStatus();
+    if (foreground.running && foreground.pid) {
+      console.log(chalk.cyan(`  ⚿ Mercury is already running (PID: ${foreground.pid}) — \`mercury code\` needs its own runtime.`));
+      console.log(chalk.dim('  Stop it first: mercury stop  (or use /code inside the running TUI).'));
+      console.log('');
+      return;
+    }
+    // Mercury Code needs the in-process TUI. Beside the daemon it just
+    // spawned, runAgent() is a terminal for the main agent only (ADR-024).
+    autoDaemonize();
+    await runAgent();
+  });
+
+program
+  .command('uninstall')
+  .description('Fully remove Mercury from this machine (runtime, service, npm/binary artifacts)')
+  .option('--purge-data', 'Also delete all Mercury data (~/.mercury: memory, sessions, soul, keys) without asking')
+  .option('--keep-data', 'Keep all Mercury data (skips the confirmation prompt)')
+  .action(async (opts) => {
+    await runUninstall({
+      purgeData: opts.purgeData ? true : opts.keepData ? false : undefined,
+    });
+  });
+
+program
   .command('web-reset-password')
   .description('Reset the web dashboard password')
   .argument('[password]', 'New password (prompted if omitted)')
@@ -2276,5 +5234,272 @@ program
     console.log(chalk.dim(`  Login at http://localhost:${loadConfig().web.port}`));
     console.log('');
   });
+
+interface McpAddOptions {
+  stdio?: string;
+  http?: string;
+  env: string[];
+  header: string[];
+  cwd?: string;
+  allow?: string;
+  autoApprove?: string;
+  allowPrivate?: boolean;
+  disabled?: boolean;
+  yes?: boolean;
+}
+
+async function confirmMcp(question: string): Promise<boolean> {
+  try {
+    const answer = (await ask(chalk.white(`  ${question} [y/N] `))).trim().toLowerCase();
+    return answer === 'y' || answer === 'yes';
+  } catch (err) {
+    if (err instanceof InputClosedError) return false;
+    throw err;
+  }
+}
+
+function printMcpProbe(status: McpServerStatus): void {
+  const line = formatMcpStatusLine(status);
+  console.log(status.state === 'connected' ? chalk.green(`  ✓ ${line}`) : chalk.red(`  ✗ ${line}`));
+  if (status.state === 'connected') {
+    for (const toolLine of formatMcpToolLines(status)) console.log(chalk.dim(`    ${toolLine}`));
+  }
+  if (status.stderrTail) {
+    console.log(chalk.dim('  stderr:'));
+    for (const stderrLine of status.stderrTail.trim().split('\n').slice(-20)) console.log(chalk.dim(`    ${stderrLine}`));
+  }
+}
+
+function mcpAction<A extends unknown[]>(fn: (...args: A) => Promise<void> | void): (...args: A) => Promise<void> {
+  return async (...args: A) => {
+    try {
+      await fn(...args);
+    } catch (err) {
+      console.log(chalk.red(`  ${err instanceof Error ? err.message : String(err)}`));
+      console.log('');
+      process.exitCode = 1;
+    }
+  };
+}
+
+function saveMcpChange(config: MercuryConfig, message: string): void {
+  saveConfig(config);
+  console.log(chalk.green(`  ✓ ${message}`));
+  restartDaemonIfRunning('Restarting the background daemon to apply the change...');
+  console.log('');
+}
+
+const collectRepeated = (value: string, previous: string[]): string[] => [...previous, value];
+
+const mcpCmd = program.command('mcp').description('Manage MCP servers whose tools Mercury can use');
+
+mcpCmd
+  .command('list')
+  .description('Show configured MCP servers')
+  .action(mcpAction(() => {
+    console.log('');
+    for (const line of formatMcpServerList(loadConfig())) {
+      console.log(line.startsWith('  ') ? chalk.dim(`  ${line}`) : `  ${line}`);
+    }
+    console.log('');
+  }));
+
+mcpCmd
+  .command('add <id> [args...]')
+  .description('Add an MCP server: --stdio <command> [-- args...] or --http <url>')
+  .option('--stdio <command>', 'command that starts a local stdio server')
+  .option('--http <url>', 'Streamable HTTP endpoint of a remote server')
+  .option('--env <KEY=VALUE>', 'environment variable for a stdio server, ${env:NAME} for secrets (repeatable)', collectRepeated, [])
+  .option('--header <Name: value>', 'HTTP header, ${env:NAME} for secrets (repeatable)', collectRepeated, [])
+  .option('--cwd <dir>', 'working directory for a stdio server')
+  .option('--allow <tools>', 'comma-separated tools the agent may see, or *')
+  .option('--auto-approve <tools>', 'comma-separated tools that run without asking')
+  .option('--allow-private', 'allow a private or loopback address for an HTTP server')
+  .option('--disabled', 'save the server without enabling it')
+  .option('-y, --yes', 'do not ask for confirmation')
+  .action(mcpAction(async (id: string, args: string[], opts: McpAddOptions) => {
+    const config = loadConfig();
+    const server = buildMcpServerConfig({ ...opts, args });
+    const warnings = addMcpServer(config, id, server);
+    console.log('');
+    for (const warning of warnings) console.log(chalk.yellow(`  ⚠ ${warning}`));
+    if (server.transport === 'stdio') {
+      console.log(chalk.white(`  Mercury will start this command: ${formatMcpStdioCommand(server)}`));
+      if (!opts.yes && !(await confirmMcp('Add this server?'))) {
+        console.log(chalk.dim('  Cancelled.'));
+        console.log('');
+        return;
+      }
+    }
+    if (server.enabled !== false) {
+      console.log(chalk.dim('  Testing the connection...'));
+      const status = await probeMcpServer(id, server);
+      printMcpProbe(status);
+      if (status.state !== 'connected' && !opts.yes && !(await confirmMcp('Save it anyway?'))) {
+        console.log(chalk.dim('  Cancelled.'));
+        console.log('');
+        return;
+      }
+    }
+    if (!server.tools?.allow?.length) {
+      console.log(chalk.dim(`  No tools are enabled yet. Enable some with \`mercury mcp allow ${id} <tool...>\`.`));
+    }
+    saveMcpChange(config, `MCP server "${id}" saved.`);
+  }));
+
+mcpCmd
+  .command('remove <id>')
+  .description('Remove an MCP server')
+  .action(mcpAction((id: string) => {
+    const config = loadConfig();
+    removeMcpServer(config, id);
+    console.log('');
+    saveMcpChange(config, `MCP server "${id}" removed.`);
+  }));
+
+mcpCmd
+  .command('enable <id>')
+  .description('Enable an MCP server')
+  .option('-y, --yes', 'do not ask for confirmation')
+  .action(mcpAction(async (id: string, opts: { yes?: boolean }) => {
+    const config = loadConfig();
+    const server = getMcpServer(config, id);
+    console.log('');
+    if (server.transport === 'stdio') {
+      console.log(chalk.white(`  Mercury will start this command: ${formatMcpStdioCommand(server)}`));
+      if (!opts.yes && !(await confirmMcp('Enable this server?'))) {
+        console.log(chalk.dim('  Cancelled.'));
+        console.log('');
+        return;
+      }
+    }
+    setMcpServerEnabled(config, id, true);
+    saveMcpChange(config, `MCP server "${id}" enabled.`);
+  }));
+
+mcpCmd
+  .command('disable <id>')
+  .description('Disable an MCP server without removing it')
+  .action(mcpAction((id: string) => {
+    const config = loadConfig();
+    setMcpServerEnabled(config, id, false);
+    console.log('');
+    saveMcpChange(config, `MCP server "${id}" disabled.`);
+  }));
+
+mcpCmd
+  .command('allow <id> <tools...>')
+  .description('Let the agent see these tools (quote "*" to allow all)')
+  .action(mcpAction((id: string, tools: string[]) => {
+    const config = loadConfig();
+    const server = allowMcpTools(config, id, tools);
+    console.log('');
+    saveMcpChange(config, `${id}: allowed ${server.tools?.allow?.join(', ') || 'nothing'}.`);
+  }));
+
+mcpCmd
+  .command('disallow <id> <tools...>')
+  .description('Hide these tools from the agent')
+  .action(mcpAction((id: string, tools: string[]) => {
+    const config = loadConfig();
+    const server = disallowMcpTools(config, id, tools);
+    console.log('');
+    const deny = server.tools?.deny?.length ? `, denied ${server.tools.deny.join(', ')}` : '';
+    saveMcpChange(config, `${id}: allowed ${server.tools?.allow?.join(', ') || 'nothing'}${deny}.`);
+  }));
+
+mcpCmd
+  .command('test <id>')
+  .description('Connect to an MCP server and list its tools')
+  .action(mcpAction(async (id: string) => {
+    const server = getMcpServer(loadConfig(), id);
+    console.log('');
+    const status = await probeMcpServer(id, server);
+    printMcpProbe(status);
+    console.log('');
+    if (status.state !== 'connected') process.exitCode = 1;
+  }));
+registerPluginsCli(program);
+
+const cloud = program.command('cloud').description('Manage Mercury Cloud connection');
+
+cloud
+  .command('connect')
+  .description('Connect to Mercury Cloud via terminal pairing')
+  .action(async () => {
+    console.log('');
+    const wasDaemonRunning = getDaemonStatus().running;
+    try {
+      const { runCloudConnect } = await import('./cloud/pairing-flow.js');
+      await runCloudConnect();
+    } catch (err: any) {
+      console.log(chalk.red(`  ✗ ${err.message || err}`));
+      console.log('');
+      return;
+    }
+    // Always launch the foreground TUI so the user can start chatting
+    // immediately. The background daemon (started by runCloudConnect) keeps
+    // the WebSocket alive even after the user exits the foreground.
+    if (isSetupComplete()) {
+      // runCloudConnect (re)starts the daemon — join IT, never boot a second
+      // runtime next to it (two schedulers would call bots in lockstep).
+      const daemon = getDaemonStatus();
+      if (daemon.running && daemon.pid) {
+        console.log(chalk.cyan(`\n  ⚿ Mercury is already running in the background (PID: ${daemon.pid}) — attaching.\n`));
+        await attachOrHeal();
+        return;
+      }
+      console.log(chalk.cyan('\n  Launching Mercury...\n'));
+      await runAgent();
+    } else {
+      console.log(chalk.cyan('\n  Mercury daemon is running in the background. Run `mercury` to start chatting.'));
+      console.log('');
+    }
+  });
+
+cloud
+  .command('disconnect')
+  .description('Disconnect from Mercury Cloud and switch to offline (BYOK) mode')
+  .action(async () => {
+    console.log('');
+    try {
+      const { runCloudDisconnect } = await import('./cloud/pairing-flow.js');
+      await runCloudDisconnect();
+    } catch (err: any) {
+      console.log(chalk.red(`  ✗ ${err.message || err}`));
+    }
+    console.log('');
+  });
+
+cloud
+  .command('status')
+  .description('Show Mercury Cloud connection status')
+  .action(async () => {
+    console.log('');
+    try {
+      const { runCloudStatus } = await import('./cloud/pairing-flow.js');
+      await runCloudStatus();
+    } catch (err: any) {
+      console.log(chalk.red(`  ✗ ${err.message || err}`));
+    }
+    console.log('');
+  });
+
+cloud
+  .command('login')
+  .description('Refresh Mercury Cloud authentication token')
+  .action(async () => {
+    console.log('');
+    try {
+      const { runCloudLogin } = await import('./cloud/pairing-flow.js');
+      await runCloudLogin();
+    } catch (err: any) {
+      console.log(chalk.red(`  ✗ ${err.message || err}`));
+    }
+    console.log('');
+  });
+
+registerSkillsCommand(program);
+registerBotsCommand(program);
 
 program.parse();

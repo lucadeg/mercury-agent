@@ -16,7 +16,7 @@ export interface TelegramPendingRequest {
   pairingCode?: string;
 }
 
-export type ChannelType = 'cli' | 'telegram' | 'web' | 'internal' | 'signal' | 'discord' | 'slack' | 'whatsapp';
+export type ChannelType = 'cli' | 'telegram' | 'web' | 'internal' | 'signal' | 'discord' | 'slack' | 'whatsapp' | 'desktop';
 
 export interface ChannelMessage {
   id: string;
@@ -24,9 +24,32 @@ export interface ChannelMessage {
   channelType: ChannelType;
   senderId: string;
   senderName?: string;
+  /**
+   * Role of the sender on the originating channel, when the channel can
+   * distinguish it (e.g. Telegram admins vs approved members). Undefined for
+   * channels that have no notion of roles (CLI, internal). Used to keep
+   * admin-only capabilities (such as installing skills) out of the tool set
+   * exposed to non-admin chat participants.
+   */
+  senderRole?: "admin" | "member";
   content: string;
   timestamp: number;
+  /** Canonical local session identity; channelId remains transport-specific. */
+  sessionId?: string;
   metadata?: Record<string, unknown>;
+}
+
+/**
+ * A file the owner attached to a message. The runtime reads `path` at turn time
+ * and hands images/PDFs to the model when it can take them
+ * (`src/core/attachments.ts`); other kinds stay a path in the transcript.
+ */
+export interface ChannelAttachment {
+  /** `image` and `document` are the kinds the runtime can hand to a model. */
+  kind: 'image' | 'document';
+  path: string;
+  mime?: string;
+  name?: string;
 }
 
 export interface ChannelConfig {
@@ -51,4 +74,89 @@ export interface TelegramChannelConfig extends ChannelConfig {
 
 export interface CLIChannelConfig extends ChannelConfig {
   type: 'cli';
+}
+
+export type SignalMode = 'private' | 'group';
+
+export interface SignalAccessUser {
+  phoneNumber: string;
+  uuid?: string;
+  name?: string;
+  role: 'admin' | 'member';
+  pairedAt: string;
+}
+
+export interface SignalPendingRequest {
+  phoneNumber: string;
+  pairingCode: string;
+  requestedAt: string;
+  uuid?: string;
+  name?: string;
+}
+
+export interface SignalChannelConfig extends ChannelConfig {
+  type: 'signal';
+  phoneNumber: string;
+  mode: SignalMode;
+  groupId?: string;
+  groupName?: string;
+  admins: SignalAccessUser[];
+  members: SignalAccessUser[];
+  pending: SignalPendingRequest[];
+}
+
+export interface DiscordAccessUser {
+  userId: string;
+  username?: string;
+  displayName?: string;
+  role: 'admin' | 'member';
+  approvedAt: string;
+}
+
+export interface DiscordPendingRequest {
+  userId: string;
+  username?: string;
+  displayName?: string;
+  requestedAt: string;
+  pairingCode?: string;
+}
+
+export interface DiscordChannelConfig extends ChannelConfig {
+  type: 'discord';
+  botToken: string;
+  guildId?: string;
+  channelId?: string;
+  adminRoleName?: string;
+  streaming?: boolean;
+  admins: DiscordAccessUser[];
+  members: DiscordAccessUser[];
+  pending: DiscordPendingRequest[];
+}
+
+export interface SlackAccessUser {
+  userId: string;
+  userName?: string;
+  displayName?: string;
+  role: 'admin' | 'member';
+  approvedAt: string;
+}
+
+export interface SlackPendingRequest {
+  userId: string;
+  userName?: string;
+  displayName?: string;
+  requestedAt: string;
+  pairingCode?: string;
+}
+
+export interface SlackChannelConfig extends ChannelConfig {
+  type: 'slack';
+  botToken: string;
+  appToken: string;
+  channelId?: string;
+  teamId?: string;
+  streaming?: boolean;
+  admins: SlackAccessUser[];
+  members: SlackAccessUser[];
+  pending: SlackPendingRequest[];
 }

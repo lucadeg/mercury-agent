@@ -54,16 +54,47 @@ check('shebang present', () => {
   if (!head.includes('node')) throw new Error('no #!/usr/bin/env node shebang');
 });
 
+check('dist/index.js is the Node version launcher, dist/mercury.js the bundle', () => {
+  if (!existsSync(join(modDir, 'dist', 'mercury.js'))) throw new Error('missing dist/mercury.js');
+  const launcher = readFileSync(join(modDir, 'dist', 'index.js'), 'utf-8');
+  // The check must run before any dependency loads: no static imports
+  // other than node builtins, and the gate before the bundle import.
+  const staticImports = [...launcher.matchAll(/^import .* from ["']([^"']+)["'];?$/gm)].map((m) => m[1]);
+  const foreign = staticImports.filter((s) => !s.startsWith('node:'));
+  if (foreign.length) throw new Error(`launcher has static imports that load before the version check: ${foreign.join(', ')}`);
+  const gate = launcher.indexOf('Mercury needs Node.js 22 or newer');
+  const load = launcher.indexOf('./mercury.js');
+  if (gate < 0 || load < 0 || gate > load) throw new Error('launcher must check the Node version before loading ./mercury.js');
+});
+
 check('no dangling script references', () => {
   const pkg = JSON.parse(readFileSync(join(modDir, 'package.json'), 'utf-8'));
   const scripts = pkg.scripts || {};
-  const devOnlyScripts = ['build', 'build:ui', 'dev', 'lint', 'typecheck', 'test', 'test:watch', 'prepublishOnly'];
+  const devOnlyScripts = ['build', 'build:ui', 'build:bin', 'build:bin:all', 'build:bin:force', 'build:bin:all:force', 'dev', 'lint', 'typecheck', 'test', 'test:watch', 'prepublishOnly', 'eval', 'lint:eslint', 'lint:ratchet', 'vendor:ink', 'vendor:ink:check'];
   for (const [key, val] of Object.entries(scripts)) {
     if (devOnlyScripts.includes(key)) continue;
-    if (val.includes('scripts/') || val.includes('bash ')) {
+    if (val.includes('bash ')) {
       throw new Error(`script "${key}" references unpublished path: ${val}`);
     }
+    // A `scripts/<file>` reference is fine only when that file ships in the
+    // tarball (e.g. the postinstall ink-patch fallback).
+    for (const m of val.matchAll(/scripts\/[\w.-]+/g)) {
+      if (!existsSync(join(modDir, m[0]))) {
+        throw new Error(`script "${key}" references unpublished path ${m[0]}: ${val}`);
+      }
+    }
   }
+});
+
+check('patched ink is bundled into dist (ADR-017, no postinstall)', () => {
+  const bundle = readFileSync(join(modDir, 'dist', 'mercury.js'), 'utf-8');
+  if (/(?:from|import\()\s*["']ink["']/.test(bundle)) throw new Error('dist/mercury.js imports "ink" at runtime — the vendored build is not bundled');
+  // Same markers as scripts/post-build.cjs (ink 8 patch set, ADR-019).
+  for (const marker of ['__mercuryFrameGate', '__mercuryCursorAnchor', 'maxLiveRows', 'setCommitTick', 'vendored: true']) {
+    if (!bundle.includes(marker)) throw new Error(`vendored ink marker missing from dist/mercury.js: ${marker}`);
+  }
+  const pkg = JSON.parse(readFileSync(join(modDir, 'package.json'), 'utf-8'));
+  if (pkg.scripts && pkg.scripts.postinstall) throw new Error(`postinstall must not be needed any more (got: ${pkg.scripts.postinstall})`);
 });
 
 check('better-sqlite3 is optional', () => {
@@ -76,10 +107,11 @@ check('better-sqlite3 is optional', () => {
   }
 });
 
-check('engines requires >=20', () => {
+check('engines requires >=22', () => {
   const pkg = JSON.parse(readFileSync(join(modDir, 'package.json'), 'utf-8'));
-  if (!pkg.engines || !pkg.engines.node || !pkg.engines.node.includes('20')) {
-    throw new Error('engines.node should require >=20.0.0');
+  // ink 8 (the vendored TUI renderer) requires Node 22.
+  if (!pkg.engines || !pkg.engines.node || !pkg.engines.node.includes('22')) {
+    throw new Error('engines.node should require >=22.0.0');
   }
 });
 

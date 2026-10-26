@@ -1,9 +1,18 @@
 node_modules/
 dist/
+release/
+sea-config.json
+website/static/install.sh
+website/static/install.ps1
 .env
 *.log
 .DS_Store
 *.tsbuildinfo
-config/
-soul/
-memory/
+/config/
+/soul/
+/memory/
+# Claude Code worktrees / local state
+.claude/
+
+# plugin-system tests (src/plugins/test-fixtures.ts)
+.vitest-tmp/

@@ -1,4 +1,5 @@
 import { spawn, type ChildProcess } from 'node:child_process';
+import { planArgvExecution, minimalEnv } from '../capabilities/shell/argv-lane.js';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { logger } from '../utils/logger.js';
@@ -42,7 +43,7 @@ const MAX_TASKS = 20;
 const PRUNE_AGE_MS = 60 * 60 * 1000;
 const SIGTERM_GRACE_MS = 3000;
 const MAX_PREVIEW = 200;
-const DEFAULT_SHELL_TIMEOUT_MS = 0;
+const DEFAULT_SHELL_TIMEOUT_MS = 30 * 60 * 1000;
 const BG_TASKS_FILE = 'background-tasks.json';
 
 let taskCounter = 0;
@@ -150,11 +151,17 @@ export class BackgroundTaskManager {
     this.save();
 
     try {
-      const child = spawn(command, [], {
-        cwd,
-        shell: true,
-        stdio: ['pipe', 'pipe', 'pipe'],
-      });
+      // Same lane split as run_command: a command the argv lane can express
+      // runs via execFile from the pinned PATH with a minimal env; only the
+      // rest (already approved by the caller's checkShellCommand) uses a shell.
+      const plan = planArgvExecution(command);
+      const child = plan?.kind === 'exec'
+        ? spawn(plan.file, plan.args, { cwd, env: minimalEnv(), shell: false, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true })
+        : spawn(command, [], {
+          cwd,
+          shell: true,
+          stdio: ['pipe', 'pipe', 'pipe'],
+        });
 
       task.pid = child.pid ?? undefined;
       this.processes.set(id, child);
@@ -434,6 +441,9 @@ export class BackgroundTaskManager {
           task.status = 'failed';
           task.completedAt = Date.now();
           task.stderr = `${task.stderr}\nRecovered after restart: task was running when process exited.`.trim();
+          // Notify the user about recovered (failed) tasks so they don't
+          // have to check /bg list to discover what happened.
+          this.notifyComplete(task);
         }
         this.tasks.set(task.id, task);
         usedIds.add(task.id);

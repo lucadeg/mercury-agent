@@ -1,0 +1,164 @@
+import { describe, expect, it, vi, beforeEach } from 'vitest';
+import { resolve } from 'node:path';
+
+// Regression tests for ROADMAP P0.4: the git helpers used to build a shell
+// string from a model-chosen path and run it through execSync with no
+// permission check. They must now (a) hand the path to git as one argv
+// element via execFile (async — git must never hold the event loop) and
+// (b) refuse out-of-scope paths before exec.
+
+vi.mock('node:child_process', () => ({
+  execFile: vi.fn((_f: unknown, _a: unknown, _o: unknown, cb: (e: unknown, out: string, err: string) => void) => cb(null, '', '')),
+  execSync: vi.fn(() => { throw new Error('execSync must not be used by git helpers'); }),
+}));
+
+import { execFile, execSync } from 'node:child_process';
+import { createGitStatusTool } from './git-status.js';
+import { createGitLogTool } from './git-log.js';
+import { createGitDiffTool } from './git-diff.js';
+import { createGitPushTool } from './git-push.js';
+import type { PermissionManager } from '../permissions.js';
+import { setPinnedBinariesForTest } from '../shell/argv-lane.js';
+import { GIT_READ_HARDENING } from './git-path.js';
+
+// Read helpers run the git resolved from the pinned system PATH (#103).
+const PINNED_GIT = '/usr/bin/git';
+setPinnedBinariesForTest({ git: PINNED_GIT });
+const H = [...GIT_READ_HARDENING];
+
+const CWD = '/repo';
+const INJECTED = '/tmp/x"; echo pwned; "';
+
+function fakePermissions(opts: { readAllowed: boolean; shellAllowed?: boolean }) {
+  return {
+    checkFsAccess: vi.fn(async () => ({ allowed: opts.readAllowed, reason: opts.readAllowed ? undefined : 'out of scope' })),
+    checkShellCommand: vi.fn(async () => ({ allowed: opts.shellAllowed ?? true, needsApproval: false })),
+  } as unknown as PermissionManager & { checkFsAccess: ReturnType<typeof vi.fn>; checkShellCommand: ReturnType<typeof vi.fn> };
+}
+
+const run = (t: any, input: Record<string, unknown>) => (t.execute as any)(input, { toolCallId: 't', messages: [] });
+
+beforeEach(() => {
+  vi.mocked(execFile).mockClear();
+  vi.mocked(execFile).mockImplementation(((...a: unknown[]) => (a[3] as (...r: unknown[]) => void)(null, '', '')) as never);
+  vi.mocked(execSync).mockClear();
+});
+
+describe('git helpers pass the path as a single argv element (no shell)', () => {
+  it('git_status: -C <path> is one argv element', async () => {
+    const permissions = fakePermissions({ readAllowed: true });
+    await run(createGitStatusTool(permissions, () => CWD), { path: INJECTED });
+
+    expect(execSync).not.toHaveBeenCalled();
+    expect(execFile).toHaveBeenCalledTimes(1);
+    const [file, args, opts] = vi.mocked(execFile).mock.calls[0] as unknown as [string, string[], any];
+    expect(file).toBe(PINNED_GIT);
+    expect(args).toEqual([...H, '-C', resolve(INJECTED), 'status', '--porcelain']);
+    expect(opts.cwd).toBe(CWD);
+    expect(opts.shell).toBeUndefined();
+    // Minimal env: pinned PATH, nothing inherited wholesale.
+    expect(opts.env.PATH).not.toBe(process.env.PATH);
+    expect(opts.env.GIT_PAGER).toBe('cat');
+  });
+
+  it('git_log: path follows `--` as one argv element', async () => {
+    const permissions = fakePermissions({ readAllowed: true });
+    await run(createGitLogTool(permissions, () => CWD), { path: INJECTED, count: 5 });
+
+    expect(execSync).not.toHaveBeenCalled();
+    const [file, args] = vi.mocked(execFile).mock.calls[0] as unknown as [string, string[]];
+    expect(file).toBe(PINNED_GIT);
+    expect(args).toEqual([...H, 'log', '--no-ext-diff', '--no-textconv', '--oneline', '--decorate', '-5', '--', INJECTED]);
+  });
+
+  it('git_diff: path follows `--` as one argv element', async () => {
+    const permissions = fakePermissions({ readAllowed: true });
+    await run(createGitDiffTool(permissions, () => CWD), { path: INJECTED, staged: true });
+
+    expect(execSync).not.toHaveBeenCalled();
+    const [file, args] = vi.mocked(execFile).mock.calls[0] as unknown as [string, string[]];
+    expect(file).toBe(PINNED_GIT);
+    expect(args).toEqual([...H, 'diff', '--no-ext-diff', '--no-textconv', '--cached', '--', INJECTED]);
+  });
+
+  it('git_push: remote and branch are argv elements, and options are refused', async () => {
+    const permissions = fakePermissions({ readAllowed: true, shellAllowed: true });
+    const push = createGitPushTool(permissions, () => CWD);
+
+    await run(push, { remote: 'origin; echo pwned', branch: 'main' });
+    expect(execSync).not.toHaveBeenCalled();
+    const [file, args] = vi.mocked(execFile).mock.calls[0] as unknown as [string, string[]];
+    expect(file).toBe('git');
+    expect(args).toEqual(['push', 'origin; echo pwned', 'main']);
+
+    vi.mocked(execFile).mockClear();
+    const result = await run(push, { remote: '--receive-pack=echo pwned', branch: 'main' });
+    expect(result).toMatch(/must be names/);
+    expect(execFile).not.toHaveBeenCalled();
+  });
+
+  it('git_status without a path runs plain `git status --porcelain` and skips the scope check', async () => {
+    const permissions = fakePermissions({ readAllowed: false });
+    await run(createGitStatusTool(permissions, () => CWD), {});
+    expect(permissions.checkFsAccess).not.toHaveBeenCalled();
+    const [, args] = vi.mocked(execFile).mock.calls[0] as unknown as [string, string[]];
+    expect(args).toEqual([...H, 'status', '--porcelain']);
+  });
+});
+
+describe('git helpers reject out-of-scope paths before any exec', () => {
+  const OUTSIDE = '/etc/secret';
+  // The tools resolve the path first, so on Windows this becomes D:\etc\secret.
+  const OUTSIDE_RESOLVED = resolve(OUTSIDE);
+  const escapeRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const DENIED = new RegExp(`^Error: Permission denied for read access to ${escapeRe(OUTSIDE_RESOLVED)}\\. Use the approve_scope tool`);
+
+  it.each([
+    ['git_status', (p: PermissionManager) => createGitStatusTool(p, () => CWD), { path: OUTSIDE }],
+    ['git_log', (p: PermissionManager) => createGitLogTool(p, () => CWD), { path: OUTSIDE }],
+    ['git_diff', (p: PermissionManager) => createGitDiffTool(p, () => CWD), { path: OUTSIDE }],
+  ])('%s denies with the read_file-style message and never execs', async (_name, make, input) => {
+    const permissions = fakePermissions({ readAllowed: false });
+    const result = await run(make(permissions), input);
+
+    expect(result).toMatch(DENIED);
+    expect(permissions.checkFsAccess).toHaveBeenCalledWith(OUTSIDE_RESOLVED, 'read');
+    expect(execFile).not.toHaveBeenCalled();
+    expect(execSync).not.toHaveBeenCalled();
+  });
+
+  it('resolves relative paths against the tool cwd before checking scope', async () => {
+    const permissions = fakePermissions({ readAllowed: false });
+    await run(createGitLogTool(permissions, () => CWD), { path: '../outside' });
+    expect(permissions.checkFsAccess).toHaveBeenCalledWith(resolve(CWD, '../outside'), 'read');
+    expect(execFile).not.toHaveBeenCalled();
+  });
+
+  it('git_push denies before exec when the shell permission check fails', async () => {
+    const permissions = fakePermissions({ readAllowed: true, shellAllowed: false });
+    const result = await run(createGitPushTool(permissions, () => CWD), {});
+    expect(result).toMatch(/^Error:/);
+    expect(permissions.checkShellCommand).toHaveBeenCalledWith('git push origin');
+    expect(execFile).not.toHaveBeenCalled();
+  });
+});
+
+describe('output format is unchanged', () => {
+  it('git_status reports a clean tree, git_log/git_diff report empty results', async () => {
+    const permissions = fakePermissions({ readAllowed: true });
+    expect(await run(createGitStatusTool(permissions, () => CWD), {})).toBe('Working tree clean — no changes.');
+    expect(await run(createGitLogTool(permissions, () => CWD), {})).toBe('No commits found.');
+    expect(await run(createGitDiffTool(permissions, () => CWD), {})).toBe('No differences found.');
+
+    // The pre-existing behaviour trims the whole result (including the
+    // leading porcelain status column); keep it byte-for-byte identical.
+    vi.mocked(execFile).mockImplementation(((...a: unknown[]) => (a[3] as (...r: unknown[]) => void)(null, ' M src/a.ts\n?? new.ts\n', '')) as never);
+    expect(await run(createGitStatusTool(permissions, () => CWD), {})).toBe('M src/a.ts\n?? new.ts');
+  });
+
+  it('surfaces git stderr as an Error line', async () => {
+    const permissions = fakePermissions({ readAllowed: true });
+    vi.mocked(execFile).mockImplementation(((...a: unknown[]) => (a[3] as (...r: unknown[]) => void)(Object.assign(new Error('boom'), { stderr: 'fatal: not a git repository\n' }))) as never);
+    expect(await run(createGitDiffTool(permissions, () => CWD), {})).toBe('Error: fatal: not a git repository');
+  });
+});

@@ -1,0 +1,234 @@
+import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { BOT_JOURNAL_FILENAME, BOT_TRANSCRIPTS_DIRNAME, assertValidBotId } from './store.js';
+import { logger } from '../utils/logger.js';
+import type { BotRunRecord } from './types.js';
+
+/**
+ * Append-only per-bot run journal — the permanent compact record of every
+ * run (one line per run; bulky transcripts are evicted separately, see
+ * BOTS-ARCHITECTURE.md §2.10). Rotates at a byte threshold, keeping a fixed
+ * number of rotations, so a bot running for years is bounded in size.
+ */
+export class BotJournal {
+  private readonly dir: string;
+  private readonly rotateBytes: number;
+  private readonly keepRotations: number;
+
+  private readonly keepTranscripts: number;
+
+  constructor(dir: string, rotateBytes = 5 * 1024 * 1024, keepRotations = 3, keepTranscripts = 50) {
+    this.dir = dir;
+    this.rotateBytes = rotateBytes;
+    this.keepRotations = keepRotations;
+    this.keepTranscripts = keepTranscripts;
+  }
+
+  /**
+   * Compact per-run transcript (ADR-020): what the run actually did — the
+   * tool trace and the full reply — so a journal row can be explained after
+   * the fact. Bounded: the oldest files beyond `keepTranscripts` are pruned.
+   */
+  writeTranscript(record: BotRunRecord, body: { prompt: string; output: string; trace: unknown[] }): string | null {
+    assertValidBotId(record.botId);
+    if (this.keepTranscripts <= 0) return null;
+    const dir = join(this.dir, BOT_TRANSCRIPTS_DIRNAME);
+    try {
+      mkdirSync(dir, { recursive: true });
+      const file = join(dir, `${new Date(record.startedAt).toISOString().slice(0, 19).replace(/[:T]/g, '-')}-${record.runId}.json`);
+      writeFileSync(file, JSON.stringify({ record, ...body }, null, 1), 'utf-8');
+      const names = readdirSync(dir).filter(n => n.endsWith('.json')).sort();
+      for (const stale of names.slice(0, Math.max(0, names.length - this.keepTranscripts))) {
+        try { rmSync(join(dir, stale)); } catch { /* best effort */ }
+      }
+      return file;
+    } catch (err) {
+      logger.warn({ botId: record.botId, err: (err as Error)?.message }, 'Bot transcript write failed');
+      return null;
+    }
+  }
+
+  append(record: BotRunRecord): void {
+    assertValidBotId(record.botId);
+    this.rotateIfNeeded();
+    try {
+      appendFileSync(join(this.dir, BOT_JOURNAL_FILENAME), JSON.stringify(record) + '\n', 'utf-8');
+    } catch (err: any) {
+      // Journaling must never break a run — the queue/state carries the outcome.
+      console.error(`[bots] journal append failed for ${record.botId}: ${err?.message}`);
+    }
+  }
+
+  /** Most recent records, newest last. */
+  read(botId: string, limit = 20): BotRunRecord[] {
+    assertValidBotId(botId);
+    const file = join(this.dir, BOT_JOURNAL_FILENAME);
+    if (!existsSync(file)) return [];
+    return readTailRecords(file, limit);
+  }
+
+  counts(botId: string): { total: number; completed: number; failed: number; bytes: number } {
+    assertValidBotId(botId);
+    const file = join(this.dir, BOT_JOURNAL_FILENAME);
+    const files = [file, ...rotationFiles(this.dir, this.keepRotations)];
+    let total = 0, completed = 0, failed = 0, bytes = 0;
+    for (const f of files) {
+      if (!existsSync(f)) continue;
+      bytes += statSync(f).size;
+      for (const rec of readLines(f)) {
+        total++;
+        if (rec.state === 'completed') completed++;
+        if (rec.state === 'failed') failed++;
+      }
+    }
+    return { total, completed, failed, bytes };
+  }
+
+  /** Token and outcome totals for runs that started since `sinceMs` (all rotations). */
+  usage(botId: string, sinceMs = 0): BotUsage {
+    assertValidBotId(botId);
+    const out: BotUsage = { runs: 0, completed: 0, failed: 0, noOutcome: 0, deliverables: 0, tokensIn: 0, tokensOut: 0 };
+    const files = [join(this.dir, BOT_JOURNAL_FILENAME), ...rotationFiles(this.dir, this.keepRotations)];
+    for (const f of files) {
+      if (!existsSync(f)) continue;
+      for (const rec of readLines(f)) {
+        if ((rec.turnStartedAt ?? rec.startedAt) < sinceMs) continue;
+        out.runs++;
+        if (rec.state === 'completed') out.completed++;
+        if (rec.state === 'failed') out.failed++;
+        if (rec.outcome === 'none' && (rec.trigger === 'cron' || rec.trigger === 'api')) out.noOutcome++;
+        out.deliverables += rec.deliverables?.length ?? 0;
+        out.tokensIn += rec.tokensIn || 0;
+        out.tokensOut += rec.tokensOut || 0;
+      }
+    }
+    return out;
+  }
+
+  /** Transcript files, newest first (name = <when>-<runId>.json). */
+  listTranscripts(botId: string): Array<{ runId: string; file: string; mtimeMs: number }> {
+    assertValidBotId(botId);
+    const dir = join(this.dir, BOT_TRANSCRIPTS_DIRNAME);
+    try {
+      return readdirSync(dir)
+        .filter(n => n.endsWith('.json'))
+        .map(n => ({ runId: n.replace(/\.json$/, '').split('-').pop() ?? '', file: join(dir, n), mtimeMs: statSync(join(dir, n)).mtimeMs }))
+        .sort((a, b) => b.mtimeMs - a.mtimeMs);
+    } catch {
+      return [];
+    }
+  }
+
+  /** One run's transcript; the newest when no run id is given. */
+  readTranscript(botId: string, runId?: string): BotTranscript | null {
+    const entry = runId ? this.listTranscripts(botId).find(t => t.runId === runId) : this.listTranscripts(botId)[0];
+    if (!entry) return null;
+    try {
+      return JSON.parse(readFileSync(entry.file, 'utf-8')) as BotTranscript;
+    } catch {
+      return null;
+    }
+  }
+
+  private rotateIfNeeded(): void {
+    const file = join(this.dir, BOT_JOURNAL_FILENAME);
+    if (!existsSync(file) || statSync(file).size < this.rotateBytes) return;
+    // Drop the oldest rotation first, then shift: .N-1→.N, …, journal→.1
+    const oldest = join(this.dir, `${BOT_JOURNAL_FILENAME}.${this.keepRotations}`);
+    if (existsSync(oldest)) rmSync(oldest);
+    for (let i = this.keepRotations - 1; i >= 1; i--) {
+      const from = join(this.dir, `${BOT_JOURNAL_FILENAME}.${i}`);
+      const to = join(this.dir, `${BOT_JOURNAL_FILENAME}.${i + 1}`);
+      if (existsSync(from)) renameSync(from, to);
+    }
+    renameSync(file, join(this.dir, `${BOT_JOURNAL_FILENAME}.1`));
+  }
+}
+
+export interface BotUsage {
+  runs: number;
+  completed: number;
+  failed: number;
+  /** Unattended runs that produced no deliverable or action. */
+  noOutcome: number;
+  deliverables: number;
+  tokensIn: number;
+  tokensOut: number;
+}
+
+export interface BotTranscript {
+  record: BotRunRecord;
+  prompt: string;
+  output: string;
+  trace: Array<{ name: string; ok: boolean; arg?: string; task?: boolean }>;
+}
+
+/** Tail-read chunk: one journal line is ~300 bytes, so 64KB ≈ 200 records —
+ * far more than any viewer asks for, without scanning a 5MB rotated file. */
+const READ_CHUNK_BYTES = 64 * 1024;
+
+/**
+ * Read the newest `limit` records from ONE file without reading it whole:
+ * a 64KB tail usually suffices; double the window until enough records (or
+ * the whole file) are covered. Used by read() — counts() still scans fully.
+ */
+function readTailRecords(file: string, limit: number): BotRunRecord[] {
+  let size: number;
+  try {
+    size = statSync(file).size;
+  } catch {
+    return [];
+  }
+  if (size === 0) return [];
+  let start = Math.max(0, size - READ_CHUNK_BYTES);
+  while (true) {
+    const records: BotRunRecord[] = [];
+    const fd = openSync(file, 'r');
+    try {
+      const buf = Buffer.alloc(size - start);
+      readSync(fd, buf, 0, buf.length, start);
+      const text = buf.toString('utf-8');
+      // A mid-file window starts inside some line — drop that partial line.
+      const lines = (start === 0 ? text : text.slice(text.indexOf('\n') + 1)).split('\n');
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        try {
+          records.push(JSON.parse(trimmed) as BotRunRecord);
+        } catch { /* skip corrupt line — never break reads on one bad row */ }
+      }
+    } catch {
+      return [];
+    } finally {
+      closeSync(fd);
+    }
+    if (records.length >= limit || start === 0) return records.slice(-limit);
+    start = Math.max(0, size - (size - start) * 2); // double the window
+  }
+}
+
+function readLines(file: string): BotRunRecord[] {
+  const out: BotRunRecord[] = [];
+  try {
+    const content = statSync(file).size > 0 ? readFileSync(file, 'utf-8') : '';
+    for (const line of content.split('\n')) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      try {
+        out.push(JSON.parse(trimmed) as BotRunRecord);
+      } catch { /* skip corrupt line — never break reads on one bad row */ }
+    }
+  } catch { /* missing/unreadable file = empty journal */ }
+  return out;
+}
+
+function rotationFiles(dir: string, keep: number): string[] {
+  const out: string[] = [];
+  try {
+    for (const name of readdirSync(dir)) {
+      const match = /^journal\.jsonl\.(\d+)$/.exec(name);
+      if (match && parseInt(match[1], 10) <= keep) out.push(join(dir, name));
+    }
+  } catch { /* no dir yet */ }
+  return out;
+}

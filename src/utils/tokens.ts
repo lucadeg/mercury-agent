@@ -3,6 +3,7 @@ import { join } from 'node:path';
 import type { MercuryConfig } from './config.js';
 import { getMercuryHome, saveConfig } from './config.js';
 import { logger } from './logger.js';
+import { formatNumber } from './format.js';
 
 export interface TokenTracker {
   dailyUsed: number;
@@ -37,10 +38,18 @@ export class TokenBudget {
   private requestLog: TokenLogEntry[] = [];
   private forceNext = false;
   private perAgentUsage: Map<string, number> = new Map();
+  /** Estimated tokens saved today by saver mode (resets daily). */
+  private dailySaved = 0;
+  /** Cumulative lifetime estimated tokens saved (persisted). */
+  private lifetimeSaved = 0;
 
   constructor(private config: MercuryConfig) {
     this.dailyBudget = config.tokens.dailyBudget;
     this.lastResetDate = new Date().toISOString().split('T')[0];
+    const lifetime = (config.tokens as any).saverTokensSavedLifetime;
+    if (typeof lifetime === 'number' && Number.isFinite(lifetime) && lifetime > 0) {
+      this.lifetimeSaved = lifetime;
+    }
     this.restore();
   }
 
@@ -104,6 +113,34 @@ export class TokenBudget {
     }
 
     this.persist();
+    this.syncToCloud(logEntry).catch((err) => {
+      logger.warn({ err }, 'Failed to sync token usage to Mercury Cloud');
+    });
+  }
+
+  private async syncToCloud(entry: TokenLogEntry): Promise<void> {
+    if (!this.config.cloud.enabled || !this.config.cloud.jwt || !this.config.cloud.agentId || !this.config.cloud.apiUrl) return;
+    if (entry.provider === 'mercuryCloud' || entry.provider === 'Mercury Cloud') return;
+    if (entry.totalTokens <= 0) return;
+
+    const res = await fetch(`${this.config.cloud.apiUrl}/v1/agents/${this.config.cloud.agentId}/usage/sync`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${this.config.cloud.jwt}`,
+      },
+      body: JSON.stringify({
+        model: `${entry.provider}:${entry.model}`,
+        tokensIn: entry.inputTokens,
+        tokensOut: entry.outputTokens,
+        costCredits: 0,
+        timestamp: new Date(entry.timestamp).toISOString(),
+      }),
+    });
+
+    if (!res.ok) {
+      throw new Error(`usage sync failed: ${res.status}`);
+    }
   }
 
   getUsageByAgent(agentId: string): { used: number; percentage: number } {
@@ -129,7 +166,35 @@ export class TokenBudget {
     const used = this.sanitizeCount(this.dailyUsed);
     const pct = Math.round(this.getUsagePercentage());
     const remaining = this.getRemaining();
-    return `Token budget: ${used.toLocaleString()} / ${this.dailyBudget.toLocaleString()} used (${pct}%), ${remaining.toLocaleString()} remaining`;
+    return `Token budget: ${formatNumber(used)} / ${formatNumber(this.dailyBudget)} used (${pct}%), ${formatNumber(remaining)} remaining`;
+  }
+
+  /**
+   * Record an estimated savings from Token Saver Mode. Updates both the
+   * per-day counter (resets at day rollover) and the lifetime counter
+   * (persisted to mercury.yaml). Negative or zero values are ignored.
+   */
+  recordSavings(estimatedTokens: number): void {
+    const n = safeNumber(estimatedTokens);
+    if (n <= 0) return;
+    this.resetIfNewDay();
+    this.dailySaved += n;
+    this.lifetimeSaved += n;
+    try {
+      (this.config.tokens as any).saverTokensSavedLifetime = this.lifetimeSaved;
+      saveConfig(this.config);
+    } catch (err) {
+      logger.warn({ err }, 'Failed to persist saver lifetime counter');
+    }
+  }
+
+  getSavedToday(): number {
+    this.resetIfNewDay();
+    return this.dailySaved;
+  }
+
+  getSavedLifetime(): number {
+    return this.lifetimeSaved;
   }
 
   private resetIfNewDay(): void {
@@ -139,6 +204,7 @@ export class TokenBudget {
       this.lastResetDate = today;
       this.requestLog = [];
       this.perAgentUsage.clear();
+      this.dailySaved = 0;
       this.persist();
       logger.info('Token budget reset for new day');
     }

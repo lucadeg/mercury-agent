@@ -10,6 +10,14 @@ import type { TokenBudget } from '../utils/tokens.js';
 import type { CapabilityRegistry } from '../capabilities/registry.js';
 import type { FileLockManager } from './file-lock.js';
 import type { TaskBoard } from './task-board.js';
+import type { SaverMode } from './saver-mode.js';
+import type { SubAgentSupervisor } from './supervisor.js';
+import { createDelegateTaskTool, createListAgentsTool, createStopAgentTool } from '../capabilities/subagents/index.js';
+import { getHeapStatistics } from 'node:v8';
+import { memoryGovernorThresholds, memoryGovernorVerdict, CONVERSATION_TOOL_BUDGET_CHARS, TOOL_RESULT_KEEP_RECENT, summarizeToolResult } from './memory-governor.js';
+import { classifyStreamCompletion } from './stream-completion.js';
+import { resolveChildTools, childMayUse, filterToolsByAllowlist } from '../utils/tool-filter.js';
+import { deriveChildContext, type PermissionContext } from '../capabilities/permission-context.js';
 import { logger } from '../utils/logger.js';
 
 export type ProgressCallback = (agentId: string, progress: string) => void;
@@ -39,6 +47,8 @@ export class SubAgent {
   private tokenBudget: TokenBudget;
   private fileLockManager: FileLockManager;
   private taskBoard: TaskBoard;
+  private saverMode?: SaverMode;
+  private supervisor?: SubAgentSupervisor;
 
   private onProgress?: ProgressCallback;
   private onComplete?: CompletionCallback;
@@ -60,6 +70,9 @@ export class SubAgent {
       tokenBudget: TokenBudget;
       fileLockManager: FileLockManager;
       taskBoard: TaskBoard;
+      saverMode?: SaverMode;
+      /** Needed only to hand out lineage-scoped orchestration tools. */
+      supervisor?: SubAgentSupervisor;
     },
   ) {
     this.config = config;
@@ -76,6 +89,8 @@ export class SubAgent {
     this.tokenBudget = dependencies.tokenBudget;
     this.fileLockManager = dependencies.fileLockManager;
     this.taskBoard = dependencies.taskBoard;
+    this.saverMode = dependencies.saverMode;
+    this.supervisor = dependencies.supervisor;
   }
 
   getStatus(): SubAgentStatus {
@@ -107,7 +122,46 @@ export class SubAgent {
     this.onPostComment = cb;
   }
 
+  private permissionContext?: PermissionContext;
+
+  /**
+   * This agent's frozen permission context: the one the supervisor derived
+   * at spawn time, or (when constructed directly) one derived now from the
+   * current context. Child ⊆ parent; see permission-context.ts.
+   */
+  getPermissionContext(): PermissionContext | undefined {
+    if (this.permissionContext) return this.permissionContext;
+    if (this.config.permissionContext) {
+      this.permissionContext = this.config.permissionContext;
+    } else {
+      const permissions = this.capabilities.permissions as any;
+      if (typeof permissions?.currentContext !== 'function') return undefined;
+      this.permissionContext = deriveChildContext(permissions.currentContext(), {
+        channelType: this.config.sourceChannelType || 'internal',
+        channelId: this.config.sourceChannelId || 'internal',
+        allowedTools: this.config.allowedTools,
+      });
+    }
+    return this.permissionContext;
+  }
+
+  /**
+   * Run the task under this agent's own permission context. Every tool it
+   * invokes — through any depth of the AI SDK's promise chain — resolves
+   * permissions against that context via AsyncLocalStorage, so a concurrent
+   * change to the main agent's context (an internal turn's allow-all) never
+   * reaches it (#75/#99 residual).
+   */
   async run(): Promise<SubAgentResult> {
+    const ctx = this.getPermissionContext();
+    const permissions = this.capabilities.permissions as any;
+    if (ctx && typeof permissions?.withContext === 'function') {
+      return permissions.withContext(ctx, () => this.runInContext());
+    }
+    return this.runInContext();
+  }
+
+  private async runInContext(): Promise<SubAgentResult> {
     this.status = 'running';
     this.startTime = Date.now();
 
@@ -123,6 +177,32 @@ export class SubAgent {
       const systemPrompt = this.buildSystemPrompt();
       const messages: any[] = [];
 
+      // Conversation budget: compacts old tool results once retained tool
+      // output exceeds the budget. A sub-agent analyzing a whole project
+      // must not hold every file read verbatim for the entire run.
+      const enforceConversationBudget = () => {
+        const toolIdx: number[] = [];
+        let total = 0;
+        for (let i = 0; i < messages.length; i++) {
+          const m = messages[i];
+          if (m.role !== 'tool' || typeof m.content !== 'string') continue;
+          toolIdx.push(i);
+          total += m.content.length;
+        }
+        if (total <= CONVERSATION_TOOL_BUDGET_CHARS) return;
+        const cutoff = toolIdx.slice(0, Math.max(0, toolIdx.length - TOOL_RESULT_KEEP_RECENT));
+        for (const idx of cutoff) {
+          messages[idx] = { ...messages[idx], content: summarizeToolResult(messages[idx].content) };
+        }
+        logger.info({ agentId: this.config.id, compacted: cutoff.length }, 'Sub-agent conversation budget enforced');
+      };
+
+      const governorThresholds = memoryGovernorThresholds({
+        heapSizeLimit: getHeapStatistics().heap_size_limit,
+        baselineHeapUsed: process.memoryUsage().heapUsed,
+        reservedHeapBytes: 384 * 1024 * 1024,
+      });
+
       messages.push({
         role: 'user',
         content: this.config.task,
@@ -135,17 +215,13 @@ export class SubAgent {
         this.capabilities.setCwd(this.config.workingDirectory);
       }
 
-      this.capabilities.permissions.setAutoApproveAll(true);
-      this.capabilities.permissions.addTempScope('/', true, true);
-
-      this.capabilities.setChannelContext(
-        this.config.sourceChannelId || 'internal',
-        this.config.sourceChannelType || 'internal',
-      );
+      // Channel routing comes from this agent's permission context (set in
+      // run()); the shared registry's main-agent channel is left alone.
 
       try {
         const provider = this.providers.getDefault();
-        const maxSteps = this.config.maxSteps || 25;
+        const baseMaxSteps = this.config.maxSteps || 25;
+        const maxSteps = this.saverMode?.isActive() ? this.saverMode.adjustMaxSteps(baseMaxSteps) : baseMaxSteps;
         let stepsRemaining = maxSteps;
 
         logger.info({ agentId: this.config.id, provider: provider.name, maxSteps }, 'Sub-agent generating response');
@@ -160,16 +236,43 @@ export class SubAgent {
         // Execution loop: run generateText, then check for new comments.
         // If new comments found, inject them as user messages and continue.
         while (stepsRemaining > 0 && !this.abortController.signal.aborted) {
+          // Step-level memory checkpoint before each provider round-trip.
+          const verdict = memoryGovernorVerdict(process.memoryUsage().heapUsed, governorThresholds);
+          if (verdict === 'exit') {
+            logger.error({ agentId: this.config.id }, 'Sub-agent: heap beyond exit threshold — exiting to preserve process');
+            process.exit(0);
+          }
+          if (verdict === 'abort') {
+            this.abortController.abort(new Error('Sub-agent stopped: task memory safety limit reached'));
+            break;
+          }
+          enforceConversationBudget();
           const result = await generateText({
             model: provider.getModelInstance(),
             system: systemPrompt,
             messages,
-            tools: this.capabilities.getTools(),
+            tools: this.resolveTools(),
             stopWhen: stepCountIs(stepsRemaining),
             abortSignal: this.abortController.signal,
+            // Stop the SDK retaining raw HTTP bodies in every step's result
+            // (same O(N²) heap growth as the main agent loop).
+            experimental_include: { requestBody: false, responseBody: false },
             onStepFinish: async ({ toolCalls, toolResults, usage }) => {
               if (this.abortController.signal.aborted) return;
               stepsRemaining--;
+
+              // Mid-loop memory checkpoint: abort generation if the heap
+              // crosses the emergency ceiling (the sub-agent runs on the
+              // shared process, so its blowup kills the whole app).
+              const midVerdict = memoryGovernorVerdict(process.memoryUsage().heapUsed, governorThresholds);
+              if (midVerdict === 'exit') {
+                logger.error({ agentId: this.config.id }, 'Sub-agent: heap beyond exit threshold mid-step — exiting');
+                process.exit(0);
+              }
+              if (midVerdict === 'abort') {
+                this.abortController.abort(new Error('Sub-agent stopped: task memory safety limit reached'));
+                return;
+              }
 
               // Accumulate live token usage
               if (usage) {
@@ -215,6 +318,20 @@ export class SubAgent {
           });
 
           lastResult = result;
+
+          // Stream integrity: generateText can resolve with finishReason
+          // 'other' when the provider dropped the connection mid-generation
+          // (no terminal chunk). Treat as a failure so the sub-agent reports
+          // honestly instead of completing with truncated/empty output.
+          const completion = classifyStreamCompletion({
+            finishReason: (result as any)?.finishReason,
+            hasText: Boolean(result?.text),
+            hasToolCalls: true,
+          });
+          if (completion === 'interrupted') {
+            logger.warn({ agentId: this.config.id, finishReason: (result as any)?.finishReason }, 'Sub-agent generation ended without a provider finish signal');
+            throw new Error('Generation was interrupted before completion (no finish signal from provider)');
+          }
 
           // Append the assistant response to the conversation history
           if (result.text) {
@@ -287,6 +404,35 @@ export class SubAgent {
           return this.result;
         }
 
+        // Completion contract: the loop exited because the step budget ran
+        // out while the last round still had tool calls pending. That is a
+        // pause, never a completion — the supervisor resumes with a fresh
+        // budget; reporting 'completed' here shipped half-done work behind a
+        // success status.
+        if (stepsRemaining <= 0 && (result as any)?.finishReason === 'tool-calls') {
+          this.status = 'paused';
+          const duration = Date.now() - this.startTime;
+          this.result = {
+            agentId: this.config.id,
+            task: this.config.task,
+            status: 'paused',
+            output: 'Step budget reached before the task completed — work so far is preserved; resuming with a fresh budget.',
+            filesModified: this.filesModified,
+            duration,
+            tokenUsage: {
+              input: this.totalInputTokens,
+              output: this.totalOutputTokens,
+            },
+          };
+          this.taskBoard.update(this.config.id, {
+            status: 'paused',
+            completedAt: Date.now(),
+            progress: 'Step budget reached — resuming',
+          });
+          logger.info({ agentId: this.config.id, duration }, 'Sub-agent paused at step budget (completion contract)');
+          return this.result;
+        }
+
         const finalText = (result?.text || '').trim() || '(no text response)';
 
         this.tokenBudget.recordUsage({
@@ -333,7 +479,6 @@ export class SubAgent {
         if (this.config.workingDirectory) {
           this.capabilities.setCwd(originalCwd);
         }
-        this.capabilities.permissions.setAutoApproveAll(false);
         this.capabilities.permissions.clearElevation();
         this.fileLockManager.releaseAll(this.config.id);
       }
@@ -386,12 +531,48 @@ export class SubAgent {
     }
   }
 
+  /**
+   * Tools handed to the model. `allowedTools` is a real runtime restriction:
+   * when set, the child never sees tools outside the list. The orchestration
+   * tools (delegate_task, list_agents, stop_agent) are stripped unless the
+   * parent granted them by name, and a granted one is re-bound to THIS
+   * agent's id so the supervisor confines it to this agent's descendants —
+   * the shared registry instance carries the main agent's authority (#74).
+   */
+  private resolveTools() {
+    let tools = resolveChildTools(this.capabilities.getTools(), this.config.allowedTools);
+    // The context's allowlist is the parent's ∩ this agent's: a grandchild
+    // can never be granted a tool its parent did not have.
+    const ctxTools = this.getPermissionContext()?.allowedTools;
+    if (ctxTools) tools = filterToolsByAllowlist(tools, ctxTools);
+    const ctxAllows = (name: string) => !ctxTools || ctxTools.includes(name);
+    if (this.supervisor) {
+      const scoped = { callerId: this.config.id };
+      if (childMayUse('delegate_task', this.config.allowedTools) && ctxAllows('delegate_task')) {
+        tools.delegate_task = createDelegateTaskTool(this.supervisor, this.capabilities, scoped);
+      }
+      if (childMayUse('list_agents', this.config.allowedTools) && ctxAllows('list_agents')) {
+        tools.list_agents = createListAgentsTool(this.supervisor, scoped);
+      }
+      if (childMayUse('stop_agent', this.config.allowedTools) && ctxAllows('stop_agent')) {
+        tools.stop_agent = createStopAgentTool(this.supervisor, scoped);
+      }
+    }
+    return tools;
+  }
+
+  /** Names of the tools this agent actually receives. */
+  getToolNames(): string[] {
+    return Object.keys(this.resolveTools());
+  }
+
   private buildSystemPrompt(): string {
     let prompt = this.identity.getSystemPrompt(this.agentConfig.identity);
 
     prompt += `\n\nYou are a sub-agent (ID: ${this.config.id}) working independently on a specific task.`;
     prompt += `\nTask: ${this.config.task}`;
-    prompt += `\nYou have full permissions for this task. Focus only on completing this task efficiently.`;
+    prompt += `\n${this.describePermissions()}`;
+    prompt += `\nFocus only on completing this task efficiently.`;
     if (this.config.workingDirectory) {
       prompt += `\nWorking directory: ${this.config.workingDirectory}`;
     }
@@ -405,15 +586,45 @@ export class SubAgent {
     if (this.tokenBudget.getUsagePercentage() > 70) {
       prompt += '\nBe concise to conserve tokens.';
     }
+    const saverSuffix = this.saverMode?.getSystemPromptSuffix() ?? '';
+    if (saverSuffix) {
+      prompt += saverSuffix;
+    }
 
     prompt += `\n\nEnvironment:\n- Platform: ${process.platform}\n- Working directory: ${this.capabilities.getCwd()}`;
 
-    const toolNames = this.capabilities.getToolNames();
-    const toolsList = this.config.allowedTools
-      ? toolNames.filter(t => this.config.allowedTools!.includes(t))
-      : toolNames;
-    prompt += `\n\nAvailable tools: ${toolsList.join(', ')}`;
+    prompt += `\n\nAvailable tools: ${this.getToolNames().join(', ')}`;
 
     return prompt;
+  }
+
+  /**
+   * An accurate statement of what this agent may do: it runs under the same
+   * permission state as the agent that delegated it — the same approved
+   * scopes, the same shell approval prompt — never with elevated rights.
+   */
+  private describePermissions(): string {
+    const permissions = this.capabilities.permissions;
+    const readable: string[] = [];
+    const writable: string[] = [];
+    for (const scope of [...permissions.getManifest().capabilities.filesystem.scopes, ...(this.getPermissionContext()?.scopes ?? [])]) {
+      if (scope.write) writable.push(scope.path);
+      else if (scope.read) readable.push(scope.path);
+    }
+    const parts: string[] = [];
+    parts.push('You run with the same permissions as the agent that delegated you, not more.');
+    const ctx = this.getPermissionContext();
+    if (ctx ? ctx.autoApprove : permissions.isAutoApproveAll()) {
+      parts.push('This session is in Allow All mode, so approved-scope actions run without prompts.');
+    } else {
+      parts.push('File writes and non-read-only shell commands go to the user for approval (reads inside approved scopes do not); a denial is final — do not retry it or work around it.');
+    }
+    if (writable.length > 0) parts.push(`Writable scopes: ${writable.join(', ')}.`);
+    if (readable.length > 0) parts.push(`Read-only scopes: ${readable.join(', ')}.`);
+    parts.push('Use approve_scope to request a path outside these scopes.');
+    if (this.config.allowedTools?.some(t => ['delegate_task', 'list_agents', 'stop_agent'].includes(t))) {
+      parts.push('Your delegate_task/list_agents/stop_agent only reach agents you delegated yourself.');
+    }
+    return parts.join(' ');
   }
 }

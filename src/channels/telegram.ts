@@ -3,7 +3,7 @@ import path from 'node:path';
 import { Bot, InputFile, InlineKeyboard } from 'grammy';
 import { autoRetry } from '@grammyjs/auto-retry';
 import type { ChannelMessage } from '../types/channel.js';
-import { BaseChannel, type PermissionMode } from './base.js';
+import { BaseChannel, type PermissionMode, type ChannelAction } from './base.js';
 import type { MercuryConfig, TelegramAccessUser, TelegramPendingRequest } from '../utils/config.js';
 import {
   addTelegramPendingRequest,
@@ -22,12 +22,23 @@ import {
 import { logger } from '../utils/logger.js';
 import { mdToTelegram } from '../utils/markdown.js';
 import { formatToolStep, formatToolResult } from '../utils/tool-label.js';
+import { RegistryClient, isValidSkillId, searchFeed, type RegistrySkillSummary } from '../skills/registry.js';
+import { SkillStore } from '../skills/store.js';
+import { SkillLoader } from '../skills/loader.js';
 
 const MAX_MESSAGE_LENGTH = 4096;
 const ACCESS_ACTION_PREFIX = 'tg_access';
 const MEMORY_ACTION_PREFIX = 'tg_memory';
 
 type ApprovalResolver = () => void;
+type ChoiceResolver = (value: string) => void;
+
+interface ActionTapContext {
+  callbackQuery: { data: string; message?: { chat?: { id?: number } } };
+  chat?: { id?: number };
+  from?: { id?: number; first_name?: string };
+  answerCallbackQuery: (args: { text: string }) => Promise<unknown>;
+}
 
 export class TelegramChannel extends BaseChannel {
   readonly type = 'telegram' as const;
@@ -36,9 +47,15 @@ export class TelegramChannel extends BaseChannel {
   private typingInterval: NodeJS.Timeout | null = null;
   private chatCommandContext?: import('../capabilities/registry.js').ChatCommandContext;
   private pendingApprovals: Map<string, ApprovalResolver> = new Map();
+  private pendingChoices: Map<string, ChoiceResolver> = new Map();
+  private processedMessages = new Map<string, number>();
+  private static readonly DEDUP_TTL = 5 * 60_000;
+  private static readonly DEDUP_MAX_SIZE = 10_000;
+  private dedupCleanupInterval: NodeJS.Timeout | null = null;
   private permissionModes = new Map<number, PermissionMode>();
   private onPermissionMode?: (mode: PermissionMode, chatId: number) => void;
   private statusMessageIds = new Map<string, number>();
+  private statusUpdateQueues = new Map<string, Promise<void>>();
   private stepCounters = new Map<string, number>();
   private stepHistory = new Map<string, string[]>();
   private statusText = new Map<string, string>();
@@ -56,6 +73,12 @@ export class TelegramChannel extends BaseChannel {
   private statusNotices = new Map<string, string[]>();
   /** Maximum number of notice lines to show in the status card */
   private static readonly MAX_STATUS_NOTICES = 3;
+  /** Maximum number of notice lines retained per task (heartbeats arrive every 20-60s) */
+  private static readonly MAX_STORED_STATUS_NOTICES = 8;
+  /** How long an inline-keyboard prompt waits before answering for the user */
+  private static readonly PROMPT_TIMEOUT_MS = 120_000;
+  /** Sent prompt cards (permission / choice / continue), keyed by prompt id, so the outcome can be written back in place */
+  private promptCards = new Map<string, { chatId: number; messageId: number; html: string }>();
 
   constructor(private config: MercuryConfig) {
     super();
@@ -85,12 +108,18 @@ export class TelegramChannel extends BaseChannel {
     return this.taskActive.get(key) ?? false;
   }
 
-  /** Get and clear deferred response text (to send after task cleanup) */
+  /** Peek at deferred response text. A successful final send clears it. */
   popDeferredResponse(targetId?: string): string | undefined {
     const key = targetId || 'notification';
-    const text = this.deferredResponses.get(key);
-    this.deferredResponses.delete(key);
-    return text;
+    return this.deferredResponses.get(key);
+  }
+
+  /** Explicitly queue the final AI response to send after progress cleanup. */
+  deferResponse(targetId: string | undefined, content: string): void {
+    const key = targetId || 'notification';
+    if (content.trim()) {
+      this.deferredResponses.set(key, content);
+    }
   }
 
   setOnPermissionMode(handler: (mode: PermissionMode, chatId: number) => void): void {
@@ -122,6 +151,16 @@ export class TelegramChannel extends BaseChannel {
       const command = this.getCommandName(text);
 
       if (!userId) return;
+
+      const dedupKey = `${chatId}:${ctx.message.message_id}`;
+      if (this.processedMessages.has(dedupKey)) {
+        logger.debug({ chatId, messageId: ctx.message.message_id }, 'Telegram: dedup skipping message');
+        return;
+      }
+      this.processedMessages.set(dedupKey, Date.now());
+      if (this.processedMessages.size > TelegramChannel.DEDUP_MAX_SIZE) {
+        this.cleanupDedup();
+      }
 
       if (ctx.chat.type !== 'private') {
         await this.sendDirectMessage(chatId, 'This bot is only available in private one-to-one chats.');
@@ -162,7 +201,7 @@ export class TelegramChannel extends BaseChannel {
           if (this.onPermissionMode) {
             this.onPermissionMode(mode, chatId);
           }
-        }).catch(() => {});
+        }).catch((e: any) => logger.warn({ e }, 'telegram permission ask failed'));
         this.permissionModes.set(chatId, 'ask-me');
       }
 
@@ -180,13 +219,18 @@ export class TelegramChannel extends BaseChannel {
         return;
       }
 
+      if (command === '/skills') {
+        await this.handleSkillsCommand(chatId, userId, text);
+        return;
+      }
+
       if (command === '/permissions') {
         this.askPermissionMode(`telegram:${chatId}`).then((mode) => {
           this.permissionModes.set(chatId, mode);
           if (this.onPermissionMode) {
             this.onPermissionMode(mode, chatId);
           }
-        }).catch(() => {});
+        }).catch((e: any) => logger.warn({ e }, 'telegram permission ask failed'));
         return;
       }
 
@@ -196,6 +240,7 @@ export class TelegramChannel extends BaseChannel {
         channelType: 'telegram',
         senderId: ctx.from?.id.toString() ?? 'unknown',
         senderName: ctx.from?.first_name,
+        senderRole: this.isAdminUser(userId) ? 'admin' : 'member',
         content: ctx.message.text,
         timestamp: ctx.message.date * 1000,
         metadata: { chatId, messageId: ctx.message.message_id },
@@ -203,35 +248,15 @@ export class TelegramChannel extends BaseChannel {
       this.emit(msg);
     });
 
-    bot.on('callback_query:data', async (ctx) => {
-      const data = ctx.callbackQuery.data;
-      if (data.startsWith(`${ACCESS_ACTION_PREFIX}:`)) {
-        await this.handleAccessCallback(ctx, data);
-        return;
-      }
-
-      if (data.startsWith(`${MEMORY_ACTION_PREFIX}:`)) {
-        await this.handleMemoryCallback(ctx, data);
-        return;
-      }
-
-      const resolver = this.pendingApprovals.get(data);
-      if (!resolver) {
-        await ctx.answerCallbackQuery({ text: 'Expired' });
-        return;
-      }
-
-      this.pendingApprovals.delete(data);
-      resolver();
-      const action = data.split(':')[1];
-      await ctx.answerCallbackQuery({ text: action === 'no' ? 'Denied' : 'Approved' });
-    });
+    bot.on('callback_query:data', (ctx) => this.handleCallbackQuery(ctx));
 
     bot.catch((err) => {
       logger.error({ err: err.message }, 'Telegram bot error');
     });
 
     this.bot = bot;
+
+    this.dedupCleanupInterval = setInterval(() => this.cleanupDedup(), 30_000);
 
     // Start long-polling in the background.
     // bot.start() blocks until the first getUpdates succeeds, which can take
@@ -246,8 +271,14 @@ export class TelegramChannel extends BaseChannel {
     }).catch((err: any) => {
       const message = err?.description || err?.message || String(err);
       logger.error({ err: message }, 'Telegram bot polling stopped');
-      // Don't null out this.bot here — stop() will handle cleanup.
-      // The guard (if this.bot) prevents a second instance from being created.
+      if (this.bot === bot) {
+        this.bot = null;
+        this.ready = false;
+        if (this.dedupCleanupInterval) {
+          clearInterval(this.dedupCleanupInterval);
+          this.dedupCleanupInterval = null;
+        }
+      }
     });
   }
 
@@ -261,15 +292,21 @@ export class TelegramChannel extends BaseChannel {
       { command: 'progress', description: 'Live status for the current task' },
       { command: 'stop', description: 'Stop all agents and clear queue' },
       { command: 'budget', description: 'Token budget status and management' },
+      { command: 'saver', description: 'Toggle Token Saver Mode (save tokens, terser responses)' },
       { command: 'stream', description: 'Toggle text streaming on/off' },
       { command: 'memory', description: 'View and manage second brain memory' },
       { command: 'permissions', description: 'Change permission mode (Ask Me / Allow All)' },
       { command: 'models', description: 'List providers or switch AI model' },
       { command: 'code', description: 'Programming mode (plan / execute / off)' },
       { command: 'agents', description: 'List and manage sub-agents' },
+      { command: 'bots', description: 'Your bots: roster with controls, cost, outputs, stop/start' },
+      { command: 'bot', description: 'Message a bot: /bot <id> <task>' },
       { command: 'bg', description: 'Background tasks (list / cancel / run)' },
       { command: 'spotify', description: 'Spotify playback controls' },
+      { command: 'skills', description: 'Browse and install skills from the registry' },
+      { command: 'plugins', description: 'Install, enable, disable and remove plugins' },
       { command: 'unpair', description: 'Reset all Telegram access (admin only)' },
+      { command: 'new', description: 'Start a fresh conversation (memory is kept)' },
     ];
 
     try {
@@ -282,15 +319,19 @@ export class TelegramChannel extends BaseChannel {
 
   async stop(): Promise<void> {
     this.bot?.stop();
+    this.bot = null;
     this.ready = false;
     this.stopTypingLoop();
+    if (this.dedupCleanupInterval) {
+      clearInterval(this.dedupCleanupInterval);
+      this.dedupCleanupInterval = null;
+    }
   }
 
   async send(content: string, targetId?: string, elapsedMs?: number): Promise<void> {
     const chatIds = this.resolveTargetChatIds(targetId);
     if (chatIds.length === 0 || !this.bot) {
-      logger.warn({ targetId, chatIds }, 'Telegram send: no valid chat IDs');
-      return;
+      throw new Error(`Telegram send failed: no valid chat for ${targetId || 'notification'}`);
     }
 
     const key = targetId || 'notification';
@@ -338,9 +379,13 @@ export class TelegramChannel extends BaseChannel {
             await this.bot.api.sendMessage(chatId, this.stripHtml(chunk));
           } catch (err2: any) {
             logger.error({ err: err2.message, chatId }, 'Telegram send failed');
+            throw err2;
           }
         }
       }
+    }
+    if (this.deferredResponses.get(key) === content) {
+      this.deferredResponses.delete(key);
     }
   }
 
@@ -354,7 +399,7 @@ export class TelegramChannel extends BaseChannel {
     const resolved = path.resolve(filePath);
     if (!fs.existsSync(resolved)) {
       for (const chatId of chatIds) {
-        await this.bot.api.sendMessage(chatId, `File not found: ${filePath}`).catch(() => {});
+        await this.bot.api.sendMessage(chatId, `File not found: ${filePath}`).catch((e: any) => logger.warn({ e }, "telegram send failed"));
       }
       return;
     }
@@ -378,7 +423,7 @@ export class TelegramChannel extends BaseChannel {
         logger.info({ file: resolved, chatId }, 'File sent via Telegram');
       } catch (err: any) {
         logger.error({ err: err.message, file: resolved, chatId }, 'Telegram sendFile failed');
-        await this.bot.api.sendMessage(chatId, `Failed to send file: ${err.message}`).catch(() => {});
+        await this.bot.api.sendMessage(chatId, `Failed to send file: ${err.message}`).catch((e: any) => logger.warn({ e }, "telegram send failed"));
       }
     }
   }
@@ -406,7 +451,7 @@ export class TelegramChannel extends BaseChannel {
       try {
         await this.bot.api.sendMessage(chatId, html, { parse_mode: 'HTML' });
       } catch (err: any) {
-        await this.bot.api.sendMessage(chatId, this.stripHtml(html)).catch(() => {});
+        await this.bot.api.sendMessage(chatId, this.stripHtml(html)).catch((e: any) => logger.warn({ e }, "telegram html send failed"));
       }
     }
     return full;
@@ -466,9 +511,9 @@ export class TelegramChannel extends BaseChannel {
 
   startTypingLoop(chatId: number): void {
     this.stopTypingLoop();
-    this.bot?.api.sendChatAction(chatId, 'typing').catch(() => {});
+    this.bot?.api.sendChatAction(chatId, 'typing').catch((e: any) => logger.warn({ e }, "telegram sendChatAction failed"));
     this.typingInterval = setInterval(() => {
-      this.bot?.api.sendChatAction(chatId, 'typing').catch(() => {});
+      this.bot?.api.sendChatAction(chatId, 'typing').catch((e: any) => logger.warn({ e }, "telegram sendChatAction failed"));
     }, 4000);
   }
 
@@ -486,12 +531,17 @@ export class TelegramChannel extends BaseChannel {
     // Check all task-active keys since we have chatId not targetId
     const activeKey = this.findActiveTaskKey(chatId);
     if (activeKey) {
-      let full = '';
-      for await (const chunk of textStream) {
-        full += chunk;
+      this.startTypingLoop(chatId);
+      try {
+        let full = '';
+        for await (const chunk of textStream) {
+          full += chunk;
+        }
+        this.deferredResponses.set(activeKey, full);
+        return full;
+      } finally {
+        this.stopTypingLoop();
       }
-      this.deferredResponses.set(activeKey, full);
-      return full;
     }
 
     const STREAM_EDIT_INTERVAL = 1500;
@@ -565,6 +615,165 @@ export class TelegramChannel extends BaseChannel {
     }
   }
 
+  /**
+   * Tappable actions (bots control, ADR-023): a message with inline buttons
+   * whose taps run slash commands exactly as if the user had typed them —
+   * same routing, same permissions, same replies. Commands are kept behind
+   * short tokens (callback data is capped at 64 bytes) in a bounded map.
+   */
+  private readonly actionTokens = new Map<string, string>();
+  private static readonly ACTION_TOKENS_MAX = 300;
+
+  async sendWithActions(content: string, rows: ChannelAction[][], targetId?: string): Promise<void> {
+    const chatIds = this.resolveTargetChatIds(targetId);
+    const chatId = chatIds[0];
+    if (!chatId || !this.bot) {
+      await this.send(content, targetId);
+      return;
+    }
+    const keyboard = new InlineKeyboard();
+    rows.forEach((row, i) => {
+      for (const button of row) {
+        const token = Math.random().toString(36).slice(2, 10);
+        this.actionTokens.set(token, button.command);
+        keyboard.text(button.label.slice(0, 40), `ba:${token}`);
+      }
+      if (i < rows.length - 1) keyboard.row();
+    });
+    while (this.actionTokens.size > TelegramChannel.ACTION_TOKENS_MAX) {
+      const oldest = this.actionTokens.keys().next().value;
+      if (oldest === undefined) break;
+      this.actionTokens.delete(oldest);
+    }
+    const html = mdToTelegram(content);
+    try {
+      await this.bot.api.sendMessage(chatId, html, { parse_mode: 'HTML', reply_markup: keyboard });
+    } catch {
+      await this.bot.api.sendMessage(chatId, this.stripHtml(html), { reply_markup: keyboard }).catch((e: unknown) => logger.warn({ e }, 'telegram actions send failed'));
+    }
+  }
+
+  /** Inline-keyboard taps (approvals, choices, access/memory admin actions). */
+  private async handleCallbackQuery(ctx: any): Promise<void> {
+    const data: string = ctx.callbackQuery.data;
+    if (data.startsWith('ba:')) {
+      await this.handleActionTap(ctx, data.slice(3));
+      return;
+    }
+    if (data.startsWith(`${ACCESS_ACTION_PREFIX}:`)) {
+      await this.handleAccessCallback(ctx, data);
+      return;
+    }
+
+    if (data.startsWith(`${MEMORY_ACTION_PREFIX}:`)) {
+      await this.handleMemoryCallback(ctx, data);
+      return;
+    }
+
+    if (data.startsWith('choice:')) {
+      const [, id, value] = data.split(':');
+      const resolver = id ? this.pendingChoices.get(id) : undefined;
+      if (!resolver) {
+        await ctx.answerCallbackQuery({ text: 'Expired' });
+        return;
+      }
+
+      this.pendingChoices.delete(id);
+      // The resolver settles the card: outcome appended, keyboard removed.
+      resolver(value ?? '');
+      await ctx.answerCallbackQuery({ text: 'Selected' });
+      return;
+    }
+
+    const resolver = this.pendingApprovals.get(data);
+    if (!resolver) {
+      await ctx.answerCallbackQuery({ text: 'Expired' });
+      return;
+    }
+
+    this.pendingApprovals.delete(data);
+    // The resolver settles the card: outcome appended, keyboard removed (#23).
+    resolver();
+    const action = data.slice(data.lastIndexOf(':') + 1);
+    await ctx.answerCallbackQuery({ text: action === 'no' ? 'Denied' : 'Approved' });
+  }
+
+  /** A tapped action runs its slash command as a message from the tapping user. */
+  // (the grammy context fields the handler reads; the rest is irrelevant here)
+  private async handleActionTap(ctx: ActionTapContext, token: string): Promise<void> {
+    const command = this.actionTokens.get(token);
+    const userId: number | undefined = ctx.from?.id;
+    const chatId: number | undefined = ctx.callbackQuery?.message?.chat?.id ?? ctx.chat?.id;
+    if (!command || !chatId) {
+      await ctx.answerCallbackQuery({ text: 'Expired — send /bots again' }).catch(() => {});
+      return;
+    }
+    if (!userId || !findTelegramApprovedUser(this.config, userId)) {
+      await ctx.answerCallbackQuery({ text: 'Not allowed' }).catch(() => {});
+      return;
+    }
+    await ctx.answerCallbackQuery({ text: command.slice(0, 60) }).catch(() => {});
+    this.emit({
+      id: `tap-${Date.now().toString(36)}-${token}`,
+      channelId: `telegram:${chatId}`,
+      channelType: 'telegram',
+      senderId: String(userId),
+      senderName: ctx.from?.first_name,
+      senderRole: this.isAdminUser(userId) ? 'admin' : 'member',
+      content: command,
+      timestamp: Date.now(),
+      metadata: { chatId, tapped: true },
+    });
+  }
+
+  /**
+   * Send a prompt card with an inline keyboard. Returns the message id (or
+   * undefined when sending failed) and remembers the card so the outcome can be
+   * written back into it later.
+   */
+  private async sendPromptCard(id: string, chatId: number, targetId: string | undefined, html: string, keyboard: InlineKeyboard): Promise<number | undefined> {
+    if (!this.bot) return undefined;
+    let sentMsgId: number | undefined;
+    try {
+      const msg = await this.bot.api.sendMessage(chatId, html, { parse_mode: 'HTML', reply_markup: keyboard });
+      sentMsgId = msg.message_id;
+    } catch {
+      const msg = await this.bot.api.sendMessage(chatId, this.stripHtml(html), { reply_markup: keyboard });
+      sentMsgId = msg.message_id;
+    }
+    if (sentMsgId) {
+      this.trackEphemeral(targetId, sentMsgId);
+      this.promptCards.set(id, { chatId, messageId: sentMsgId, html });
+    }
+    return sentMsgId;
+  }
+
+  /**
+   * Write the outcome of a prompt into its card: the inline keyboard is removed
+   * and `outcomeHtml` is appended below the original question. The card stays
+   * in the chat (it is still ephemeral — cleaned up when the task completes) so
+   * the user can see what was decided, including decisions made FOR them on
+   * timeout.
+   */
+  private async settlePromptCard(id: string, outcomeHtml: string): Promise<void> {
+    const card = this.promptCards.get(id);
+    this.promptCards.delete(id);
+    if (!card || !this.bot) return;
+    const html = `${card.html}\n\n${outcomeHtml}`;
+    try {
+      await this.bot.api.editMessageText(card.chatId, card.messageId, html, { parse_mode: 'HTML' });
+    } catch (err: any) {
+      const description = String(err?.description || err?.message || '');
+      if (description.includes('message is not modified')) return;
+      await this.bot.api.editMessageText(card.chatId, card.messageId, this.stripHtml(html))
+        .catch((e: any) => logger.debug({ e }, 'telegram settlePromptCard failed'));
+    }
+  }
+
+  private static timeoutOutcome(decision: string): string {
+    return `⏱ No answer in 2 min — ${decision}`;
+  }
+
   async askPermission(prompt: string, targetId?: string): Promise<string> {
     const chatIds = this.resolveTargetChatIds(targetId);
     const chatId = chatIds[0];
@@ -576,44 +785,64 @@ export class TelegramChannel extends BaseChannel {
       .text('Always', `${id}:always`)
       .text('Deny', `${id}:no`);
 
-    const html = mdToTelegram(prompt);
-    let sentMsgId: number | undefined;
+    await this.sendPromptCard(id, chatId, targetId, mdToTelegram(prompt), keyboard);
 
-    try {
-      const msg = await this.bot.api.sendMessage(chatId, html, {
-        parse_mode: 'HTML',
-        reply_markup: keyboard,
-      });
-      sentMsgId = msg.message_id;
-    } catch {
-      const msg = await this.bot.api.sendMessage(chatId, this.stripHtml(html), {
-        reply_markup: keyboard,
-      });
-      sentMsgId = msg.message_id;
-    }
-
-    if (sentMsgId) this.trackEphemeral(targetId, sentMsgId);
+    const outcomes: Record<string, string> = {
+      yes: '✅ <b>Allowed</b>',
+      always: '✅ <b>Always allowed</b>',
+      no: '🚫 <b>Denied</b>',
+    };
 
     return new Promise((resolve) => {
-      const cleanup = (result: string) => {
-        this.pendingApprovals.delete(`${id}:yes`);
-        this.pendingApprovals.delete(`${id}:always`);
-        this.pendingApprovals.delete(`${id}:no`);
-        // Delete the permission card immediately
-        if (sentMsgId) this.deleteEphemeralMessage(targetId, sentMsgId);
+      const actions = Object.keys(outcomes);
+      const settle = (result: string, outcomeHtml: string) => {
+        clearTimeout(timer);
+        for (const action of actions) this.pendingApprovals.delete(`${id}:${action}`);
+        void this.settlePromptCard(id, outcomeHtml);
         resolve(result);
       };
-      this.pendingApprovals.set(`${id}:yes`, () => cleanup('yes'));
-      this.pendingApprovals.set(`${id}:always`, () => cleanup('always'));
-      this.pendingApprovals.set(`${id}:no`, () => cleanup('no'));
+      for (const action of actions) {
+        this.pendingApprovals.set(`${id}:${action}`, () => settle(action, outcomes[action]));
+      }
+      const timer = setTimeout(
+        () => settle('no', TelegramChannel.timeoutOutcome('treated as <b>Deny</b>')),
+        TelegramChannel.PROMPT_TIMEOUT_MS,
+      );
+    });
+  }
 
-      setTimeout(() => {
-        this.pendingApprovals.delete(`${id}:yes`);
-        this.pendingApprovals.delete(`${id}:always`);
-        this.pendingApprovals.delete(`${id}:no`);
-        if (sentMsgId) this.deleteEphemeralMessage(targetId, sentMsgId);
-        resolve('no');
-      }, 120_000);
+  async presentChoicePrompt(question: string, options: Array<{ value: string; label: string }>, targetId?: string): Promise<string> {
+    const chatIds = this.resolveTargetChatIds(targetId);
+    const chatId = chatIds[0];
+    if (!chatId || !this.bot) return options[0]?.value || '';
+
+    const id = `choice_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const keyboard = new InlineKeyboard();
+    for (let i = 0; i < options.length; i++) {
+      const option = options[i];
+      keyboard.text(option.label.slice(0, 60), `choice:${id}:${option.value}`);
+      if (i < options.length - 1 && (i + 1) % 2 === 0) {
+        keyboard.row();
+      }
+    }
+
+    await this.sendPromptCard(id, chatId, targetId, mdToTelegram(question), keyboard);
+
+    const labelFor = (value: string) => this.escapeHtml(options.find(o => o.value === value)?.label || value);
+
+    return new Promise((resolve) => {
+      const settle = (value: string, outcomeHtml: string) => {
+        clearTimeout(timer);
+        this.pendingChoices.delete(id);
+        void this.settlePromptCard(id, outcomeHtml);
+        resolve(value);
+      };
+      this.pendingChoices.set(id, (value) => settle(value, `✅ Selected: <b>${labelFor(value)}</b>`));
+      const timer = setTimeout(() => {
+        if (!this.pendingChoices.has(id)) return;
+        const fallback = options[0]?.value || '';
+        settle(fallback, TelegramChannel.timeoutOutcome(`continued with the recommended option: <b>${labelFor(fallback)}</b>`));
+      }, TelegramChannel.PROMPT_TIMEOUT_MS);
     });
   }
 
@@ -627,38 +856,22 @@ export class TelegramChannel extends BaseChannel {
       .text('Continue', `${id}:yes`)
       .text('Stop', `${id}:no`);
 
-    let sentMsgId: number | undefined;
-    try {
-      const msg = await this.bot.api.sendMessage(chatId, mdToTelegram(question), {
-        parse_mode: 'HTML',
-        reply_markup: keyboard,
-      });
-      sentMsgId = msg.message_id;
-    } catch {
-      const msg = await this.bot.api.sendMessage(chatId, question, {
-        reply_markup: keyboard,
-      });
-      sentMsgId = msg.message_id;
-    }
-
-    if (sentMsgId) this.trackEphemeral(targetId, sentMsgId);
+    await this.sendPromptCard(id, chatId, targetId, mdToTelegram(question), keyboard);
 
     return new Promise((resolve) => {
-      const cleanup = (result: boolean) => {
+      const settle = (result: boolean, outcomeHtml: string) => {
+        clearTimeout(timer);
         this.pendingApprovals.delete(`${id}:yes`);
         this.pendingApprovals.delete(`${id}:no`);
-        if (sentMsgId) this.deleteEphemeralMessage(targetId, sentMsgId);
+        void this.settlePromptCard(id, outcomeHtml);
         resolve(result);
       };
-      this.pendingApprovals.set(`${id}:yes`, () => cleanup(true));
-      this.pendingApprovals.set(`${id}:no`, () => cleanup(false));
-
-      setTimeout(() => {
-        this.pendingApprovals.delete(`${id}:yes`);
-        this.pendingApprovals.delete(`${id}:no`);
-        if (sentMsgId) this.deleteEphemeralMessage(targetId, sentMsgId);
-        resolve(false);
-      }, 120_000);
+      this.pendingApprovals.set(`${id}:yes`, () => settle(true, '▶️ <b>Continuing</b>'));
+      this.pendingApprovals.set(`${id}:no`, () => settle(false, '⏹ <b>Stopped</b>'));
+      const timer = setTimeout(
+        () => settle(false, TelegramChannel.timeoutOutcome('<b>stopped</b>')),
+        TelegramChannel.PROMPT_TIMEOUT_MS,
+      );
     });
   }
 
@@ -674,38 +887,22 @@ export class TelegramChannel extends BaseChannel {
 
     const html = `<b>Permission Mode</b>\nHow should Mercury handle risky actions this session?\n\n🔒 <b>Ask Me</b> — confirm before file writes, commands, and scope changes\n✅ <b>Allow All</b> — auto-approve everything (scopes, commands, loops)`;
 
-    let sentMsgId: number | undefined;
-    try {
-      const msg = await this.bot.api.sendMessage(chatId, html, {
-        parse_mode: 'HTML',
-        reply_markup: keyboard,
-      });
-      sentMsgId = msg.message_id;
-    } catch {
-      const msg = await this.bot.api.sendMessage(chatId, this.stripHtml(html), {
-        reply_markup: keyboard,
-      });
-      sentMsgId = msg.message_id;
-    }
-
-    if (sentMsgId) this.trackEphemeral(targetId, sentMsgId);
+    await this.sendPromptCard(id, chatId, targetId, html, keyboard);
 
     return new Promise((resolve) => {
-      const cleanup = (result: PermissionMode) => {
+      const settle = (result: PermissionMode, outcomeHtml: string) => {
+        clearTimeout(timer);
         this.pendingApprovals.delete(`${id}:ask-me`);
         this.pendingApprovals.delete(`${id}:allow-all`);
-        if (sentMsgId) this.deleteEphemeralMessage(targetId, sentMsgId);
+        void this.settlePromptCard(id, outcomeHtml);
         resolve(result);
       };
-      this.pendingApprovals.set(`${id}:ask-me`, () => cleanup('ask-me'));
-      this.pendingApprovals.set(`${id}:allow-all`, () => cleanup('allow-all'));
-
-      setTimeout(() => {
-        this.pendingApprovals.delete(`${id}:ask-me`);
-        this.pendingApprovals.delete(`${id}:allow-all`);
-        if (sentMsgId) this.deleteEphemeralMessage(targetId, sentMsgId);
-        resolve('ask-me');
-      }, 120_000);
+      this.pendingApprovals.set(`${id}:ask-me`, () => settle('ask-me', '🔒 <b>Ask Me</b> selected'));
+      this.pendingApprovals.set(`${id}:allow-all`, () => settle('allow-all', '✅ <b>Allow All</b> selected'));
+      const timer = setTimeout(
+        () => settle('ask-me', TelegramChannel.timeoutOutcome('defaulting to <b>Ask Me</b>')),
+        TelegramChannel.PROMPT_TIMEOUT_MS,
+      );
     });
   }
 
@@ -781,7 +978,7 @@ export class TelegramChannel extends BaseChannel {
       } catch {
         await this.bot.api.sendMessage(admin.chatId, message, {
           reply_markup: keyboard,
-        }).catch(() => {});
+        }).catch((e: any) => logger.warn({ e }, "telegram send failed"));
       }
     }
   }
@@ -809,7 +1006,7 @@ export class TelegramChannel extends BaseChannel {
     const request = findTelegramPendingRequest(this.config, requestUserId);
     if (!request) {
       await ctx.answerCallbackQuery({ text: 'Already handled' });
-      await ctx.editMessageReplyMarkup({ reply_markup: undefined }).catch(() => {});
+      await ctx.editMessageReplyMarkup({ reply_markup: undefined }).catch((e: any) => logger.debug({ e }, "telegram editMessageReplyMarkup failed"));
       return;
     }
 
@@ -822,7 +1019,7 @@ export class TelegramChannel extends BaseChannel {
 
       saveConfig(this.config);
       await ctx.answerCallbackQuery({ text: 'Approved' });
-      await ctx.editMessageReplyMarkup({ reply_markup: undefined }).catch(() => {});
+      await ctx.editMessageReplyMarkup({ reply_markup: undefined }).catch((e: any) => logger.debug({ e }, "telegram editMessageReplyMarkup failed"));
       await this.sendDirectMessage(
         request.chatId,
         `Telegram access approved. You can now chat with Mercury.\n\nTelegram access: ${getTelegramAccessSummary(this.config)}`,
@@ -840,7 +1037,7 @@ export class TelegramChannel extends BaseChannel {
 
       saveConfig(this.config);
       await ctx.answerCallbackQuery({ text: 'Rejected' });
-      await ctx.editMessageReplyMarkup({ reply_markup: undefined }).catch(() => {});
+      await ctx.editMessageReplyMarkup({ reply_markup: undefined }).catch((e: any) => logger.debug({ e }, "telegram editMessageReplyMarkup failed"));
       await this.sendDirectMessage(
         request.chatId,
         'Your Telegram access request was rejected. This bot is not available to you.',
@@ -938,7 +1135,7 @@ export class TelegramChannel extends BaseChannel {
       await ctx.answerCallbackQuery({ text: 'Recent memories' });
       const recent = this.chatCommandContext.memoryRecent(10);
       if (recent.length === 0) {
-        await this.bot.api.sendMessage(chatId, 'No memories yet.').catch(() => {});
+        await this.bot.api.sendMessage(chatId, 'No memories yet.').catch((e: any) => logger.warn({ e }, "telegram send failed"));
         return;
       }
       const lines = ['<b>Recent Memories:</b>\n'];
@@ -962,7 +1159,7 @@ export class TelegramChannel extends BaseChannel {
       await this.bot.api.sendMessage(chatId, currentlyPaused
         ? 'Learning resumed. Mercury will remember new things from conversations.'
         : 'Learning paused. Mercury will not store new memories until resumed.',
-      ).catch(() => {});
+      ).catch((e: any) => logger.warn({ e }, "telegram send failed"));
       await this.sendMemoryKeyboard(chatId);
       return;
     }
@@ -984,7 +1181,7 @@ export class TelegramChannel extends BaseChannel {
     if (action === 'clear_yes') {
       const cleared = this.chatCommandContext.memoryClear();
       await ctx.answerCallbackQuery({ text: `Cleared ${cleared} memories` });
-      await this.bot.api.sendMessage(chatId, `Cleared ${cleared} memories.`).catch(() => {});
+      await this.bot.api.sendMessage(chatId, `Cleared ${cleared} memories.`).catch((e: any) => logger.warn({ e }, "telegram send failed"));
       return;
     }
 
@@ -1001,7 +1198,7 @@ export class TelegramChannel extends BaseChannel {
       const subconsciousMemories = this.chatCommandContext.memoryGetSubconscious(5);
       const subconsciousTotal = this.chatCommandContext.memorySummary().subconsciousTotal;
       if (subconsciousMemories.length === 0) {
-        await this.bot.api.sendMessage(chatId, '💤 <b>Subconscious Memory</b>\n\nNo subconscious memories yet. Memories move here after 30 days of not being referenced, and are recalled automatically when relevant to a conversation.').catch(() => {});
+        await this.bot.api.sendMessage(chatId, '💤 <b>Subconscious Memory</b>\n\nNo subconscious memories yet. Memories move here after 30 days of not being referenced, and are recalled automatically when relevant to a conversation.').catch((e: any) => logger.warn({ e }, "telegram send failed"));
         return;
       }
       const lines = ['💤 <b>Subconscious Memory (first 5 by recency):</b>\n'];
@@ -1048,6 +1245,189 @@ export class TelegramChannel extends BaseChannel {
 
   private getCommandName(text: string): string {
     return text.trim().split(/\s+/)[0]?.toLowerCase() || '';
+  }
+
+  private async handleSkillsCommand(chatId: number, userId: number, text: string): Promise<void> {
+    const parts = text.trim().split(/\s+/).slice(1);
+    const sub = (parts[0] || 'list').toLowerCase();
+    const args = parts.slice(1);
+    const arg = args.join(' ').trim();
+
+    const registry = new RegistryClient();
+    const store = new SkillStore({ registry });
+    const loader = new SkillLoader();
+
+    try {
+      switch (sub) {
+        case 'help':
+        case '-h':
+        case '--help': {
+          await this.sendDirectMessage(
+            chatId,
+            [
+              '*Mercury Skills — Telegram*',
+              '',
+              '`/skills` — list installed skills',
+              '`/skills search <query>` — search the registry',
+              '`/skills view <id>` — show details + registry URL',
+              '`/skills install <id>` — admin only',
+              '`/skills remove <id>` — admin only',
+              '',
+              'Registry: https://skills.mercuryagent.sh',
+            ].join('\n'),
+          );
+          return;
+        }
+
+        case 'list': {
+          const installed = loader.getAllSkills();
+          if (installed.length === 0) {
+            await this.sendDirectMessage(
+              chatId,
+              'No skills installed.\n\nTry `/skills search <query>` to browse https://skills.mercuryagent.sh.',
+            );
+            return;
+          }
+          const lines = installed
+            .slice(0, 25)
+            .map((s) => `• \`${s.name}\` — ${s.active ? 'active' : 'inactive'}${s.description ? ` — ${s.description}` : ''}`);
+          const more = installed.length > 25 ? `\n\n_…and ${installed.length - 25} more. Run \`mercury skills list\` for the full set._` : '';
+          await this.sendDirectMessage(
+            chatId,
+            `*Installed skills (${installed.length})*\n\n${lines.join('\n')}${more}`,
+          );
+          return;
+        }
+
+        case 'search':
+        case 'find': {
+          if (!arg) {
+            await this.sendDirectMessage(chatId, 'Usage: `/skills search <query>`');
+            return;
+          }
+          const feed = await registry.getFeed();
+          const scored = searchFeed(feed, arg, 5);
+          if (scored.length === 0) {
+            await this.sendDirectMessage(chatId, `No results for "${arg}".`);
+            return;
+          }
+          const results = scored.map((s) => s.skill);
+          const lines = results.map(
+            (r: RegistrySkillSummary) =>
+              `• \`${r.id}\` (v${r.version})\n  ${r.description}\n  ${registry.webUrl(r.id)}`,
+          );
+          await this.sendDirectMessage(
+            chatId,
+            `*Top ${results.length} matches for "${arg}"*\n\n${lines.join('\n\n')}\n\nReview a skill before installing: \`/skills view <id>\``,
+          );
+          return;
+        }
+
+        case 'view':
+        case 'show':
+        case 'info': {
+          if (!arg) {
+            await this.sendDirectMessage(chatId, 'Usage: `/skills view <category/slug>`');
+            return;
+          }
+          if (!isValidSkillId(arg)) {
+            await this.sendDirectMessage(chatId, 'Invalid skill id. Expected `<category>/<slug>`.');
+            return;
+          }
+          const detail = await registry.getSkill(arg);
+          const tags = detail.tags?.length ? `\n*Tags:* ${detail.tags.join(', ')}` : '';
+          const author = detail.author ? `\n*Author:* ${detail.author}` : '';
+          await this.sendDirectMessage(
+            chatId,
+            [
+              `*${detail.title}* (\`${detail.id}\`)`,
+              `*Version:* ${detail.version}`,
+              `*Category:* ${detail.category}`,
+              author,
+              tags,
+              '',
+              detail.description,
+              '',
+              `🔗 ${registry.webUrl(detail.id)}`,
+              '',
+              this.isAdminUser(userId)
+                ? 'Install with: `/skills install ' + detail.id + '`'
+                : 'Ask an admin to install: `/skills install ' + detail.id + '`',
+            ]
+              .filter(Boolean)
+              .join('\n'),
+          );
+          return;
+        }
+
+        case 'install':
+        case 'add': {
+          if (!this.isAdminUser(userId)) {
+            await this.sendDirectMessage(chatId, '🔒 Only Telegram admins can install skills.');
+            return;
+          }
+          if (!arg) {
+            await this.sendDirectMessage(chatId, 'Usage: `/skills install <category/slug>`');
+            return;
+          }
+          if (!isValidSkillId(arg)) {
+            await this.sendDirectMessage(chatId, 'Invalid skill id. Expected `<category>/<slug>`.');
+            return;
+          }
+          await this.sendDirectMessage(chatId, `Installing \`${arg}\`…`);
+          const result = await store.install(arg);
+          const verb =
+            result.status === 'already-installed'
+              ? 'Already installed'
+              : result.status === 'updated'
+                ? 'Updated'
+                : result.status === 'reinstalled'
+                  ? 'Reinstalled'
+                  : 'Installed';
+          await this.sendDirectMessage(
+            chatId,
+            `✅ ${verb} \`${result.id}\` (v${result.version})\n\n🔗 ${registry.webUrl(result.id)}`,
+          );
+          return;
+        }
+
+        case 'remove':
+        case 'rm':
+        case 'delete':
+        case 'uninstall': {
+          if (!this.isAdminUser(userId)) {
+            await this.sendDirectMessage(chatId, '🔒 Only Telegram admins can remove skills.');
+            return;
+          }
+          if (!arg) {
+            await this.sendDirectMessage(chatId, 'Usage: `/skills remove <category/slug>`');
+            return;
+          }
+          if (!isValidSkillId(arg)) {
+            await this.sendDirectMessage(chatId, 'Invalid skill id. Expected `<category>/<slug>`.');
+            return;
+          }
+          const removed = store.remove(arg);
+          if (!removed) {
+            await this.sendDirectMessage(chatId, `Skill \`${arg}\` is not installed.`);
+            return;
+          }
+          await this.sendDirectMessage(chatId, `🗑 Removed \`${arg}\`.`);
+          return;
+        }
+
+        default: {
+          await this.sendDirectMessage(
+            chatId,
+            `Unknown subcommand \`${sub}\`. Try \`/skills help\`.`,
+          );
+        }
+      }
+    } catch (err: any) {
+      const msg = err?.message || 'Skill registry request failed';
+      logger.warn({ err: msg, sub, arg }, 'Telegram /skills command failed');
+      await this.sendDirectMessage(chatId, `⚠️ ${msg}`);
+    }
   }
 
   private getPendingStatusMessage(request?: TelegramPendingRequest): string {
@@ -1141,6 +1521,11 @@ export class TelegramChannel extends BaseChannel {
     const step = this.stepCounters.get(key) || 0;
     const history = this.stepHistory.get(key) || [];
     const notices = this.statusNotices.get(key) || [];
+    // Heartbeat lines arrive every 20-60s for the whole task — keep only the tail
+    // so the stored list (and the card) stays short.
+    if (notices.length > TelegramChannel.MAX_STORED_STATUS_NOTICES) {
+      notices.splice(0, notices.length - TelegramChannel.MAX_STORED_STATUS_NOTICES);
+    }
 
     const recentHistory = history.slice(-5);
     const recentNotices = notices.slice(-TelegramChannel.MAX_STATUS_NOTICES);
@@ -1160,6 +1545,22 @@ export class TelegramChannel extends BaseChannel {
   }
 
   private async updateStatusMessage(text: string, targetId?: string): Promise<void> {
+    const key = targetId || 'notification';
+    const previous = this.statusUpdateQueues.get(key) || Promise.resolve();
+    const next = previous
+      .catch(() => {})
+      .then(() => this.updateStatusMessageNow(text, targetId));
+    this.statusUpdateQueues.set(key, next);
+    try {
+      await next;
+    } finally {
+      if (this.statusUpdateQueues.get(key) === next) {
+        this.statusUpdateQueues.delete(key);
+      }
+    }
+  }
+
+  private async updateStatusMessageNow(text: string, targetId?: string): Promise<void> {
     const chatIds = this.resolveTargetChatIds(targetId);
     if (chatIds.length === 0 || !this.bot) return;
 
@@ -1173,7 +1574,13 @@ export class TelegramChannel extends BaseChannel {
         try {
           await this.bot.api.editMessageText(chatId, existingMsgId, html, { parse_mode: 'HTML' });
           return;
-        } catch {
+        } catch (err: any) {
+          const description = err?.description || err?.message || '';
+          if (String(description).includes('message is not modified')) {
+            return;
+          }
+          await this.unpinStatusMessage(targetId);
+          await this.bot.api.deleteMessage(chatId, existingMsgId).catch(() => {});
           this.statusMessageIds.delete(key);
         }
       }
@@ -1194,6 +1601,10 @@ export class TelegramChannel extends BaseChannel {
 
   private async deleteStatusMessage(targetId?: string): Promise<void> {
     const key = targetId || 'notification';
+    const pendingUpdate = this.statusUpdateQueues.get(key);
+    if (pendingUpdate) {
+      await pendingUpdate.catch(() => {});
+    }
     const msgId = this.statusMessageIds.get(key);
     if (msgId && this.bot) {
       // Unpin before deleting if this was pinned
@@ -1300,35 +1711,8 @@ export class TelegramChannel extends BaseChannel {
   }
 
   async sendCompletion(elapsedMs: number, stepCount: number, targetId?: string, meta?: { provider: string; model: string; inputTokens: number; outputTokens: number; totalTokens: number; budgetUsed: number; budgetTotal: number; budgetPercentage: number }): Promise<void> {
-    const secs = Math.floor(elapsedMs / 1000);
-    const mins = Math.floor(secs / 60);
-    const remSecs = secs % 60;
-    const timeStr = mins > 0 ? `${mins}m ${remSecs}s` : `${secs}s`;
-    const stepsStr = stepCount > 0 ? `${stepCount} step${stepCount !== 1 ? 's' : ''}` : '';
-    const parts = [stepsStr, timeStr].filter(Boolean).join(' · ');
-
     const key = targetId || 'notification';
-    const history = this.stepHistory.get(key) || [];
-    const recentHistory = history.slice(-5);
-
-    const lines = [
-      `✅ **Task complete** (${parts})`,
-    ];
-
-    if (meta) {
-      const formatTokens = (n: number) => n >= 1000 ? `${(n / 1000).toFixed(1)}k` : `${n}`;
-      lines.push(`☿ ${meta.model} via ${meta.provider} · ${formatTokens(meta.totalTokens)} tokens`);
-      const pct = Math.round(meta.budgetPercentage);
-      const barLen = 15;
-      const filled = Math.round((pct / 100) * barLen);
-      const bar = '█'.repeat(filled) + '░'.repeat(barLen - filled);
-      lines.push(`Budget: ${bar} ${pct}% (${formatTokens(meta.budgetUsed)} / ${formatTokens(meta.budgetTotal)})`);
-    }
-
-    if (recentHistory.length > 0) {
-      lines.push('');
-      lines.push(...recentHistory.map(h => `  ✓ ${h}`));
-    }
+    logger.info({ elapsedMs, stepCount, provider: meta?.provider, model: meta?.model }, 'Telegram task complete');
 
     // Clean up: unpin + delete the status card, clean up ephemeral messages
     await this.deleteStatusMessage(targetId);
@@ -1342,28 +1726,7 @@ export class TelegramChannel extends BaseChannel {
     // Flush deferred AI response first (the actual answer the user wants to see)
     const deferred = this.deferredResponses.get(key);
     if (deferred && deferred.trim()) {
-      this.deferredResponses.delete(key);
-      const deferredHtml = mdToTelegram(deferred);
-      const chunks = this.splitMessage(deferredHtml, MAX_MESSAGE_LENGTH);
-      for (const chatId of chatIds) {
-        for (const chunk of chunks) {
-          try {
-            await this.bot?.api.sendMessage(chatId, chunk, { parse_mode: 'HTML' });
-          } catch {
-            await this.bot?.api.sendMessage(chatId, this.stripHtml(chunk)).catch(() => {});
-          }
-        }
-      }
-    }
-
-    // Send the completion banner as a separate message
-    const html = mdToTelegram(lines.join('\n'));
-    for (const chatId of chatIds) {
-      try {
-        await this.bot?.api.sendMessage(chatId, html, { parse_mode: 'HTML' });
-      } catch {
-        await this.bot?.api.sendMessage(chatId, this.stripHtml(html)).catch(() => {});
-      }
+      await this.send(deferred, targetId);
     }
 
     this.stepCounters.delete(key);
@@ -1390,7 +1753,7 @@ export class TelegramChannel extends BaseChannel {
     try {
       await this.bot.api.sendMessage(chatId, mdToTelegram(content), { parse_mode: 'HTML' });
     } catch {
-      await this.bot.api.sendMessage(chatId, content).catch(() => {});
+      await this.bot.api.sendMessage(chatId, content).catch((e: any) => logger.warn({ e }, "telegram send failed"));
     }
   }
 
@@ -1442,5 +1805,14 @@ export class TelegramChannel extends BaseChannel {
       return { chatId };
     }
     return null;
+  }
+
+  private cleanupDedup(): void {
+    const now = Date.now();
+    for (const [key, ts] of this.processedMessages) {
+      if (now - ts > TelegramChannel.DEDUP_TTL) {
+        this.processedMessages.delete(key);
+      }
+    }
   }
 }

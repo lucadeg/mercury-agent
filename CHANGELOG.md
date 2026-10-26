@@ -1,5 +1,489 @@
 # Changelog
 
+## Unreleased
+
+### MCP servers (ADR-029)
+- **MCP servers: Mercury can use tools from Model Context Protocol servers.** Add a local server (`mercury mcp add files --stdio npx -- -y @modelcontextprotocol/server-filesystem ~/Documents`) or a remote one (`--http <url>`), allow the tools you want (`mercury mcp allow`), and the agent can call them next to its built-in tools. Every MCP call asks first in Ask Me mode, and Allow All does not cover MCP tools; only tools you list in `autoApprove` run without a prompt, and only those run in scheduled tasks. Secrets stay in `.env` as `${env:NAME}` references and are masked everywhere they could appear. Local servers get a minimal environment, never Mercury's API keys, and remote servers go through the SSRF guard. Check health with `mercury mcp test`, `mercury doctor --mcp`, `/mcp` in chat, or the new read-only **MCP** dashboard page. The agent's file tools now always ask before writing `mercury.yaml`, `permissions.yaml` or `.env`, even under Allow All. See [MCP Servers](https://mercuryagent.sh/docs/integrations/mcp) and ADR-029.
+
+## 1.4.2 — search that finds things, and a research prompt that asks only when you mean it
+
+### Web search
+- **Three web sources, the ones that work.** `web_search` asks [Parallel's public search](https://search.parallel.ai/mcp) first (keyless MCP built for agents, about a second, with excerpts and dates), then DuckDuckGo's html page, then its lite page. Brave, Wikipedia, Hacker News and Bing's web feed are gone from web search: Brave refuses automated requests and the others answered general questions badly. News keeps Parallel (article links only, section fronts dropped), then Bing News, Google News and Hacker News.
+- **DuckDuckGo parsed exactly.** Both pages are read from their real markup: each result's title, the real address behind DuckDuckGo's redirect, and the snippet; ads (`result--ad`, sponsored rows) are dropped. A challenge is retried once after a short pause, and a page that is neither results nor "No results" is reported as "page not recognised" instead of silently empty. Tests run against saved copies of both real pages.
+- **News links open the article.** News search used Google News first, whose links are Google redirects (`news.google.com/rss/articles/…`) that can't be turned into the publisher's address. Bing News now comes first and its links are unwrapped to the real article; Google News is the fallback, and its links are marked as redirects.
+- **Search never depends on the model.** Results come only from Mercury's own search tools, never from a provider's built-in web search, so search works the same with every model.
+- **The web-search skill (1.3.0) explains the sources** and tells the model to report which ones failed and why when a search comes back empty.
+- **You can see what happened.** Every result ends with the trail, for example `Searched: Parallel: timed out → DuckDuckGo: 8 results`, so "nothing found" and "everything was blocked" read differently.
+
+### Chat
+- **The research prompt asks only when you want research.** It used to fire on words ("latest", "recent", "explain", "today's news"), so "convert the latest epub" or "explain how my build works and fix it" got a research question. The words now only decide whether to check; one short model call decides whether you asked for an in-depth, multi-source write-up. Instructions, quick questions and today's news never get the prompt, and a failed or slow check means no prompt.
+- **Quick answer comes first.** The picker starts on "Quick answer", so an accidental Enter never starts a long research run.
+
+## 1.4.1 — Mercury learns how you work, saves its own skills, and searches again
+
+### Owner Model: Mercury learns how to work with you (ADR-026)
+- **Memory became beliefs with evidence.** Every claim about you now carries support and counter-evidence, a confidence that fades unless it is seen again, the context it applies in, and a status: candidate → held → confirmed by you; contested; retired; forgotten. What you say outright beats what Mercury inferred and never fades. Nothing is deleted behind your back.
+- **It learns working traits, not personality types:** reply length, when to ask before acting (per project or domain), options vs a recommendation, tone, your expertise and risk appetite per domain, when you are usually around, how you give feedback. It never infers health, religion, politics, sexuality or personality types, never stores credentials, and never generalises about other people beyond what you said.
+- **Two loops.** After each turn a strict extractor turns the turn into belief operations (or nothing; Mercury's own replies are never evidence about you). Every hour of activity, and at shutdown, a reflection pass reads your messages and behaviour across sessions, infers traits, merges duplicates, flags contradictions and rewrites the owner brief.
+- **The model finally sees it:** "About you" and "How to work with you" sit in every prompt, plus the beliefs relevant to each message. Beliefs it acted on without objection gain support; a correction retires the old belief and holds the new one.
+- **You hear about it.** Behaviour-changing learning ends the reply with one line: `☿ Noted: … Say "forget that" to undo.` Contradictions are asked about once. `/memory learned|beliefs|contested|confirm|correct|forget|settle`, `/forget <text>`, "forget that", the `forget_memory` / `confirm_belief` / `correct_belief` tools, a dashboard view with Confirm/Forget, and an editable `~/.mercury/soul/owner.md` whose notes are read back.
+- **Hygiene:** the old extractor saved Mercury's own replies as your preferences (about half of a typical store). Those rows are quarantined, not deleted (dashboard → Quarantined, with Restore); real memories became beliefs. The prose fallback is gone, merging works, conflicts no longer delete at random, and soul files you edited are never overwritten by migration.
+- **One source.** `/memory`, the dashboard, the `save_memory` / `search_memory` tools, the bots and cloud sync all read and write the belief store now; the old `memories` table is a read-only archive. Your name, email and handles stay in `identity.owner` in `mercury.yaml` and are never stored as beliefs.
+- **Chat can actually use what it read.** Per-message recall shows held beliefs first and fills with unverified candidates (labelled as hunches), so what Mercury learned today and what the upgrade migrated is visible now, not after a second session. "What do you know about me?" injects the strongest beliefs directly. Stopwords and channel scaffolding no longer pollute the search, and the "About you" section pads with hedged candidates until enough is held.
+- **Two extractor leaks closed.** A correction that opens like an acknowledgement ("No no, I said British spelling…") is no longer skipped as trivial, and an operation the model emits without an `excerpt` now cites your message instead of being thrown away (that alone dropped whole turns on Haiku).
+- **Pick the model that learns.** `memory.learning.provider: anthropic` (or `LEARNING_PROVIDER`) runs extraction and reflection on a capable provider while chat keeps its own; unset falls back to the default.
+- **Safe upgrade.** The first boot after upgrading backs `second-brain.db` up to `second-brain.pre-owner-model.db` before migrating, the migration runs once and never crashes the boot, every memory you could see before is still listed (or waits in Quarantined), and "☿ Noted" lines are limited to one per channel every few minutes.
+
+### Self-made skills (ADR-027)
+- **Mercury turns long work into skills.** After a multi-step task it would do again (a recurring report, a conversion pipeline, a deploy, a site or device it operates) has worked end-to-end, Mercury saves the procedure with the new `create_skill` tool — exact commands, paths, checks and pitfalls — and tells you in one line. Next time it is one `use_skill` away.
+- **Kept apart from your skills.** Self-made skills live in `~/.mercury/skills/self-made/`, carry `origin: mercury`, are listed under their own "Self-made" label and count as unverified until used again. Drafts are rejected unless they are a real, verified, credential-free procedure; a self-made skill never shadows an installed one.
+- **Skill categories and intents work again.** Discovery registered each skill's category, intents and tags and then rebuilt the index, wiping them; the prompt fell back to a flat list and intent routing matched on names only. Fixed by building the index first.
+- **No junk shelf.** `/skills self-made` shows each one with use counts; unused ones go dormant after 30 days (disabled, never deleted) and the shelf is capped at 40. `/skills self-made enable|disable|remove <name>`. Bots and channel members cannot create skills.
+
+### Web search
+- **Search returns real results again, still free and keyless.** Bing's web RSS feed, the main engine, now answers automated requests with pages unrelated to the query (train timetables for a TypeScript question), and DuckDuckGo, Mojeek and Startpage answer with bot challenges. `web_search` now asks Brave Search first, then Wikipedia, Hacker News, Bing News and Google News, and keeps only results that mention the query, so a source serving junk counts as empty and the next one is tried. A thin answer is topped up from Wikipedia, the same page is never listed twice, and Brave rests for a minute after rate-limiting instead of being retried every query. No new dependency.
+- **Old DuckDuckGo skills stop failing.** `fetch_url` on a search-engine results page (DuckDuckGo, Google, Bing, Yahoo, Brave, Startpage, Mojeek) runs the query through `web_search` instead of returning the challenge page. An installed `web-search` skill that scrapes such a page and never mentions `web_search` is replaced by the built-in one on start, with the original kept as `SKILL.md.replaced.bak`; skills you edited that already use `web_search` are left alone.
+- The built-in `web-search` skill (1.2.0) tells the model to rephrase once before giving up and never to fetch search pages directly.
+
+### Chat
+- **Regular chat works like an agent again.** Its instructions forbade helper scripts and batching ("call write_file for each one individually"), so a task like converting an EPUB to Markdown was done file by file by hand. Chat now reaches for the strongest existing tool (pandoc, ffmpeg, a Python library) or one script, does a quick web search when it isn't sure what the best tool is, and checks the output before saying it is done. It also gets a short working contract like Mercury Code's: do the work, plan multi-step tasks, report what was checked.
+- **`/model` and `/cloud` offer the arrow-key picker in the attached terminal again.** The picker was only wired to the foreground terminal; since the default launch attaches, `/model` printed a list and left you typing `/models use <name>`. Both now open the same ↑↓ picker on your own screens (attached terminal and dashboard), and Esc keeps the current model instead of silently taking the first option.
+- **A model switch says what it does.** `/model` used to answer "Saved for future sessions", which read as "takes effect next session". It now says `✓ Switched to <model> (<provider>). In effect from your next message, and kept as the default.`, and the status row shows the new model at once.
+- **Pickers answered in the attached terminal reach the runtime.** The answer endpoint only resolved permission prompts, so choosing in `/permissions`, `/model` or a question picker did nothing: the command waited out its 2-minute timeout behind a "Thinking" spinner. Choices and Esc now resolve at once, and the spinner is hidden while a picker waits on you.
+- **`/new` no longer leaves the attached terminal "Thinking" forever.** After `/new` or `/session <ref>` the runtime re-bound your screen to the new session, but the terminal kept listening on the old one, so every reply went where nobody was looking and `/stop` seemed ignored. The runtime now tells the screen to follow, and the terminal also follows whenever a message is routed to another session.
+- **Yes-or-no and "which one?" questions come as a picker, not prose.** Chat now asks decisions through its question tool (↑↓ and Enter) and keeps prose for questions that need free text (a name, a path).
+
+### Permissions
+- **Every new session asks for its permission mode again.** Since 1.3.1 the default `mercury` launch attaches to the background runtime, which never showed the "Ask Me / Allow All" prompt, so everyone was silently in Ask Me. The prompt is back wherever a session starts: the foreground terminal and Mercury Code at launch, the attached terminal when you start a new session or type `/new`. Your current mode is listed first, so Enter keeps it and ↓ Enter switches; the pick is remembered as the default for next time and applied to every screen. Resuming an existing session prints one dim line with the mode in effect instead.
+- **`/permissions` works everywhere you are the owner** (attached terminal and dashboard too, not just the foreground terminal), including `/permissions allow-all` and `/permissions ask-me`.
+- **"Always" on a command prompt now covers that command for the rest of the chat** (every `pandoc …`, `git commit …`), not just the exact string. Installs, wrappers like `sudo`/`sh -c`, and remote Mercury Cloud requests stay exact-match.
+- Telegram and Signal can switch back from Allow All to Ask Me (the switch used to be ignored until restart).
+
+### Bottom bar
+- **The session picker fits the screen, new session first.** `mercury` used to list up to six sessions under the launch pad regardless of the terminal height, so on a 24-row terminal Ink dropped the wordmark off the top. The list is now budgeted to the height (the tip goes first, then sessions fold into `… N more · /sessions in the chat`), and "Start a new session" is the first, pre-selected row instead of the last.
+- **One useful row, not a dump.** The row under the input is status only. Left: the session (`⚿ copper-mint-thd · hi`). Right: permission mode, today's budget meter, model, Code mode, Optimus, an update — fitted to the terminal width in priority order with compact forms (`claude-haiku-4-5` not `claude-haiku-4-5-20251001`, `⚡12%` when narrow), so a long model or session name never crowds out the rest; what does not fit is dropped, lowest priority first, never cut mid-word.
+- **Optimus wins the row.** While Optimus is listening or working, its activity is the first segment on the right and the last one the fit ever drops; the session on the left shrinks to its alias to make room.
+- **Model only on the row.** The provider name is gone from the status row (`claude-sonnet-4-5`, not `Anthropic · claude-sonnet-4-5`); the model name already says who serves it.
+- **The budget meter is back on the row.** `⚡ ██████░░ 76%` shows today's token use as a bar that goes green → yellow (70 %) → red (90 %), the colours the completion footer has always used. It outranks the model when the row is narrow, so it stays visible as `⚡76%` down to very small terminals. The attached terminal and the foreground TUI share one builder.
+- **The bar updates live.** The attached terminal (what `mercury` opens) read the model once on connect and never again; model switches, Code mode, permission changes and Optimus activity never reached it. The runtime now pushes a status update on every model switch and checks every 2 seconds for anything else. The bar shows the thread, model, Code mode, Ask Me / Allow All, today's token use and Optimus activity; the foreground and Mercury Code bars show the permission mode too.
+- The launch pad's budget row works again (it read field names the runtime never sent).
+- **Said once, in the chat.** While a turn runs, one line above the input shows the spinner, the phase (Thinking, the running tool, Writing) and the elapsed time, cyan then yellow at 30 s and red at 90 s, under the finished steps' ✓ marks. The status row under the input never repeats it. Choosing a permission mode no longer prints a confirmation line either: the row shows the mode.
+- **No key hints on the row.** `↵ send · /help · ctrl+c detach` is gone; Enter sends, `/help` lists the commands, and the row keeps its width for status. The right half is a single truncating line now, so it can no longer wrap onto a hidden second line and end in `Anthropic · `.
+
+## 1.4.0 — Pluggy Mercury: plugins, WhatsApp calls, and Optimus uses your computer
+
+The first stable release since 1.3.8. It also carries the 1.3.9 hotfix below, which only shipped on the dev channel.
+
+### Plugins (#203)
+- **Optional plugins.** `/plugins install|enable|disable|update|rollback|uninstall`, from a checksum-verified catalog at mercuryagent.sh. Plugins run out of process, so a crashing plugin can't take Mercury down, and they declare their network hosts, secrets and permissions up front.
+- **Plugin API 1.2.** Plugins can return images to the model (kept out of chat history), request desktop access (`permissions.desktop`), and add `whatsapp` or `desktop` channels.
+- **Plugins use Mercury's own providers.** You set a key once; plugins borrow it. A missing optional key is explained once, with what it turns off.
+- **Guided setup and a flatter `/plugins <id>` menu.** Settings are listed on the menu itself, yes/no options say what each answer does, and the follow-up settings appear right after you save. No dead ends.
+- Installing a plugin into a running Mercury now starts it immediately (it used to wait for a restart).
+
+### WhatsApp plugin 0.1.1 (#202)
+- Chat with Mercury on WhatsApp from a spare number, as a linked device.
+- **Voice calls in both directions.** Mercury can call you ("call me at 9pm", "call me when it's done"), keeps you posted while it works, takes approvals by voice or in the chat, and sends links, photos and documents mid-call.
+- Choose the voice engine (OpenAI by default, Gemini, Grok, ElevenLabs, Azure, Qwen, or your own Mercury model), access levels (General / Extended), and link or unlink from the dashboard.
+
+### Optimus plugin 0.4.7 (new)
+- **Mercury uses your computer.** It looks at the screen, then moves the pointer, scrolls and types the way a person does, with a "Mercury is driving" overlay while it has control. macOS, Windows and Linux; no developer certificates needed.
+- **Talk to it.** A talk key starts listening mode with spoken replies, a mute key stops listening without stopping the work, and saying "stop" halts every action at once. Silence ends a session, so nothing is captured or spent while you're away.
+- **Honest about results.** Optimus checks the screen before it reports something as done, and failed actions are reported as failed.
+- Consequential actions ask first; Mercury declines to play or automate games that use anti-cheat (Vanguard, Easy Anti-Cheat, BattlEye), since automated input there can get your account banned. The TUI status bar shows when Optimus is listening or working, and a soft tick-tock plays while it works.
+- Voice settings are shared with WhatsApp.
+
+### Also new
+- **Built-in `web_search`.**
+- **Mercury reads photos and PDFs, and listens to voice notes, from chat.**
+- Mercury always knows it comes from Cosmic Stack.
+- Web dashboard: plain-language model names, renaming, a reasoning picker, every local Ollama model, ChatGPT Plus/Pro plan models.
+
+### Fixed
+- **The desktop channel no longer loops broadcasts.** One failing alert used to fan out into hundreds of WhatsApp messages; repeated alerts are now sent once.
+- ChatGPT OAuth turns no longer fail after a tool call.
+- Long messages no longer fail memory search ("Expression tree is too large").
+- New dashboard chats no longer land in the previous conversation; dashboard permission prompts render and resolve.
+- Plugin tar calls work with GNU tar on Windows.
+- **The web dashboard works on the Windows standalone binary.** Mercury looked for its `web/` folder inside the binary's virtual filesystem, because it only recognised Bun's macOS/Linux marker (`$bunfs`) and not Windows' (`~BUN`), so the dashboard reported "web UI not found". Found and fixed by @farena-ai in #189; the same check is now shared by the login page and the memory-graph fallback.
+
+## 1.3.9 — hotfix: `mercury doctor` and dashboard saves take effect
+
+- **`mercury doctor` applies what you changed.** Providers, keys and channels are read at boot, so a reconfigure that only wrote the file looked like it did nothing until a manual `mercury restart`. Doctor now restarts the running daemon when the configuration actually changed (the Telegram/Discord commands already did this).
+- **Dashboard saves say "restart to apply" and offer a Restart button** (Settings → Restart Mercury), backed by a loopback-only `POST /api/restart`.
+
+## 1.3.8 — hotfix: live reply rendering and spinners in the attach TUI
+
+- **No more cyan bar beside a streaming reply.** The attach TUI (what `mercury` opens) drew the live reply with a cyan `│` strip that disappeared once the reply settled. The live tail now renders exactly like the settled block — same `MERCURY:` header, indent and markdown.
+- **Working/step indicators animate.** The attach TUI showed a frozen `⠋ working…` and static `→` steps; they now run on the shared 100 ms ticker like the main TUI.
+
+## 1.3.7 — hotfix: first-run setup exited at the mode menu
+
+- **The setup wizard quit silently at "Choose your mode"** (1.3.1 – 1.3.6, every platform, binaries and npm). The shared readline used for the name questions released itself a tick later and paused stdin *after* the arrow-key menu had taken it over; nothing was reading the terminal, so the process ran out of work and exited 0. The menu now releases the readline synchronously before it owns stdin. Reproduced and verified under a pseudo-terminal.
+
+## 1.3.6 — hotfix: `mercury upgrade` is a no-op when already current
+
+- **`mercury upgrade` / `mercury-dev upgrade` re-installed (and restarted the daemon) even on the latest build.** They now resolve the channel's newest version first — stable from `/releases/latest`, dev from the rolling `mercury-dev-latest` release — and stop with "Already on the latest version" without touching the daemon or the binary. `--force` reinstalls anyway.
+
+## 1.3.5 — hotfix: the Windows installer on Windows PowerShell 5.1
+
+- **`irm mercuryagent.sh/install.ps1 | iex` failed with "checksums.txt must contain exactly one checksum for mercury-win-x64.exe"** on stock Windows PowerShell 5.1 — and the window closed before you could read it. GitHub serves `checksums.txt` as `application/octet-stream`, for which PowerShell 5.1 returns a `byte[]` from `Invoke-WebRequest`; the installer now decodes it (PowerShell 7 was unaffected). A failure now waits for Enter before closing the window (`MERCURY_NO_PAUSE=1` for automation).
+- **Running the saved script (`powershell -File install.ps1`) failed to parse** under PowerShell 5.1: the file had UTF-8 characters and no BOM, so the ANSI code page turned a `✓` into a quote. The installers are ASCII-only now.
+- CI runs the Windows installer under PowerShell 5.1 against a local release served as `application/octet-stream`.
+- **install.sh (1.3.4) died with "Illegal instruction" instead of switching to the baseline build** when the default build crashed in the smoke test (`set -e` on a failing command substitution). Fixed; the CPU-detection path that picks baseline up front was unaffected.
+
+## 1.3.4 — hotfix: binaries for CPUs without AVX2 (#155)
+
+- **"Illegal instruction (core dumped)" on older x86-64.** Bun's default x64 build uses AVX2; Intel CPUs before Haswell (2013) and some VMs crash at start. Releases now also ship **`mercury-linux-x64-baseline`** and **`mercury-win-x64-baseline.exe`**. The installers pick the baseline build when `/proc/cpuinfo` has no `avx2`, and switch to it automatically if the default build dies with an illegal instruction during the post-install smoke test. `MERCURY_ASSET=<asset name>` forces a build.
+
+## 1.3.3 — hotfix: bots always get a provider that works
+
+- **A bot never fails on a provider that cannot answer.** A new bot (from Telegram, the TUI or the web) runs on the default LLM; if the configured default has no key or its key is rejected (401), Mercury uses the first usable provider instead, and a provider that rejects its key is remembered and skipped — for bots, the main agent's fallback chain and the default — until the key is changed. A bot turn that hit a bad key now retries on another provider instead of dead-lettering.
+- **`mercury doctor` flags keys that cannot be right** (e.g. an OpenAI key that starts with `2sk-` instead of `sk-`) before anything is tried.
+
+## 1.3.2 — hotfix: /code, the launch pad, and /stop from the default launch
+
+- **Launch pad on `mercury`.** The default launch attaches to the daemon (ADR-024) and the attach screen had dropped the launch pad — the wordmark, provider/skills/web/budget rows and tip the main TUI opens with. It is back, fed by real runtime state, above the session picker.
+- **`/stop` then a command.** `/stop` aborts asynchronously; a slash command typed before the turn finished unwinding was answered "Agent is busy…". The launcher now waits for the stop to complete (up to 5 s) and runs the command normally.
+- **`/code` works again from `mercury`.** Since 1.3.1 the default launch attaches to the daemon, and `/code` typed there was forwarded to the daemon's web channel — which has no terminal to switch into — so it printed "Programming mode: Off". The attach TUI now hands the terminal to Mercury Code (`/code` or `/code <dir>`), exactly what `mercury code` does; the runtime keeps running in the background. `/code plan|auto|off` inside the attach TUI explain where to run them.
+
+## 1.3.1 — Steady Mercury
+
+The release where Mercury stays out of your way. One process runs the fleet and your channels; the terminal just attaches to it — instantly. Bots do real work, deliver files you can find, stay online without burning tokens, and can be run from a phone. The 1.3.1 "Honest Mercury" line (chat that answers, "done" that means verified, security fixes) was never published on its own and ships here.
+
+### Upgrading
+
+- **Node.js 22 or newer is required for npm installs.** Standalone binaries carry their own runtime — nothing to do. On npm: run `node -v` first; on Node 20, `nvm install 22 && nvm alias default 22`, then `npm i -g @cosmicstack/mercury-agent`. `mercury upgrade` now checks this before it removes anything, and the package refuses to install on an older Node with a readable message instead of installing something that will not start.
+- **Your login service is re-pointed automatically** the first time the new build launches (it used to keep starting the old install). `mercury doctor` shows *Login service: points at this install*.
+- **First start moves bot outputs** from `~/.mercury/bots/outputs/` to `~/Documents/Mercury/<Bot name>/` (one-way; the old folder gets a README saying where things went).
+- No config migrations. `~/.mercury` (config, bots, memory, Telegram pairing) carries over untouched.
+
+### Known limitations
+
+- Launching `mercury` now attaches to the daemon (ADR-024), and the attach TUI does not yet have bot threads (`/bots open`) or the `/telegram`, `/discord`, `/slack` menus — use `/bots send <id> <message>` and `mercury telegram ...` from the shell, or `mercury code` for the in-process TUI. Closing this gap is the first item of the next release.
+- Bots still share the daemon's thread with the main agent: bounded (turn caps, async tools) but not isolated. `/api/health.loopLag` tells you if it ever matters.
+
+### One runtime (ADR-024)
+
+- **git tools no longer hold the runtime.** `git_status/log/diff/add/commit/push` (and `/code diff`) ran git synchronously — a push over a slow link froze Telegram, every bot and the attach TUI for up to 60 s. They now run async; errors and output are unchanged.
+- **Windows service drift** is detected too (Task Scheduler XML and the Run key are read back), so a stale autostart is re-pointed on every platform.
+- **The login service follows the install.** After a reinstall (npm → binary, stable → dev, a new Node under nvm) the old LaunchAgent / systemd unit kept resurrecting the *old* daemon on every login, so the new build could never own its port. Mercury now checks what the service launches on every launch and re-points it (unloading the old job first); `mercury doctor` shows **Login service: points at this install / STALE**, and the "port owned by another Mercury" message names the service when it is the cause.
+- **The terminal no longer runs a second copy of Mercury.** Launching `mercury` with no daemon used to spawn the daemon *and* boot a full runtime in the terminal — Telegram, the scheduler and every bot ran twice, and the second copy ran on the thread that paints your keystrokes. That was the typing lag, and the Telegram "terminated by other getUpdates" (409) conflicts. Now the terminal spawns the daemon and attaches to it; a foreground runtime beside a live daemon (`mercury code`, recovery) is a terminal for the main agent only — no bots, no channels, no web port.
+- **Attach waits for a booting daemon** (token not written yet, token rotated at bind) instead of failing on the first read.
+- **Event-loop stall monitor**: `/api/health` reports `loopLag` (p99 / worst stall over the last 10 s) and stalls ≥250 ms are logged with a warning, so lag is a number, not a feeling.
+
+### Instant attach
+
+- **Slash commands no longer show "Processing".** `/memory`, `/bots`, `/help` and friends are answered without the model; the turn indicator and heartbeat are raised only when a command actually falls through to a model turn. (`/memory` opens a menu that stays open as long as you use it — with the spinner up it looked like a hung agent.)
+- **`mercury` attaches instantly to a running daemon.** The daemon binds its web listener *first* at boot (channels and bots come after), an unauthenticated loopback `/api/health` answers with pid/version/booting, and the launcher polls every 250 ms instead of 750 ms. A port owned by another process (an old global install, another Mercury) is now reported in one line — *Port 6174 is owned by another Mercury (PID …) — stop it or set web.port* — instead of a 15-second wait followed by a pointless restart. The web server also retries a busy port for 5 s, so a restart right after a stop no longer loses the dashboard.
+
+### Bots in your pocket (ADR-023)
+
+- **Onboarding from Telegram.** `/bots create <id> "Name" "Description"` in Telegram (or the web chat) now runs the same flow as the TUI: your next message is the persona (keep as-is or convert to the template), then permissions tier, solo vs fleet, and the daily budget — each a tap on Telegram's native buttons that settle in place. Every reply lands in the chat that asked; nothing is lost to the TUI-only bot thread any more.
+- **Telegram controls.** `/bots` and `/bot` are in Telegram's command menu; the roster arrives with buttons — Stop/Start, Run and Runs per bot, plus Cost, Outputs, Doctor and Stop all for the fleet. A tap runs the slash command behind it as if you had typed it (same permissions, same reply). `/bots outputs` carries a 📎 button per delivered file.
+- **Files, not paths.** A task asked for from Telegram (or any remote chat) comes back with its delivered files attached. `/bots fetch <id> [name|latest]` sends one on demand.
+- **`/bots doctor`** runs the fleet health check from any chat; **`/bots help`** lists the commands. The TUI's slash completion, the busy-mode `/help`, and the docs now list every `/bots` subcommand.
+
+### Bots stay online
+
+- **Idle, never dead.** A routine that keeps producing nothing is cooled down instead of parked: 6 hours, doubling to 24, then it resumes by itself (`/bots start` resumes it now). Budget pauses lift at midnight and queued work is pumped then.
+- **Declared cadence is honoured.** A schedule in `bot.yaml` runs as written; the 30-minute floor applies only to routines a bot creates for itself.
+- **Doctor `stale` check** flags a bot whose routine has not fired in twice its cadence; the roster shows when a cooled-down routine resumes.
+
+### See what the bots cost and did (ADR-022)
+
+- **`/bots cost [days]`** — token spend per bot and per fleet: today against the cap, the window's runs, failures, deliveries and empty runs. Also `GET /api/bots-cost`.
+- **`/bots show <id> [runId]`** — what a run actually did: the tool trace, delivered files, the reply, and a flag when the reply claimed more than the trace shows. Also `GET /api/bots/:id/runs[/:runId]`.
+- **Kill switch** — `/bots stop all` halts every bot and holds queued work; `/bots start all` resumes. Also `POST /api/bots-stop-all` / `-start-all`.
+- **`/bots dlq clear [id]`** — drop dead-lettered jobs (the journal keeps the runs). Also `DELETE /api/bots-dlq`.
+- **Onboarding budget presets** — `light` (1M/day), `standard` (the default, 5M), `heavy` (20M), a number, or `none`; the step also tells you where the bot's results will appear.
+- `GET /api/bots/:id/tasks` lists a lead's delegated tasks.
+
+### Fleets that coordinate (ADR-021)
+
+Wave 2 of the bots work: how a lead hands out work and gets it back, how a bot remembers, and how a fleet's standard job runs without a lead turn between every step.
+
+- **Typed tasks with fan-in.** `fleet_delegate` hands several tasks to the crew in one call — each with a goal and what "done" means — and the lead is woken **once** with a digest (status, outcome, delivered files, summary per task) when the batch completes or its deadline passes (default 120 min; stragglers report once each). `bot_send(task: true)` is now a batch of one. `fleet_tasks` lists and cancels; `fleet_status` shows open tasks. Tasks are durable (`tasks.json`) and deduplicated, so a replayed delegation turn never double-dispatches.
+- **Pipelines as data.** A lead's standard job in `bot.yaml` (`pipeline.stages`: name, bot, goal with `{{input}}` / `{{previous}}`, optional `final`). `fleet_pipeline` runs it: stages chain themselves, each handing its deliverable to the next, with no lead turn in between; the lead is woken at the end; a `final` stage's deliverable is promoted to the top of the fleet folder.
+- **Bots remember.** After a productive run, 0–3 durable facts (sources and their quality, decisions, where things are, what to avoid) are extracted into the bot's own memory (`memory.learn: false` disables). Every turn also starts with a digest of the last five runs from the journal and the bot's own working-state note (`bot_state`, ≤1500 chars, replaced not appended) — the legitimate version of the status files bots used to write.
+- **Cheaper crew.** `bots.fleets.crewProvider` routes crew bots without a provider of their own to a cheaper lane; leads keep the default.
+- `/bots tasks <leadId>` shows a lead's open and recent tasks from the TUI.
+
+### Bots that do work (ADR-020)
+
+An audit of eleven days of real fleets found bots spending 617M input tokens (a median turn of 750k, the largest 6.6M), failing 38% of runs, and mostly writing notes about earlier runs. This wave gives every bot turn a governor, every routine a gate, every run an outcome verdict, and every owner a folder they can find.
+
+- **Per-turn caps.** A turn stops at 300k tokens or 20 minutes (`autonomy.maxTokensPerTurn` / `maxTurnMinutes`). A cut-off is journaled as `turn_budget` / `turn_time` — terminal, no dead-letter, no "needs you", one notice a day.
+- **Context compaction.** Tool results older than the last 8 are stubbed on every step; any single result is capped at 24KB. Prompts stop growing with the number of steps.
+- **Budgets on by default.** Every bot has a daily cap (5M tokens unless `/bots budget` says otherwise; `none` = unlimited) and the fleet has one (`bots.fleetDailyTokenBudget`, 20M). You are warned at 80%.
+- **Routine gate.** A cron tick is skipped — never stacked — while the bot is busy or within 30 minutes of its last run (`schedules[].minIntervalMinutes`). Bot-created routines run at most every 30 minutes, at most 3 per bot; self-scheduled follow-ups are at least 10 minutes out.
+- **Outcome verdict.** The tool trace, not the reply, decides what a run did: `deliverable`, `action`, `delegated`, `message` or `none`. An unattended run that only wrote notes gets one nudge to deliver or admit it. A reply that claims delivery with no matching tool call is flagged. Three empty runs in a row pause the routine; `/bots start` resumes it.
+- **Shared-folder budget.** Writes to `_shared/` are limited per run (warn at 2 files / 32KB, refuse at 6 / 128KB). The private workspace is unlimited.
+- **Deliverables you can find.** Results go to `~/Documents/Mercury/<Bot name>/` (Windows: Documents; Termux: shared storage; `bots.deliverablesDir` overrides) — finals on top, crew work under `work/`, a README index, files named `YYYY-MM-DD <title>`. Shown at onboarding, in the roster, and in every "delivered" message. `/bots outputs [id]` lists them, `/bots folder <id>` opens the folder. The hidden `outputs/` zone is migrated once.
+- **Honest failures.** Network cuts ("terminated", socket closed, interrupted streams) and empty streams retry instead of dead-lettering; the provider's real error (an invalid key, a 429) reaches the journal instead of "No output generated".
+- **Journal v2.** Real turn start, steps, tool calls, peak prompt size, outcome and delivered paths per run, plus a compact transcript per run (last 50 kept). `/bots journal` shows them; `mercury bots doctor` flags bots whose unattended runs mostly produce nothing, paused routines, and write access to the whole home directory.
+- Bot file tools and shell commands now resolve relative paths inside the bot's workspace, never the daemon's working directory. The roster scan ignores profile copies in `sandbox/` and `outputs/`.
+
+### Ink 8
+
+Mercury's terminal renderer moves from a heavily patched ink 5.2.1 to ink 8.0.0, which now does most of that work itself.
+
+- **Requires Node.js 22 or newer.** Ink 7+ needs it, and Node 20 reached end of life in April 2026. On an older Node, Mercury now exits with a clear upgrade message instead of crashing at the first render.
+- **Smoother rendering** — incremental rendering rewrites only the changed part of each line, and every frame is painted atomically (synchronized output).
+- **Upstream fixes Mercury lacked** — CJK and emoji truncation, control characters stripped from rendered text, dropped keypresses when several keys arrive together, Backspace vs Delete, Windows stale frames, and many `<Static>` fixes.
+- **Smaller patch** — four Mercury hunks remain (Static `itemKey`, freeze gate, live-region guard, cursor anchor); the rest are upstream. See `docs/ink-patch.md` and ADR-019.
+- React 19.3.
+
+### Honest Mercury — the earlier 1.3.1 work (never published separately)
+
+The release where Mercury stops pretending. Chat answers instead of forcing tool rounds, "done" means a check actually passed, every channel shows the same evidence, and the terminal UI takes paste, Esc and IME like a real editor. Built from a full audit (`ROADMAP.md`); every change below is covered by tests, including a replay eval harness that drives the real agent loop.
+
+#### Conversation and feedback
+
+- **Chat is no longer forced through tool rounds** — the Mercury Code narration guard and verification gate ran in plain chat, so "make me a workout plan" could trigger up to ten tool-only rounds and end with "I couldn't get started". Both now run in execute mode only.
+- **Done means verified** — a build/test/typecheck counts as evidence only when it exits clean (timeouts and kills are failures) and runs after the last edit; otherwise the task pauses with "the last check didn't pass" instead of "Task complete". Streamed turns now reach this gate too (they reported no finish reason and skipped it).
+- **One feedback contract on every channel** (`TaskSurface`) — begin, done-with-evidence, pause and fail behave the same on CLI, web, Telegram, Discord, Slack and Signal. Verification notes and a trace id reach messaging channels; pause and failure banners are persistent messages, never truncated status-card notices.
+- **`/trace [id]`** — provider, tokens (incl. cached), steps, timing, verification and every tool call for a turn.
+- **`/new`** on every channel — fresh conversation, memory kept (#38).
+- **Telegram prompts** — timeouts say what they defaulted to, taps settle the card, keyboards are removed (#23).
+
+#### Context, memory and speed
+
+- **Context window v2** — history is budgeted by tokens and includes a compact per-turn tool trace, so the next turn knows what was read and written. Retrieved memory goes into a per-turn system block instead of fake dialogue.
+- **Prompt caching** — the stable system prompt carries an Anthropic cache marker and no longer changes every minute.
+- **Faster steps** — per-step channel edits no longer block the agent loop; niche tool schemas (Spotify) are left out of unrelated turns; the cloud memory pool is skipped when local recall is strong.
+- **Providers** — DeepSeek thinking for V4/reasoner models with reasoning passed back (#24); per-provider output ceilings; the configured default always leads (fallback is no longer sticky).
+- **Long builds** — `run_command` reports progress so a 10-minute build is not killed as a stalled provider, and stops its child when the turn is interrupted.
+- **Tool results** — read from the AI SDK v6 `output` field, so failing-loop detection works.
+
+#### Terminal UI
+
+- **Paste** — multi-line and bracketed paste; Shift+Enter inserts a newline.
+- **Esc interrupts a turn; Ctrl+C clears input**, double-tap to quit.
+- **Concurrent prompts queue** instead of overwriting each other.
+- **Smoother streaming** — fence-aligned tail rendering, one shared tick, async git header, correct repaint on resize; grapheme-aware cursor for emoji and CJK; history persists to `~/.mercury/history`.
+
+#### Platforms
+
+- **Windows** — service install via Task Scheduler XML with an HKCU Run fallback (#13); graceful stop and upgrade; wizard no longer exits silently on closed stdin (#64); update check over HTTPS.
+- **Termux** — detected on `android`; `mercury service install` writes a Termux:Boot script.
+- **Bots** — retried jobs can no longer run twice; a fleet lead's synthesis reaches its thread; "needs you" survives restarts.
+
+#### Engineering
+
+- **Agent split** — command handlers moved to `src/core/commands/`; one step handler instead of four copies; `agent.ts` from 8,362 to about 5,000 lines.
+- **Replay eval harness** (`npm run eval`) in CI.
+- **CI** — binary smoke tests per OS (built, run and discarded, never published), installer and script checks, Node 24, linux-arm64, ESLint ratchet (provisional baseline), vendored-Ink integrity check.
+
+
+#### Security
+
+- **Argv-lane auto-approval** (ADR-016) — auto-approved commands no longer go through a shell or `PATH`: they must tokenize to plain argv, use an allowlisted program with an allowed flag set, stay inside the workspace, and run via `execFile` on a binary resolved from pinned system directories with a minimal environment (#103). Everything else is shown to the user for approval. Some read-only one-liners (pipelines, `&&` chains) now prompt; see `SECURITY.md`.
+- **Reads are authorised against the real file** — symlink targets must be in scope, hard-linked files prompt, and `read_file` verifies the opened file is the one that was checked (#104).
+- **Git helpers run argv, not a shell string** — `git_status`, `git_log` and `git_diff` built a command string from a model-chosen `path` and ran it through `execSync` with no permission check. They now pass the path to `execFileSync('git', [...])` as a single argv element after `--` (or `-C <resolved>`), and refuse any path that fails the same read-scope check `read_file` uses. `git_push` rejects option-looking `remote`/`branch` values (`--receive-pack=…`, `--exec=…`) and also uses argv. Regression tests: `src/capabilities/git/git-helpers.test.ts`.
+- **Safe-read bypass fixes, now closed with regression tests** — the read-only auto-approval lane in Ask Me mode denies: `find` action flags (`-exec`/`-execdir`/`-ok`/`-okdir`/`-delete`, since 1.2.2; `-fprint`/`-fprintf`/`-files0-from` since 1.3.0 — #71, #77, #101, #110); shell redirection (`>`, `>>`, `2>`, `<`, `&>`, since 1.2.2 — #72, #82, #109); and shell expansion (`$VAR`, `${VAR}`, `$(…)`, backticks, `$'…'`, `~`, since 1.3.0 / PR #128 — #76, #80, #95). An explicit `find -exec` case was added to `src/capabilities/permissions.test.ts`.
+- **Sub-agent approval routing** — `delegate_task` workers no longer switch the shared permission manager into allow-all with a `/` write scope; their shell and filesystem calls go through the same Ask Me prompts as the parent (since 1.2.2 — #75, #99). `allowedTools` is enforced at runtime, not just in the prompt (since 1.3.0 — #74, #97, #98). In 1.3.1 sub-agents only see and stop their own descendants and get orchestration tools only when granted (#74), and each agent runs under its own immutable permission context, so a concurrent internal-channel turn can no longer widen a worker's approvals (#75/#99 residual).
+- **Symlink write canonicalisation** — `create_file`/`write_file`/`edit_file` check the resolved target of a symlink against the writable scopes, not only the lexical path (since 1.3.0 — #105).
+- **SSRF guard** — unchanged; see the 1.2.3 entry below (hardened in 1.3.0 by #121 and #124; response record in `docs/security/ssrf-108-response.md`).
+- **Disclosure process** — `SECURITY.md` added (private reporting, response targets, scope); issue-closure and advisory drafts in `docs/security/2026-10-backlog-closure.md`.
+
+#### Fixed
+
+- **SQLite in the standalone binaries and on toolchain-less installs** (ROADMAP P1.9, #96, ADR-018) — the binaries bundled better-sqlite3's JavaScript but never its native addon, so every SQLite probe failed inside them: Second Brain was silently disabled and bots/boards fell back to JSON. A shared driver (`src/utils/sqlite-driver.ts`) now selects **better-sqlite3 → bun:sqlite → node:sqlite → JSON**: binaries use Bun's embedded engine, Node ≥ 22.13 installs work without a compiler via `node:sqlite`, and the better-sqlite3 path is untouched. Second Brain, the bots queue, boards and the cloud pool-search cache all go through it; the pool cache now degrades to uncached instead of throwing when no engine loads. New `mercury doctor --storage` prints the active backend (with why the others were rejected), every database file, its size and row counts, and warns loudly when storage is JSON-only. `MERCURY_SQLITE_BACKEND=better-sqlite3|bun:sqlite|node:sqlite|json` forces a backend. Contract tests run the same assertions against every engine the process can load (`src/utils/sqlite-driver.test.ts`).
+- **Patched ink is bundled, not post-installed** (ROADMAP P2.4, ADR-017) — the TUI's ink fixes no longer depend on `postinstall`: `vendor/ink` (stock ink 5.2.1 + the patch set, regenerated by `scripts/vendor-ink.cjs`) is bundled into `dist`, so `--ignore-scripts` installs, Termux and the standalone binaries all run the patched renderer. `mercury doctor` reports "Ink TUI patch: vendored". Hunk-by-hunk rationale: `docs/ink-patch.md`.
+- **IME input lands on the input line** (#41, #66) — the real terminal cursor is now parked on the input's cursor cell after every frame, so preedit text and candidate windows appear where you type, and terminals that suppress IME while the cursor is hidden compose again. It is hidden while a prompt or a non-input pane has focus. `MERCURY_HW_CURSOR=0` opts out.
+- **Narrow terminals** (P2.8) — widths derive from the terminal's columns: below 60 columns the splash and side panels collapse, and the input header, hints and Mercury Code hint table truncate instead of wrapping into extra live-region rows.
+
+## 1.3.0 — Mercury Bots
+
+Persistent, persona-scoped agents that run **outside your conversation** — each with its own persona, workspace, skills, permissions, and durable queue. Onboard specialists, chain them into multi-level fleets, and let them work 24/7 while you keep talking to Mercury.
+
+### New
+
+- **Persistent bot runtime (P0)** — Bots are long-lived agents with a persistent persona (`bot.yaml` + `permissions.yaml`), their own private sandbox at `~/.mercury/bots/<id>/`, and journals that survive restarts. A wake turns them on; they work through a durable job queue; results land **in the bot's own thread** — never dumped back into the session that dispatched work.
+- **Durable queue + HTTP API (P1)** — Jobs survive restarts and lease-expire when a worker dies (`timed out` classification, non-destructive DLQ replay via `/bots replay`). Fleet health is one command away: `mercury bots doctor` (exit 1 = actionable), `mercury bots list`, `mercury bots storage`. Telegram `/pair`-style ingress: every bot reachable through the channel you already use.
+- **Fleets — lead bots + crews** — Promote a bot to **fleet lead**; it recruits and organizes its own crew (imperative self-organization). Multi-level hierarchies supported. Crew results bubble up through the lead. Fleet onboarding walks tiers: **solo → lead auto-build → lead manual**.
+- **Web cockpit — Mercury Bots section** — The local web dashboard gained a fleet section: roster with live states, per-bot threads, needs-you escalation badges, and a fleet step view that mirrors the TUI.
+- **Persona system** — Two-pass persona builder keeps big personas big; hand-edited `bot.yaml`/`permissions.yaml` apply live. Persona file declares access scopes (read/write/execute per directory), so each bot gets exactly the surface it needs — no more.
+- **Sandbox + `bot_deliver`** — Every bot gets an isolated workspace; final artifacts go out through `bot_deliver`. Sandbox retention janitor caps per-bot disk usage; fleet-shared folder at `~/.mercury/bots/_shared` for cross-bot files with implicit grants.
+- **Bundles** — `/bots export` produces a shareable bundle (manifests + personas + permissions + skills; a lead's bundle carries its whole crew, whole-fleet export supported). `/bots import` recreates them — imported bots start disabled by design. Sandbox, journals, and `.env` never travel.
+- **Bot-facing tools** — `dispatch_bot`, `bot_schedule` (bots schedule their own future runs), `bot_deliver` (finalize artifacts), `fleet_status`, `journal_append`. Skill access for bots: native skill library + per-bot skill libraries with auto-synthesis.
+- **Lifecycle + observability** — Full create/edit/budget/delete lifecycle, stop/start/run with held-queue semantics (stop holds, never kills), needs-you alerts to your active channel, journal hydration restores per-bot threads on open, live activity bus feeds the roster and cockpit, per-bot token budgets, mtime-cached manifests, tail-read journals, `mercury bots storage` for disk usage.
+- **Permission tiers at onboarding** — Bots get `ask` / `allow` tiers per capability, set explicitly — nothing defaults silently. Per-bot shell allow-lists flow from `permissions.yaml autoApproveCommands`; malformed scope entries skip + warn, never crash turns.
+
+### Fixed
+
+- Fleet duplication on reopen; `/bots` stays inside the bot thread it opened.
+- Bot thinking streams into its thread live; fleet speed fixes (single-provider lease wait, batched roster fetches).
+- Web fleet step mirrors the TUI step view exactly (solo / auto-build / manual tiers).
+- Results no longer sliced at 800 chars in bot threads; delivery-contract gaps closed with durable retries + durable mailboxes.
+- Windows hardening: queue teardown EBUSY on SQLite backend, EBUSY on heartbeat test backends, EINVAL on retention backdating, separator-agnostic traversal guard; post-close queue ops degrade to no-ops, not crashes.
+- JSON backend lease-expiry race closed; SQLite queue handle released on teardown; doctor closes its queue.
+- Telegram member installs blocked `install_skill` — tool surfaced only where it's safe.
+- `mercury bots doctor` scheduler linkage: routines registered in schedules but missing from `bot.yaml` are flagged before they silently never fire.
+
+### Internal
+
+- New `src/bots/` module: `store.ts`, `queue.ts` (SQLite + JSON backends), `bot-manager.ts`, `bot-turn.ts`, `journal.ts`, `bundle.ts`, `doctor.ts`, `persona-template.ts`, `fleet-*`, `skill-synthesis.ts`, `retention.ts`, `tools/` (`dispatch-bot`, `bot_schedule`, `bot_deliver`, `fleet_status`, `journal_append`).
+- `mercury bots` — new CLI command group (`doctor` / `list` / `storage`) mirroring the in-chat `/bots` surface.
+- PRs #131–#139 + PR #117's RevShare integration carry this release.
+
+### Migration from 1.2.7
+
+No breaking changes. Bots are **opt-in** — onboard your first bot with `/bots create <id> "Name" "Description"`; the doctor and fleet surface appear as soon as you have a fleet. Existing config, memory, and channels are untouched.
+
+## 1.2.7 — Polished Mercury
+
+UX-polish on the Mercury Code surface: every command in autocomplete, honest completion stats, and status verbs that describe what's happening without an extra model call.
+
+### New
+
+- **50/50 RevShare Integration: Mercury & AIML API** (#117) — revenue-share program integration.
+- **Dynamic status verbs** (#119) — one LLM call per session generates live status verbs ("Compiling", "Sweeping"), chat stays static.
+- **"Did you know?" tips** (#120) — surface-categorized, rare, system-voice tips about features you haven't used.
+
+### Fixed
+
+- Step narrations render as separate blocks in the live tail; the `│` rule stays on settled messages, only the live tail drops it.
+- Slash autocomplete + `/help` cover every recent command, on every surface.
+- File-change stats in the completion banner are smart-conditional (no noise for prose-only turns).
+- CLI uninstall discovery works on machines with no real install.
+
+## 1.2.6 — Command Surface Fixes
+
+Hotfix on 1.2.5: slash autocomplete and `/help` now list every recent command on every surface; the live tail renders step narrations as separate blocks with the `│` rule behavior corrected.
+
+## 1.2.5 — Restore & Republish
+
+Recovery release: restores the Release/1.23 work dropped by a bad merge (40f5aea), rebuilds Pages output without merge-conflict markers, and re-publishes the 1.2.4 line cleanly.
+
+## 1.2.4 — Landing & Cards
+
+Website/branding release: richer per-page OG social-card generator with sections and breadcrumbs, inline SVG icons replace emojis on the landing page, and the v1.2.3 release page fix ships in the built docs bundle.
+
+## 1.2.3 — Unstoppable Mercury
+
+The release where **Mercury Code stops dying and starts telling the truth.** The completion pipeline was rebuilt around a completion contract: every task ends in a verdict — verified completion, or an honest pause that names its blocker and resumes. Tasks can no longer fake success, die silently, or loop forever.
+
+### New
+
+- **Completion contract** — Every task end is classified (`completion-verdict.ts`): budget exhaustion is a *pause*, never a fake "Task complete". Evidence-gated completion: implementation tasks must run a build/test/typecheck before claiming done. Honest banners: "Response delivered · no file changes" when git shows nothing, "Task paused · send continue" when resumable.
+- **AUTO mode** — Mercury Code's new default: plan and build in one flow, one `ask_user` confirmation only for large changes. No more manual plan/execute switching.
+- **Live plan checklist** — the `update_plan` tool maintains a visible checklist in Mercury Code (pending / ▶ active / ☑ done), so you always see which step is being implemented.
+- **Escalation harness for narration-locked models** — the agent mechanically forces action: harness grounding (deterministic directory listing), provider-enforced `toolChoice: 'required'` on mutating-tools-only steps, provider rotation per guard round, and a wake-up call (doubled bound, blunt directive) before any pause.
+- **Compact-on-pressure** — OpenCode practice adopted: memory pressure now compacts the conversation in place and continues; abort only if pressure persists.
+- **No Mercury-imposed output size limit** — the model's native limit governs (32,768 ceiling); providers that reject it get an adaptive halving. Big single-file writes land in one call.
+- **Write-truncation recovery** — severed file writes get sectioned-write guidance (create first ~80 lines, then `edit_file` appends) with full-budget resume rounds.
+- **Stall watchdog** — 3 min silence → visible pulse; 8 min → abort into resume machinery. `MERCURY_STALL_SOFT_MS` / `MERCURY_STALL_HARD_MS`.
+- **Automatic continuation** — step budgets and provider failures continue automatically (6 fresh budgets, provider hard-deadline counts as one attempt); the manual "continue" gate is a backstop, not a checkpoint.
+- **Interactive choice picker in Mercury Code** — `ask_user` prompts now render in the full-screen TUI (previously invisible → hang) and own the keyboard; Esc cancels safely.
+- **Live thinking preview** — model reasoning streams as a quoted preview in the TUI instead of 52 seconds of dead air.
+- **Trackpad/wheel scrolling in Mercury Code** — full-screen transcripts scroll with the wheel via a filtered stdin proxy (mouse sequences never leak into input).
+- **Change summary at completion** — per-file +/− stats and verification evidence ("✓ Verified: npm test ✓") in the completion banner.
+- **File-change previews** — bounded, syntax-highlighted excerpts of every created/edited file in the transcript.
+- **`/code chat`** — instant exit from Mercury Code to regular chat; `/chat` teardown fixed.
+
+### Security
+
+- **SSRF guard** — `fetch_url` and `install_skill` validate scheme + private ranges (DNS-resolved) on every redirect hop; 512 KB caps. `MERCURY_ALLOW_PRIVATE_FETCH=1` opt-out.
+- **Credential file hardening** — `web-config.json` / `web-sessions.json` written 0600 and repaired on load.
+- **Random initial web password** — no more hardcoded default from a public repo.
+- **Secret redaction** — API keys masked in logs (pino error serializer) and command output echoes.
+- **Shell blocklist** — swapped-flag `rm -fr` variants added to the never-execute tier.
+
+### Fixed
+
+- Yoga WASM "memory access out of bounds" crashes (ink patched: freed-node hygiene + `<Static>` identity dedup) and the duplicate-message render loop.
+- Scroll repair after long-session trims (`/mc scroll-set` was dead code — parsed as a NaN delta).
+- Prose questions no longer fight the guard; AUTO-mode banner gating; `not-a-git-repo` false "no file changes" claim.
+- Mercury Cloud recovery error now says "run `mercury cloud connect`" instead of an opaque 401 loop.
+- Chat-mode thinking indicator surfaces live provider/phase activity.
+
+
+## 1.1.13 — Chatty Mercury
+
+Mercury gets chatty. Three new channels — Discord, Slack, and Signal — bring Mercury to where you already are, with end-to-end encryption, organization access models, and real-time streaming. Plus long-running loop fixes, CLI heartbeat improvements, and crash recovery.
+
+### New
+
+- **Discord channel** — Full bot integration with slash commands, streaming responses, rich embeds, organization access with admin roles and pairing codes, DM + channel support, and rate limiting. Config: `DISCORD_ENABLED`, `DISCORD_BOT_TOKEN`, `DISCORD_GUILD_ID`, `DISCORD_CHANNEL_ID`, `DISCORD_ADMIN_ROLE_NAME`, `DISCORD_STREAMING`.
+- **Slack channel** — Socket Mode bot (no public endpoint needed) with slash commands, streaming edits, organization access with admin/member roles, channel + DM support, and @mention awareness. Config: `SLACK_ENABLED`, `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN`, `SLACK_CHANNEL_ID`, `SLACK_TEAM_ID`, `SLACK_STREAMING`.
+- **Signal channel** — End-to-end encrypted via `signal-cli` bridge. Group mode (named "Mercury" group) and private DM mode. Auto-managed `signal-cli` binary (download, register, start, health-check). Pairing-code access control. Phone number redaction in CLI output. Linux (x64/ARM64) native binaries available; macOS requires Java 17+; Windows not supported. Config: `SIGNAL_ENABLED`, `SIGNAL_PHONE_NUMBER`, `SIGNAL_MODE`, `SIGNAL_GROUP_ID`, `SIGNAL_GROUP_NAME`.
+- **Crash recovery** — New crash flag system (`~/.mercury/.crash-flag`) writes a JSON file on ungraceful exit. On next startup, Mercury reads the flag, reports what happened, and deletes it. The watchdog also writes a crash flag on max-restart exceeded, with a synchronous stderr write as last-gasp logging.
+
+### Fixed
+
+- **CLI heartbeat updates in place** — The CLI now updates the same message instead of stacking new "⏳ Working..." messages during long-running tasks. Other channels (Telegram, Discord, Slack, Signal) continue sending separate heartbeat messages.
+- **All 12 silent task failure paths eliminated** — Every loop condition, tool limit, and stall now sends an explicit error message to the channel. No more silent disappearances mid-task.
+- **Step log collapse** — Active step logs show at most 3 visible steps (running + last 2 completed). Full history available via Ctrl+D or `/log`. Idle shows compact summary line.
+- **ThinkingIndicator shows "Processing"** — Replaces agent name with a neutral label; long operations show `/bg current` hint.
+- **Ollama Local routed through OpenAI compat** — `ollamaLocal` now uses `OpenAICompatProvider` with `useChatApi: true`, bypassing the `ollama-ai-provider` v1 specification incompatibility with AI SDK v6.
+- **Daemon graceful shutdown** — `stopDaemon` is now async: sends SIGTERM, waits up to 5 seconds, escalates to SIGKILL. Stale `signal-cli` processes are cleaned up on stop.
+- **Channel send errors logged** — All `.catch(() => {})` on channel sends replaced with `.catch((e) => logger.warn({ e }, 'channel send failed'))`.
+
+### Internal
+
+- New `src/signal/` module: `binary.ts` (download/verify signal-cli), `jsonrpc.ts` (JSON-RPC client), `process.ts` (lifecycle), `setup.ts` (registration flow).
+- New `src/core/crash-flag.ts` — crash flag read/write/clear.
+- `src/types/channel.ts` — new types for Signal, Discord, Slack access models.
+- `src/utils/config.ts` — config sections, access functions, and legacy migrations for all three new channels.
+- `src/channels/registry.ts` — notification priority: Signal → Telegram → Discord → Slack → CLI.
+- `package.json` — new dependencies: `discord.js` v14, `@slack/bolt` v4.
+
+### Migration from 1.1.12
+
+No breaking changes. All new channels are **off by default** — enable via `mercury doctor` or environment variables. Existing configs, providers, threads, kanban boards, and Second Brain data carry over unchanged.
+
+## 1.1.12 — Daemon fix for standalone binaries
+
+Hotfix on top of 1.1.11. The standalone single-file binaries shipped in 1.1.11 could not start in the background — which also meant Telegram never came online when Mercury was installed via the one-line installer (the recommended path for servers).
+
+### Fixed
+
+- **Daemon now starts correctly from standalone binaries** — `src/cli/daemon.ts` used to spawn the daemon as `[process.execPath, process.argv[1], 'start', '--daemon']`. For npm installs that became `node dist/index.js start --daemon` and worked. For `bun --compile` standalone binaries, `process.execPath` is the Mercury binary itself and `process.argv[1]` is a bun-virtual `$bunfs/...` path, so the spawn became `mercury "$bunfs/..." start --daemon` — Commander treated the bunfs path as an unknown subcommand, the child died immediately, and `channels.startAll()` (the only place Telegram is started in daemon mode) was never reached.
+- **`mercury service install` no longer persists broken commands** — the LaunchAgent plist, systemd unit, and Windows Task Scheduler entry now contain the binary-only invocation (no script path) when running from a standalone binary, so auto-start on boot works end-to-end.
+- **Telegram now comes online in background mode for standalone-binary users** — direct consequence of the daemon fix.
+
+### Internal
+
+- New `isStandaloneBinary()` / `buildDaemonSpawnArgs()` helpers in `src/cli/daemon.ts` plus `getServiceLaunchArgs()` in `src/cli/service.ts`, wired through every OS installer. Detection uses `process.versions.bun`, `$bunfs` / `~BUN` markers in `argv[1]`, and the `execPath` basename — so `node`, `bun <script>`, and standalone `mercury` invocations all do the right thing.
+
+### Migration from 1.1.11
+
+No changes required. After upgrading, run `mercury restart` (or `mercury service uninstall && mercury service install` if you had the service installed under 1.1.11 with the broken command persisted).
+
+## 1.1.11 — Token Saver Mode, Skills System & Standalone Binaries
+
+The biggest release since the 1.1.x line started. Adds a full **Skill System**, a **Token Saver Mode** for cheaper sessions, **standalone binaries** for users who don't want npm, and a redesigned bottom status bar with per-step spinners.
+
+### New
+
+- **Token Saver Mode + bottom status bar overhaul + per-step spinners** (#69) — opt-in mode that aggressively trims context, plus a new persistent status bar at the bottom of the TUI showing provider/model/token usage live, with per-step spinners replacing the single global one.
+- **Skill System** (#67) — Mercury can now load and route to user-defined skills. Skills are markdown-defined behaviors that get injected on demand based on keyword/semantic match.
+- **Screenshot skill** — full website capture with viewport sizing and dark/light mode toggle.
+- **Standalone binaries + one-line installers** (#61) — `mercury` now ships as a single executable for macOS (arm64/x64), Linux (x64/arm64), and Windows (x64). No Node install required. Per-OS docs and a hero install widget on the website.
+- **Domain migration** — `mercury.cosmicstack.org` → `mercuryagent.sh`.
+- **Chinese translations** for README, ARCHITECTURE, and CHANGELOG (#53).
+
+### Fixed
+
+- **Skill ambiguity prompt** (#68) — no more 10-skill fan-out on weak matches; users get a numbered picker when the router is uncertain.
+- **Spurious ambiguity prompts on weak keyword overlap** — the matcher used to trigger the picker on incidental word overlap; now requires real signal.
+- **Release asset names aligned with published binaries** (#63) — fixes installer scripts that were pointing at the wrong filenames.
+- **Per-segment shell pattern checks** (#48) — the shell permission guard now validates each shell segment independently instead of trusting a single combined check.
+
+### Maintenance
+
+- **Removed `anonymous-file-uploader` skill** — no longer needed.
+- **`pino` upgraded** 9.14.0 → ^10.3.1 (#51).
+- Spinner polish and docs updates throughout.
+
+### Migration from 1.1.9
+
+No breaking changes. Skill system is opt-in (drop markdown files in `~/.mercury/skills/`). Token Saver Mode is off by default — enable it from the session menu or via config. Standalone binaries are an alternative install path; `npm i -g @cosmicstack/mercury-agent` keeps working exactly as before.
+
+> Note: `1.1.10` was skipped to keep numbering aligned across publish channels.
+
 ## 1.1.5 — Smoother Onboarding
 
 ### Fixed: Onboarding no longer blocks users without Ollama

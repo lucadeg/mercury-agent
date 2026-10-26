@@ -6,6 +6,12 @@ function maskApiKey(key: string): string {
   return key.slice(0, 4) + '••••' + key.slice(-4);
 }
 
+/**
+ * Surfaced as a badge in the UI. One name rather than a list, so the claim
+ * stays reviewable and reverting it is a one-line change.
+ */
+const RECOMMENDED_PROVIDER = 'aimlapi';
+
 const providers = new Hono();
 
 providers.get('/api/providers', (c) => {
@@ -17,6 +23,7 @@ providers.get('/api/providers', (c) => {
     baseUrl: p.baseUrl,
     model: p.model,
     enabled: p.enabled,
+    recommended: name === RECOMMENDED_PROVIDER,
   }));
   return c.json(list);
 });
@@ -26,7 +33,7 @@ providers.post('/api/providers/:name', async (c) => {
   const body = await c.req.json();
   const config = loadConfig();
 
-  const validNames: ProviderName[] = ['openai', 'anthropic', 'deepseek', 'grok', 'ollamaCloud', 'ollamaLocal'];
+  const validNames: ProviderName[] = ['aimlapi', 'mercuryCloud', 'openai', 'anthropic', 'deepseek', 'grok', 'atlascloud', 'ollamaCloud', 'ollamaLocal', 'atomicChat', 'openaiCompat', 'litellm', 'lmStudio', 'mimo', 'mimoTokenPlan'];
   if (!validNames.includes(providerName)) {
     return c.json({ error: 'Unknown provider' }, 400);
   }
@@ -38,7 +45,8 @@ providers.post('/api/providers/:name', async (c) => {
   if (body.enabled !== undefined) p.enabled = body.enabled;
 
   saveConfig(config);
-  return c.json({ success: true });
+  // Keys and models are read at boot — the save is durable, not live.
+  return c.json({ success: true, restartRequired: true });
 });
 
 providers.post('/api/providers/:name/test', async (c) => {
@@ -46,8 +54,17 @@ providers.post('/api/providers/:name/test', async (c) => {
   const config = loadConfig();
   const p = config.providers[providerName];
 
-  if (!p || !p.apiKey) {
+  if (!p) {
+    return c.json({ error: 'Provider not found' }, 400);
+  }
+
+  // LiteLLM proxies, local Ollama, LM Studio, and Atomic Chat are keyless - only require baseUrl
+  const needsKey = providerName !== 'litellm' && providerName !== 'ollamaLocal' && providerName !== 'lmStudio' && providerName !== 'atomicChat';
+  if (needsKey && !p.apiKey) {
     return c.json({ error: 'No API key configured' }, 400);
+  }
+  if (!needsKey && !p.baseUrl) {
+    return c.json({ error: 'No base URL configured' }, 400);
   }
 
   try {

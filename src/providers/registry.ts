@@ -3,17 +3,30 @@ import { isProviderConfigured } from '../utils/config.js';
 import type { BaseProvider } from './base.js';
 import { logger } from '../utils/logger.js';
 
-async function createProvider(pc: ProviderConfig): Promise<BaseProvider> {
-  if (pc.name === 'anthropic') {
+export async function createProvider(pc: ProviderConfig, tokenStore?: import('../cloud/token-store.js').CloudTokenStore | null): Promise<BaseProvider> {
+  if (pc.name === 'mercuryCloud') {
+    const { MercuryCloudProvider } = await import('./mercury-cloud.js');
+    return new MercuryCloudProvider(pc, tokenStore ?? null);
+  } else if (pc.name === 'anthropic') {
     const { AnthropicProvider } = await import('./anthropic.js');
     return new AnthropicProvider(pc);
   } else if (pc.name === 'deepseek') {
     const { DeepSeekProvider } = await import('./deepseek.js');
     return new DeepSeekProvider(pc);
-  } else if (pc.name === 'ollamaLocal') {
-    const { OllamaProvider } = await import('./ollama.js');
-    return new OllamaProvider(pc);
-  } else if (pc.name === 'ollamaCloud' || pc.name === 'openaiCompat') {
+  } else if (pc.name === 'ollamaLocal' || pc.name === 'atomicChat') {
+    // Route through OpenAI-compatible provider — local Ollama exposes
+    // /v1/chat/completions since v0.1.14. The ollama-ai-provider package
+    // declares specificationVersion = "v1" which is incompatible with
+    // AI SDK v6 (requires v2/v3). Using the OpenAI compat path avoids
+    // this entirely.
+    const { OpenAICompatProvider } = await import('./openai-compat.js');
+    return new OpenAICompatProvider(pc, { useChatApi: true });
+  } else if (pc.name === 'aimlapi') {
+    // OpenAI-compatible gateway. Chat Completions rather than Responses: the
+    // catalogue is mostly third-party models reached through that surface.
+    const { OpenAICompatProvider } = await import('./openai-compat.js');
+    return new OpenAICompatProvider(pc, { useChatApi: true });
+  } else if (pc.name === 'atlascloud' || pc.name === 'ollamaCloud' || pc.name === 'openaiCompat' || pc.name === 'litellm' || pc.name === 'lmStudio') {
     const { OpenAICompatProvider } = await import('./openai-compat.js');
     return new OpenAICompatProvider(pc, { useChatApi: true });
   } else if (pc.name === 'mimo' || pc.name === 'mimoTokenPlan') {
@@ -35,33 +48,49 @@ export class ProviderRegistry {
   private providers: Map<string, BaseProvider> = new Map();
   private defaultName: string;
   private lastSuccessful: string | null = null;
+  /** Providers that answered 401 this process: a wrong key does not fix itself between turns. */
+  private authFailed?: Set<string>;
+  private warnedUnusableDefault = false;
+  private get rejected(): Set<string> { return (this.authFailed ??= new Set<string>()); }
 
   private constructor(defaultName: string) {
     this.defaultName = defaultName;
   }
 
-  static async create(config: MercuryConfig): Promise<ProviderRegistry> {
+  static async create(config: MercuryConfig, tokenStore?: import('../cloud/token-store.js').CloudTokenStore | null): Promise<ProviderRegistry> {
     const registry = new ProviderRegistry(config.providers.default);
 
     const entries: ProviderConfig[] = [
+      {
+        ...config.providers.mercuryCloud,
+        apiKey: config.providers.mercuryCloud.apiKey || config.cloud.jwt,
+        baseUrl: config.cloud.apiUrl || config.providers.mercuryCloud.baseUrl,
+      },
+      // Registered after mercuryCloud on purpose. This array is the fallback
+      // order, and moving a first-party hosted provider off the front of it is
+      // a behaviour change for existing installs rather than a listing choice.
+      config.providers.aimlapi,
       config.providers.deepseek,
       config.providers.openai,
       config.providers.anthropic,
       config.providers.grok,
+      config.providers.atlascloud,
       config.providers.ollamaCloud,
       config.providers.ollamaLocal,
+      config.providers.atomicChat,
       config.providers.openaiCompat,
       config.providers.mimo,
       config.providers.mimoTokenPlan,
       config.providers.chatgptWeb,
       config.providers.githubCopilot,
+      config.providers.litellm,
     ];
 
     // Load only configured providers in parallel
     const configured = entries.filter(pc => isProviderConfigured(pc));
     const results = await Promise.allSettled(
       configured.map(async (pc) => {
-        const provider = await createProvider(pc);
+        const provider = await createProvider(pc, pc.name === 'mercuryCloud' ? tokenStore : undefined);
         return { name: pc.name, model: pc.model, provider };
       })
     );
@@ -84,35 +113,106 @@ export class ProviderRegistry {
     return this.providers.get(key);
   }
 
-  getDefault(): BaseProvider {
-    if (this.lastSuccessful) {
-      const provider = this.providers.get(this.lastSuccessful);
-      if (provider) return provider;
-    }
-
-    const provider = this.providers.get(this.defaultName);
-    if (!provider) {
-      const first = this.providers.values().next().value;
-      if (!first) throw new Error('No LLM providers available — configure API keys');
-      return first;
-    }
-    return provider;
+  set(name: string, provider: BaseProvider): void {
+    const existing = this.providers.get(name) as (BaseProvider & { destroy?: () => void }) | undefined;
+    existing?.destroy?.();
+    this.providers.set(name, provider);
   }
 
-  getFallbackIterator(): IterableIterator<BaseProvider> {
+  setDefault(name: string): void {
+    if (!this.providers.has(name)) throw new Error(`Provider is not registered: ${name}`);
+    this.defaultName = name;
+    this.lastSuccessful = null;
+  }
+
+  updateApiKey(name: string, apiKey: string): void {
+    const provider = this.providers.get(name) as (BaseProvider & { updateToken?: (token: string) => void }) | undefined;
+    provider?.updateToken?.(apiKey);
+    this.rejected.delete(name);
+  }
+
+  /** The provider rejected its key (401). It is skipped for defaults, fallbacks and bots until the key changes. */
+  markAuthFailure(name: string): void {
+    if (this.rejected.has(name)) return;
+    this.rejected.add(name);
+    logger.warn({ provider: name }, 'Provider rejected its API key — skipping it until the key is updated (mercury doctor)');
+  }
+
+  /** Registered, has credentials, and has not been rejected for them. */
+  isUsable(name: string): boolean {
+    const provider = this.providers.get(name);
+    // Test doubles may omit isAvailable; a registered provider without the
+    // method is treated as available.
+    const available = typeof provider?.isAvailable === "function" ? provider.isAvailable() : !!provider;
+    return !!provider && available && !this.rejected.has(name);
+  }
+
+  getUsable(name: string | undefined): BaseProvider | undefined {
+    return name && this.isUsable(name) ? this.providers.get(name) : undefined;
+  }
+
+  getDefault(): BaseProvider {
+    // The configured default always leads. markSuccess used to make the
+    // last provider that happened to work sticky, so a single transient
+    // failure silently moved every following turn — often to a weaker
+    // model — until restart. The fallback chain still handles outages per
+    // turn; lastSuccessful is kept for diagnostics only.
+    //
+    // "Leads" means: when it can actually answer. A default with no key, or
+    // one whose key was rejected, hands over to the first usable provider —
+    // a bot created from a phone must never fail every turn because the
+    // configured default has a typo in its key.
+    const provider = this.providers.get(this.defaultName);
+    if (provider && this.isUsable(this.defaultName)) return provider;
+    const usable = [...this.providers.entries()].find(([name]) => this.isUsable(name))?.[1];
+    if (usable) {
+      if (!this.warnedUnusableDefault) {
+        this.warnedUnusableDefault = true;
+        logger.warn({ default: this.defaultName, using: usable.name }, 'Default provider is not usable (no key, or key rejected) — using the first usable provider');
+      }
+      return usable;
+    }
+    if (provider) return provider;
+    const first = this.providers.values().next().value;
+    if (!first) throw new Error('No LLM providers available — configure API keys');
+    return first;
+  }
+
+  getFallbackIterator(preferredName?: string): IterableIterator<BaseProvider> {
     const ordered: BaseProvider[] = [];
-    const defaultProvider = this.getDefault();
+    const preferredProvider = preferredName ? this.providers.get(preferredName) : undefined;
+    const defaultProvider = preferredProvider || this.getDefault();
     ordered.push(defaultProvider);
-    for (const [, provider] of this.providers) {
-      if (provider !== defaultProvider) {
-        ordered.push(provider);
+    const rest: BaseProvider[] = [];
+    for (const [name, provider] of this.providers) {
+      if (provider !== defaultProvider && !this.rejected.has(name)) {
+        rest.push(provider);
       }
     }
+    // Respect the user's chosen default: Mercury Cloud is the vendor-hosted
+    // safety net, not the first hijacker. Registration order puts it first in
+    // the map, so any failed attempt on a BYOK default used to promote
+    // Mercury Cloud immediately — and markSuccess then stuck to it for every
+    // following turn, silently overriding the configured default. When the
+    // user's default is NOT Mercury Cloud, it goes LAST in the fallback chain.
+    if (defaultProvider.name !== 'mercuryCloud') {
+      const cloudIndex = rest.findIndex((p) => p.name === 'mercuryCloud');
+      if (cloudIndex >= 0) {
+        const [cloud] = rest.splice(cloudIndex, 1);
+        rest.push(cloud);
+      }
+    }
+    ordered.push(...rest);
     return ordered[Symbol.iterator]();
   }
 
   markSuccess(name: string): void {
     this.lastSuccessful = name;
+  }
+
+  /** Name of the provider that completed the most recent turn, if any. */
+  getLastSuccessful(): string | null {
+    return this.lastSuccessful;
   }
 
   listAvailable(): string[] {
@@ -121,5 +221,12 @@ export class ProviderRegistry {
 
   hasProviders(): boolean {
     return this.providers.size > 0;
+  }
+
+  destroy(): void {
+    for (const provider of this.providers.values()) {
+      (provider as BaseProvider & { destroy?: () => void }).destroy?.();
+    }
+    this.providers.clear();
   }
 }

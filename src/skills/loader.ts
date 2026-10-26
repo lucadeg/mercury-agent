@@ -1,11 +1,24 @@
 import { existsSync, readFileSync, readdirSync, mkdirSync, writeFileSync, rmSync, unlinkSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, resolve, sep } from 'node:path';
 import { parse as parseYaml } from 'yaml';
 import { getMercuryHome } from '../utils/config.js';
 import type { SkillDiscovery, Skill, SkillMeta } from './types.js';
+import { recordSelfMadeUse, SELF_MADE_CATEGORY, SELF_MADE_LABEL } from './self-made.js';
 import { IntentRouter } from './intent-router.js';
 import { logger } from '../utils/logger.js';
-import { DEFAULT_SKILL_SEEDS, getCategoryLabel } from './default-skills.js';
+import { DEFAULT_SKILL_SEEDS, PREVIOUS_SEED_CONTENTS, getCategoryLabel } from './default-skills.js';
+
+/**
+ * The web-search skill dir holds a skill that tells the model to fetch a
+ * search engine's HTML results page and never mentions the web_search tool.
+ * Those pages answer automated requests with a bot challenge, so such a
+ * skill only ever returns nothing.
+ */
+export function isBrokenSearchSkill(dirName: string, content: string): boolean {
+  if (dirName !== 'web-search') return false;
+  if (/\bweb_search\b/.test(content)) return false;
+  return /(html|lite)\.duckduckgo\.com|duckduckgo\.com\/html|google\.[a-z.]+\/search\?|bing\.com\/search\?q=/i.test(content);
+}
 
 const SKILL_FILE = 'SKILL.md';
 const DISABLED_FILE = '.disabled';
@@ -30,12 +43,17 @@ function parseSkillMd(content: string): { meta: SkillMeta; instructions: string 
 
 export class SkillLoader {
   private skillsDir: string;
+  /** Additional read-only skill roots (e.g. a bot's own skills dir). Own-dir entries load after the primary dir, so they win on name collision. */
+  private extraDirs: string[];
+  private seedDefaults: boolean;
   private discovered: Map<string, SkillDiscovery> = new Map();
   private loaded: Map<string, Skill> = new Map();
   readonly intentRouter: IntentRouter;
 
-  constructor(skillsDir?: string) {
+  constructor(skillsDir?: string, options?: { extraDirs?: string[]; seedDefaults?: boolean }) {
     this.skillsDir = skillsDir || join(getMercuryHome(), 'skills');
+    this.extraDirs = options?.extraDirs ?? [];
+    this.seedDefaults = options?.seedDefaults !== false;
     this.intentRouter = new IntentRouter();
   }
 
@@ -43,19 +61,22 @@ export class SkillLoader {
     this.discovered.clear();
     this.loaded.clear();
     if (!existsSync(this.skillsDir)) {
+      if (!this.seedDefaults) return [];
       mkdirSync(this.skillsDir, { recursive: true });
       this.seedTemplate();
     }
 
-    this.ensureDefaultSkills();
+    if (this.seedDefaults) {
+      this.ensureDefaultSkills();
+    }
 
-    const entries = readdirSync(this.skillsDir, { withFileTypes: true });
-    for (const entry of entries) {
-      if (!entry.isDirectory() || entry.name.startsWith('_')) continue;
-      const skillDir = join(this.skillsDir, entry.name);
-      if (existsSync(join(skillDir, DISABLED_FILE))) continue;
-      const skillPath = join(this.skillsDir, entry.name, SKILL_FILE);
-      if (!existsSync(skillPath)) continue;
+    // Walk both layouts:
+    //   - flat:   <skillsDir>/<name>/SKILL.md            (legacy + user-authored)
+    //   - nested: <skillsDir>/<category>/<slug>/SKILL.md (mercury skills install)
+    // User-installed nested skills win over flat ones on name collision (registered last).
+    const skillPaths = this.findSkillFiles();
+    const parsedSkills: Array<{ meta: SkillMeta; path: string }> = [];
+    for (const skillPath of skillPaths) {
       try {
         const raw = readFileSync(skillPath, 'utf-8');
         const parsed = parseSkillMd(raw);
@@ -64,16 +85,20 @@ export class SkillLoader {
           name: parsed.meta.name,
           description: parsed.meta.description,
         });
-        // Register full meta with IntentRouter for intent/tag/category matching
-        this.intentRouter.registerSkillMeta(parsed.meta);
-        logger.info({ skill: parsed.meta.name, category: parsed.meta.category, intents: parsed.meta.intents?.length }, 'Skill discovered');
+        parsedSkills.push({ meta: parsed.meta, path: skillPath });
       } catch (err) {
-        logger.warn({ dir: entry.name, err }, 'Failed to load skill');
+        logger.warn({ path: skillPath, err }, 'Failed to load skill');
       }
     }
 
-    // Build intent index from discovered skills (basic info for fallback matching)
+    // Reset the router with the bare list first, then enrich every entry with
+    // its category, intents and tags. (The other order wiped the metadata on
+    // every scan, so grouping and intent routing silently fell back to names.)
     this.intentRouter.buildIndex([...this.discovered.values()]);
+    for (const { meta, path } of parsedSkills) {
+      this.intentRouter.registerSkillMeta(meta);
+      logger.info({ skill: meta.name, path, category: meta.category, intents: meta.intents?.length }, 'Skill discovered');
+    }
 
     return [...this.discovered.values()];
   }
@@ -82,36 +107,90 @@ export class SkillLoader {
     const cached = this.loaded.get(name);
     if (cached) return cached;
 
-    for (const entry of readdirSync(this.skillsDir, { withFileTypes: true })) {
-      if (!entry.isDirectory() || entry.name.startsWith('_')) continue;
-      const skillDir = join(this.skillsDir, entry.name);
-      if (existsSync(join(skillDir, DISABLED_FILE))) continue;
-      const skillPath = join(this.skillsDir, entry.name, SKILL_FILE);
-      if (!existsSync(skillPath)) continue;
+    const skillPaths = this.findSkillFiles();
+    let lastMatch: Skill | null = null;
+    for (const skillPath of skillPaths) {
       try {
         const raw = readFileSync(skillPath, 'utf-8');
         const parsed = parseSkillMd(raw);
         if (!parsed || parsed.meta.name !== name) continue;
 
+        const skillDir = join(skillPath, '..');
         const skill: Skill = {
           ...parsed.meta,
           instructions: parsed.instructions,
           scriptsDir: existsSync(join(skillDir, 'scripts')) ? join(skillDir, 'scripts') : undefined,
           referencesDir: existsSync(join(skillDir, 'references')) ? join(skillDir, 'references') : undefined,
         };
-        this.loaded.set(name, skill);
-        return skill;
+        // Nested wins over flat — keep walking and prefer the deepest match.
+        lastMatch = skill;
       } catch (err) {
         logger.warn({ err, name }, 'Failed to load skill');
-        return null;
       }
     }
-
+    if (lastMatch) {
+      this.loaded.set(name, lastMatch);
+      return lastMatch;
+    }
     return null;
+  }
+
+  /**
+   * Walk the skills directory and return absolute paths to every SKILL.md found,
+   * supporting both flat (<dir>/SKILL.md) and nested (<category>/<slug>/SKILL.md)
+   * layouts. Skips directories starting with "_" and any tree containing a
+   * `.disabled` marker.
+   */
+  private findSkillFiles(): string[] {
+    const out: string[] = [];
+    for (const dir of [this.skillsDir, ...this.extraDirs]) {
+      this.findSkillFilesIn(dir, out);
+    }
+    return out;
+  }
+
+  /** Walk one skills root (flat + one nested category level), appending SKILL.md paths. */
+  private findSkillFilesIn(skillsDir: string, out: string[]): string[] {
+    if (!existsSync(skillsDir)) return out;
+
+    for (const entry of readdirSync(skillsDir, { withFileTypes: true })) {
+      if (!entry.isDirectory() || entry.name.startsWith('_') || entry.name.startsWith('.')) continue;
+      const dir = join(skillsDir, entry.name);
+      if (existsSync(join(dir, DISABLED_FILE))) continue;
+
+      const flat = join(dir, SKILL_FILE);
+      if (existsSync(flat)) {
+        out.push(flat);
+        continue;
+      }
+      // Treat as category folder: look one level deeper for <slug>/SKILL.md.
+      let children: import('node:fs').Dirent[] = [];
+      try {
+        children = readdirSync(dir, { withFileTypes: true });
+      } catch { continue; }
+      for (const child of children) {
+        if (!child.isDirectory() || child.name.startsWith('_') || child.name.startsWith('.')) continue;
+        const childDir = join(dir, child.name);
+        if (existsSync(join(childDir, DISABLED_FILE))) continue;
+        const nested = join(childDir, SKILL_FILE);
+        if (existsSync(nested)) out.push(nested);
+      }
+    }
+    return out;
   }
 
   getDiscovered(): SkillDiscovery[] {
     return [...this.discovered.values()];
+  }
+
+  /** The primary skills root (where self-made skills are written). */
+  rootDir(): string {
+    return this.skillsDir;
+  }
+
+  /** Count a use of a self-made skill (no-op for curated ones). */
+  noteUse(name: string): void {
+    recordSelfMadeUse(this.skillsDir, name);
   }
 
   getSkillSummariesText(): string {
@@ -127,7 +206,7 @@ export class SkillLoader {
     if (hasCategories && categories.size > 1) {
       // Group by category
       for (const [category, catSkills] of categories) {
-        const label = getCategoryLabel(category);
+        const label = category === SELF_MADE_CATEGORY ? SELF_MADE_LABEL : getCategoryLabel(category);
         text += `\n**${label}:**\n`;
         for (const s of catSkills) {
           const discovered = this.discovered.get(s.name);
@@ -162,15 +241,18 @@ export class SkillLoader {
     }
 
     // Intent routing hint — tell the agent about the new system
-    text += '\n\n**Skill Intent Routing Available** — When a user request matches skill intents, '
-      + 'you can use intent matching to automatically route to the right skills. '
-      + 'For multi-skill requests, batch execution across sub-agents for parallel processing.';
+    text += '\n\n**Skill Intent Routing** — When a user request clearly matches a skill, '
+      + 'invoke it via `use_skill` immediately. If the request is ambiguous (could match '
+      + 'multiple skills equally well), prefer asking the user with the `ask_user` tool '
+      + 'over guessing or fanning out across many skills. '
+      + 'Users can also explicitly pick a skill by prefixing their message with '
+      + '`#skill-name` — when you see that prefix the choice is already made for you.';
 
     return text;
   }
 
   saveSkill(name: string, content: string): string {
-    const skillDir = join(this.skillsDir, name);
+    const skillDir = this.resolveSkillDir(name);
     if (!existsSync(skillDir)) {
       mkdirSync(skillDir, { recursive: true });
     }
@@ -184,15 +266,29 @@ export class SkillLoader {
     return skillDir;
   }
 
+  /**
+   * Resolve a skill name to its directory inside the skills root. Rejects
+   * empty names and names that escape the root (absolute paths, `..`
+   * traversal), so a remote SKILL.md frontmatter `name` cannot cause writes
+   * outside `skillsDir`.
+   */
+  private resolveSkillDir(name: string): string {
+    const trimmed = (name ?? '').trim();
+    const root = resolve(this.skillsDir);
+    const candidate = resolve(root, trimmed);
+    if (!trimmed || candidate === root || !candidate.startsWith(root + sep)) {
+      throw new Error(`Invalid skill name ${JSON.stringify(name)}: resolves outside the skills root`);
+    }
+    return candidate;
+  }
+
   getAllSkills(): Array<SkillDiscovery & { active: boolean }> {
     const list: Array<SkillDiscovery & { active: boolean }> = [];
     if (!existsSync(this.skillsDir)) return list;
 
-    for (const entry of readdirSync(this.skillsDir, { withFileTypes: true })) {
-      if (!entry.isDirectory() || entry.name.startsWith('_')) continue;
-      const skillDir = join(this.skillsDir, entry.name);
-      const skillPath = join(skillDir, SKILL_FILE);
-      if (!existsSync(skillPath)) continue;
+    // Include disabled too — walk both layouts but don't honor .disabled here.
+    const candidates = this.walkAllSkillPaths();
+    for (const { skillPath, disabled } of candidates) {
       try {
         const raw = readFileSync(skillPath, 'utf-8');
         const parsed = parseSkillMd(raw);
@@ -200,10 +296,10 @@ export class SkillLoader {
         list.push({
           name: parsed.meta.name,
           description: parsed.meta.description,
-          active: !existsSync(join(skillDir, DISABLED_FILE)),
+          active: !disabled,
         });
       } catch (err) {
-        logger.warn({ err, dir: entry.name }, 'Failed to read skill metadata');
+        logger.warn({ err, path: skillPath }, 'Failed to read skill metadata');
       }
     }
 
@@ -252,22 +348,46 @@ export class SkillLoader {
 
   private findSkillEntryByName(name: string): { skillDir: string } | null {
     if (!existsSync(this.skillsDir)) return null;
-    for (const entry of readdirSync(this.skillsDir, { withFileTypes: true })) {
-      if (!entry.isDirectory() || entry.name.startsWith('_')) continue;
-      const skillDir = join(this.skillsDir, entry.name);
-      const skillPath = join(skillDir, SKILL_FILE);
-      if (!existsSync(skillPath)) continue;
+    const candidates = this.walkAllSkillPaths();
+    let lastMatch: string | null = null;
+    for (const { skillPath } of candidates) {
       try {
         const raw = readFileSync(skillPath, 'utf-8');
         const parsed = parseSkillMd(raw);
         if (parsed?.meta.name === name) {
-          return { skillDir };
+          lastMatch = join(skillPath, '..');
         }
       } catch {
         continue;
       }
     }
-    return null;
+    return lastMatch ? { skillDir: lastMatch } : null;
+  }
+
+  /** Like findSkillFiles, but also returns disabled entries (used by getAllSkills). */
+  private walkAllSkillPaths(): Array<{ skillPath: string; disabled: boolean }> {
+    const out: Array<{ skillPath: string; disabled: boolean }> = [];
+    if (!existsSync(this.skillsDir)) return out;
+    for (const entry of readdirSync(this.skillsDir, { withFileTypes: true })) {
+      if (!entry.isDirectory() || entry.name.startsWith('_') || entry.name.startsWith('.')) continue;
+      const dir = join(this.skillsDir, entry.name);
+      const flat = join(dir, SKILL_FILE);
+      if (existsSync(flat)) {
+        out.push({ skillPath: flat, disabled: existsSync(join(dir, DISABLED_FILE)) });
+        continue;
+      }
+      let children: import('node:fs').Dirent[] = [];
+      try { children = readdirSync(dir, { withFileTypes: true }); } catch { continue; }
+      for (const child of children) {
+        if (!child.isDirectory() || child.name.startsWith('_') || child.name.startsWith('.')) continue;
+        const childDir = join(dir, child.name);
+        const nested = join(childDir, SKILL_FILE);
+        if (existsSync(nested)) {
+          out.push({ skillPath: nested, disabled: existsSync(join(childDir, DISABLED_FILE)) });
+        }
+      }
+    }
+    return out;
   }
 
   private seedTemplate(): void {
@@ -316,7 +436,25 @@ Describe what this skill enables Mercury to do. When invoked via the use_skill t
     for (const seed of DEFAULT_SKILL_SEEDS) {
       const skillDir = join(this.skillsDir, seed.dirName);
       const skillFile = join(skillDir, seed.fileName);
-      if (existsSync(skillFile)) continue;
+      if (existsSync(skillFile)) {
+        // Upgrade an untouched copy of an older built-in version; never overwrite edits.
+        try {
+          const current = readFileSync(skillFile, 'utf-8');
+          if (current !== seed.content && (PREVIOUS_SEED_CONTENTS[seed.dirName] ?? []).includes(current)) {
+            writeFileSync(skillFile, seed.content, 'utf-8');
+            logger.info({ skill: seed.dirName }, 'Upgraded default skill');
+          } else if (current !== seed.content && isBrokenSearchSkill(seed.dirName, current)) {
+            // A web-search skill that scrapes a search engine's HTML page
+            // (usually DuckDuckGo, which now answers bots with a challenge)
+            // never works. Keep the owner's copy beside it and use the
+            // built-in one, which calls the web_search tool.
+            writeFileSync(`${skillFile}.replaced.bak`, current, 'utf-8');
+            writeFileSync(skillFile, seed.content, 'utf-8');
+            logger.info({ skill: seed.dirName, backup: `${skillFile}.replaced.bak` }, 'Replaced a web-search skill that scrapes a blocked search page');
+          }
+        } catch { /* leave it */ }
+        continue;
+      }
 
       mkdirSync(skillDir, { recursive: true });
       writeFileSync(skillFile, seed.content, 'utf-8');

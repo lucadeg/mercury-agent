@@ -1,6 +1,6 @@
 #!/usr/bin/env node
-const { execSync } = require('child_process');
-const { platform } = require('os');
+import { execFileSync } from 'node:child_process';
+import { platform } from 'node:os';
 
 console.log('\u263F Checking native build prerequisites for better-sqlite3...\n');
 
@@ -36,9 +36,9 @@ if (!isWin) {
 const nodeVersion = process.version;
 const nodeMajor = parseInt(nodeVersion.replace(/^v/, '').split('.')[0], 10);
 
-if (nodeMajor < 20) {
-  console.log(`\u26A0  Node.js ${nodeVersion} detected \u2014 better-sqlite3 v12 requires Node >= 20.`);
-  console.log('   Upgrade with: nvm install 20');
+if (nodeMajor < 22) {
+  console.log(`\u26A0  Node.js ${nodeVersion} detected \u2014 Mercury requires Node >= 22.`);
+  console.log('   Upgrade with: nvm install 22');
   missing = true;
 }
 
@@ -52,9 +52,8 @@ if (!missing) {
 
 function commandExists(cmd) {
   const isWin = platform() === 'win32';
-  const checkCmd = isWin ? `where ${cmd}` : `command -v ${cmd}`;
   try {
-    execSync(checkCmd, { stdio: 'pipe' });
+    execFileSync(isWin ? 'where.exe' : 'sh', isWin ? [cmd] : ['-c', 'command -v "$1"', 'sh', cmd], { stdio: 'pipe' });
     return true;
   } catch {
     return false;

@@ -1,12 +1,22 @@
 import { Hono } from 'hono';
+import { isBunVirtualPath } from '../../utils/bun-path.js';
 import { setCookie, getCookie, deleteCookie } from 'hono/cookie';
 import { existsSync, readFileSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
+import process from 'node:process';
 import { authenticate, createSession, destroySession, changePassword, changeUsername, getSessionCookieName, getSessionMaxAge } from '../auth.js';
 
-const __authDir = dirname(fileURLToPath(import.meta.url));
-const spaLoginIndex = join(__authDir, 'web', 'ui', 'index.html');
+function resolveWebDir(...segments: string[]): string {
+  const __dirname = dirname(fileURLToPath(import.meta.url));
+  // Standalone binary (macOS/Linux `$bunfs`, Windows `~BUN`): assets sit next to the executable.
+  if (isBunVirtualPath(__dirname)) {
+    return join(dirname(process.execPath), ...segments);
+  }
+  return join(__dirname, ...segments);
+}
+
+const spaLoginIndex = resolveWebDir('web', 'ui', 'index.html');
 
 function renderLoginPage(error?: string): string {
   return `<!DOCTYPE html>

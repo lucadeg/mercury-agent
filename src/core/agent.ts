@@ -1,33 +1,50 @@
 import { generateText, streamText, stepCountIs } from 'ai';
 import path from 'node:path';
+import { homedir } from 'node:os';
+import { existsSync, readdirSync } from 'node:fs';
+import { getHeapStatistics } from 'node:v8';
 import type { ChannelMessage, ChannelType } from '../types/channel.js';
 import type { ProviderRegistry } from '../providers/registry.js';
 import type { Identity } from '../soul/identity.js';
 import type { ShortTermMemory, LongTermMemory, EpisodicMemory } from '../memory/store.js';
 import type { UserMemoryStore } from '../memory/user-memory.js';
 import type { ChannelRegistry } from '../channels/registry.js';
-import type { MercuryConfig } from '../utils/config.js';
+import type { MercuryConfig, ProviderName } from '../utils/config.js';
 import type { TokenBudget } from '../utils/tokens.js';
 import type { CapabilityRegistry } from '../capabilities/registry.js';
 import type { ScheduledTaskManifest } from './scheduler.js';
 import { DeepSeekProvider } from '../providers/deepseek.js';
-import { ProviderRegistry as ProviderRegistryImpl } from '../providers/registry.js';
+import { createProvider, ProviderRegistry as ProviderRegistryImpl } from '../providers/registry.js';
+import type { BaseProvider } from '../providers/base.js';
 import { Lifecycle } from './lifecycle.js';
 import { Scheduler } from './scheduler.js';
 import { ProgrammingMode } from './programming-mode.js';
+import { ResearchMode } from './research-mode.js';
+import { SaverMode, NORMAL_HISTORY_WINDOW } from './saver-mode.js';
 import { BackgroundTaskManager } from './background-tasks.js';
 import { SkillBatcher } from '../skills/batcher.js';
 import type { SkillLoader } from '../skills/loader.js';
 import { logger } from '../utils/logger.js';
+import { refinePersona } from '../bots/persona-template.js';
+import { proposeCrew } from '../bots/fleet-onboarding.js';
+import { PERMISSION_TIERS, tierPermissionsFile, isPermissionTier, type PermissionTier } from '../bots/permission-tiers.js';
+import { buildBotBundle, writeBundle, readBundle, importBotBundle } from '../bots/bundle.js';
+import { applyBotFieldPatch } from '../bots/edit.js';
 import { CLIChannel } from '../channels/cli.js';
 import { TelegramChannel } from '../channels/telegram.js';
+import { SignalChannel } from '../channels/signal.js';
+import { DiscordChannel } from '../channels/discord.js';
+import { SlackChannel } from '../channels/slack.js';
 import { formatToolStep, formatNarrative, type NarrativeStep } from '../utils/tool-label.js';
-import { getTelegramHelp } from '../utils/manual.js';
+import { getTelegramHelp, getDiscordHelp, getSlackHelp } from '../utils/manual.js';
 import { WebChannel } from '../channels/web.js';
 import type { ArrowSelectOption } from '../utils/arrow-select.js';
 import { setAskUserHandler } from '../capabilities/interaction/ask-user.js';
+import { classifyResearchIntent } from './research-intent.js';
 import type { SpotifyClient } from '../spotify/client.js';
+import { normalizeGeneratedSessionTitle, SessionResolutionError, type SessionRepository } from '../sessions/index.js';
 import { PLAYER_CONTROLS, handlePlayerAction, formatNowPlaying } from '../spotify/ui.js';
+import { getCloudTokenStore } from '../cloud/token-store.js';
 import {
   approveTelegramPendingRequest,
   approveTelegramPendingRequestByPairingCode,
@@ -40,8 +57,130 @@ import {
   rejectTelegramPendingRequest,
   removeTelegramUser,
   saveConfig,
+  loadConfig,
   getActiveProviders,
+  getDiscordAccessSummary,
+  hasDiscordAdmins,
+  findDiscordPendingRequest,
+  approveDiscordPendingRequest,
+  approveDiscordPendingRequestByPairingCode,
+  rejectDiscordPendingRequest as rejectDiscordPendingRequestConfig,
+  removeDiscordUser,
+  clearDiscordAccess,
+  getSlackAccessSummary,
+  hasSlackAdmins,
+  findSlackPendingRequest,
+  approveSlackPendingRequest,
+  approveSlackPendingRequestByPairingCode,
+  rejectSlackPendingRequest as rejectSlackPendingRequestConfig,
+  removeSlackUser,
+  clearSlackAccess,
 } from '../utils/config.js';
+import { fetchProviderModelCatalog, getPreferredModelsForProvider } from '../utils/provider-models.js';
+import { WorkLedger, type WorkEntry } from './work-ledger.js';
+import { MAX_PROVIDER_ATTEMPT_MS, MAX_AUTOMATIC_CONTINUATIONS, needsContinuationApproval, needsRetryApproval, withAbortDeadline } from './execution-limits.js';
+import { requiresFinalSend } from './response-delivery.js';
+import { updateCliProviderStatus } from './provider-status.js';
+import { isTaskHeapUnsafe, taskHeapAbortThreshold, taskHeapExitThreshold } from './memory-guard.js';
+import { compactConversation, memoryGovernorThresholds, memoryGovernorVerdict } from './memory-governor.js';
+import { classifyStreamCompletion, isLengthTruncation, truncationContinuationPrompt, toolTruncationContinuationPrompt } from './stream-completion.js';
+import { MAX_EXECUTE_CONTINUATIONS, MAX_VERIFICATION_CONTINUATIONS, executeContinuationPrompt, shouldForceExecuteContinuation, isFailedToolResult, shouldRequireVerification, isVerificationOutputOk, verificationPrompt, responseAsksUser, EXECUTE_MUTATING_TOOLS, VERIFICATION_COMMAND_PATTERN, wakeUpPrompt } from './execute-guard.js';
+import { classifyTurnEnd, stepsExhaustedPrompt, STEPS_PAUSED_BANNER, WORK_NOT_STARTED_BANNER, VERIFICATION_FAILED_BANNER, type LoopEndCause } from './completion-verdict.js';
+import { HISTORY_TOKEN_BUDGET, HISTORY_TOKEN_BUDGET_SAVER, TOOL_TRACE_KIND, selectHistoryWindow, toModelMessage, withReasoningParts, formatToolTrace, formatToolTraceLine, summarizeToolArgs, summarizeToolResult, detectRepetitionLoop } from './context-window.js';
+import { buildSystemPrompt as assembleSystemPrompt, budgetContext } from './system-prompt.js';
+import { buildStatusVerbPrompt, parseStatusVerbs, shouldRefreshStatusVerbs } from './status-verbs.js';
+import { verbPoolFor } from '../ui/status-word.js';
+import { StallWatchdog } from './stall-watchdog.js';
+import { setProgressPulse } from './progress-pulse.js';
+import { selectActiveTools } from './tool-exposure.js';
+import { createTaskSurface } from './task-surface.js';
+import { buildFileChangePreview } from '../utils/file-preview.js';
+import { whatsNewText } from '../utils/whats-new.js';
+import { handleBotsCommand as handleBotsCommandImpl } from './commands/bots-command.js';
+import { modelSeesImages, withAttachments } from './attachments.js';
+import { AlertGate } from './alert-gate.js';
+import { setPluginImagesAllowed } from '../plugins/tool-bridge.js';
+import { handleCallCommand } from '../plugins/call-schedule.js';
+import { handlePluginsCommand, tryPluginCommand, hasPluginDialog, answerPluginDialog } from '../plugins/commands.js';
+import { handleChatCommand as handleChatCommandImpl } from './commands/chat-command.js';
+import { formatCounts, formatLearnedLine } from './commands/memory-commands.js';
+import { handleBgCommand as handleBgCommandImpl } from './commands/bg-command.js';
+import { handleSaverCommand as handleSaverCommandImpl } from './commands/saver-command.js';
+import { handleSessionCommand as handleSessionCommandImpl } from './commands/session-command.js';
+import { handleFastPathCommand as handleFastPathCommandImpl } from './commands/fast-path-command.js';
+import { openCliMemoryMenu as openCliMemoryMenuImpl } from './commands/cli-memory-menu.js';
+import { openMemoryChoiceMenu as openMemoryChoiceMenuImpl } from './commands/memory-choice-menu.js';
+import { openCliCommandMenu as openCliCommandMenuImpl } from './commands/cli-command-menu.js';
+import { collectTurnSignals, parseToolTraceLines } from '../learning/signals.js';
+import { extractBeliefOperations, type ExtractTurn } from '../learning/extract.js';
+import { composeLearnedNote, pendingQuestion } from '../learning/announce.js';
+import { asksAboutSelf, ownerWords } from '../learning/text.js';
+
+/** Minimum gap between two "☿ Noted" lines on one channel. */
+const NOTE_COOLDOWN_MS = 3 * 60 * 1000;
+import { runReflection } from '../learning/reflection.js';
+import { createOwnerSectionsMemo } from '../learning/owner-brief.js';
+import type { ApplyResult } from '../memory/beliefs.js';
+
+/**
+ * Step-aware text stream for the TUI. The SDK's textStream concatenates
+ * the narration of EVERY agentic step back-to-back with no separator —
+ * on longer /code tasks that produced word salad ("Building it
+ * now.Clean slate.Now scaffolding…Next.js project scaffolded…") as each
+ * tool step narrated and then handed off to the next. This wraps
+ * fullStream and inserts paragraph breaks at step boundaries so each
+ * step's narration reads as its own block.
+ */
+export function stepAwareTextStream(
+  fullStream: AsyncIterable<any>,
+  onReasoning?: (preview: string | null) => void,
+): AsyncIterable<string> {
+  return (async function* () {
+    let firstStep = true;
+    let sawTextInStep = false;
+    let reasoningBuf = '';
+    for await (const part of fullStream) {
+      // Step boundary: AI SDK 6 emits 'start-step' (the v4/v5 name was
+      // 'step-start'). Matching only the old name meant the separator never
+      // fired — every step's narration ran into the next as word salad
+      // ("…in this project.Found the situation…") in the live tail.
+      if (part.type === 'start-step' || part.type === 'step-start') {
+        if (!firstStep && sawTextInStep) yield '\n\n';
+        firstStep = false;
+        sawTextInStep = false;
+        continue;
+      }
+      if (part.type === 'reasoning-delta' && part.text) {
+        // Live thinking feedback: the model reasoning before speaking is
+        // surfaced as a preview instead of dead air.
+        reasoningBuf = (reasoningBuf + part.text).slice(-400);
+        onReasoning?.(reasoningBuf.slice(-160));
+        continue;
+      }
+      if (part.type === 'text-delta' && part.text) {
+        if (reasoningBuf) {
+          reasoningBuf = '';
+          onReasoning?.(null);
+        }
+        sawTextInStep = true;
+        yield part.text;
+      }
+    }
+    onReasoning?.(null);
+  })();
+}
+
+
+
+/**
+ * Tools allowed on a GUARD-FORCED step: MUTATING tools only. The forced
+ * step must be real work — a narration-prone model satisfied toolChoice
+ * 'required' by calling list_dir/read_file every round (inspection instead
+ * of action), burning all guard rounds and pausing. The grounding message
+ * already gives it the directory listing, so inspection is unnecessary;
+ * if it truly must read, run_command is available (and permission-gated).
+ */
+const FORCED_ACTION_TOOLS = [...EXECUTE_MUTATING_TOOLS];
 
 class ToolCallLoopDetector {
   private recentCalls: Array<{ tool: string; params: string; failed: boolean; timestamp: number }> = [];
@@ -270,55 +409,233 @@ class ToolCallLoopDetector {
   }
 }
 
-const MAX_STEPS = 25;
-const MAX_RESPONSE_TOKENS = 4096;
+// AI SDK warnings go to Mercury's logger, never straight to the terminal: a raw
+// console.warn lands in the middle of the TUI's live region and the renderer
+// then erases the wrong rows (a stuck "Processing" block in the transcript).
+(globalThis as { AI_SDK_LOG_WARNINGS?: unknown }).AI_SDK_LOG_WARNINGS = (options: { warnings: unknown[]; provider?: string; model?: string }) => {
+  logger.warn({ warnings: options.warnings, provider: options.provider, model: options.model }, 'AI SDK warning');
+};
+
+// Test/soak override: MERCURY_MAX_STEPS=3 forces cheap step-budget
+// exhaustion to exercise the completion contract end to end.
+/**
+ * The value a tool returned. AI SDK v6 tool results carry it as `output`;
+ * older shapes used `result`. Reading only `.result` stringified the whole
+ * envelope, so failures were detected by accident and the loop detector's
+ * failed flag never fired.
+ */
+export function toolResultValue(tr: unknown): unknown {
+  if (tr && typeof tr === 'object') {
+    const o = tr as { output?: unknown; result?: unknown };
+    if (o.output !== undefined) return o.output;
+    if (o.result !== undefined) return o.result;
+  }
+  return tr;
+}
+
+export const MAX_STEPS = (() => {
+  const override = Number(process.env.MERCURY_MAX_STEPS);
+  return Number.isFinite(override) && override > 0 ? Math.floor(override) : 75;
+})();
+// No Mercury-imposed size limit: a single-file app write is emitted AS
+// tool-call arguments, so any cap we choose eventually severs a legitimate
+// write mid-argument. The ceiling below is deliberately far above any
+// mainstream model's NATIVE output limit — the model's own limit governs,
+// not ours. If a provider still rejects the value, the adaptive clamp in
+// the attempt loop halves it and retries.
+const MODEL_OUTPUT_TOKEN_LIMIT = 32768;
 const HEARTBEAT_INITIAL_MS = 20000;
 const HEARTBEAT_MAX_MS = 60000;
 const LONG_TASK_HANDOFF_SUGGEST_MS = 45000;
-const MAX_FOREGROUND_WALL_MS = 10 * 60 * 1000;
 const MAX_STALL_MS = 4 * 60 * 1000;
 const MAX_SELF_CHECKS = 3; // max AI self-checks per request before hard-aborting
+
+/**
+ * Heuristic: does this message look like a deep-research request that would
+ * benefit from full research mode? Conservative — false negatives just fall
+ * through to a normal answer, so we prefer specificity over recall.
+ */
+function looksResearchy(text: string): boolean {
+  const t = text.toLowerCase();
+  if (t.length < 24) return false; // too short to be a research question
+  if (t.startsWith('/')) return false;
+
+  // Temporal / event research signals
+  const temporal = /\b(happened|occurr?ed|took place|what (did|do) .* (say|report|find)|recent|last (week|month|year|few)|(\d+)\s*(days?|weeks?|months?|years?) (ago|back|earlier)|today'?s news|this week|this month|this year)\b/;
+  // Deep / comparative / explain signals
+  const deep = /\b(research|investigate|deep dive|in[- ]depth|explain in detail|comprehensive (guide|overview|analysis)|compare (and )?contrast|state of|history of|causes? of|impact of|effects? of|timeline of|breakdown of|everything about)\b/;
+  // Factual lookup signals
+  const factual = /\b(latest|current state|what is .* (situation|status)|what are the (options|alternatives|risks|benefits))\b/;
+
+  return temporal.test(t) || deep.test(t) || factual.test(t);
+}
+
+/** No answer to the Mercury Code hand-off prompt is treated as "keep chatting". */
+export const MERCURY_CODE_HANDOFF_TIMEOUT_MS = 45_000;
+
+/**
+ * Fleet-control verbs: `/bot <verb> …` where the first token resolves to NO
+ * configured bot is a control command typed on the message slash — it is
+ * routed to the /bots surface instead of failing as an unknown target.
+ * (A bot actually named e.g. "start" always wins — bot resolution first.)
+ */
+export const BOT_CONTROL_VERBS = new Set([
+  'start', 'stop', 'pause', 'enable', 'disable', 'run', 'open', 'send',
+  'journal', 'inbox', 'budget', 'edit', 'delete', 'replay', 'list', 'dlq', 'storage',
+]);
+
+/**
+ * Whitelabel a provider error into one short, respectful line for the chat:
+ * the user gets the real reason (token expired, rate limit, server error) —
+ * never a stack trace or raw HTTP dump.
+ */
+export function whitelabelProviderError(err: any): string {
+  const raw = String(err?.message || err || 'unknown error');
+  const body = typeof (err as any)?.responseBody === 'string' ? (err as any).responseBody : '';
+  const combined = `${raw} ${body}`;
+
+  if (/401|invalid[_ -]?api[_ -]?key|token expired|expired token|invalid_api_key|unauthorized|authentication|credential/i.test(combined)) {
+    return 'Access token expired or rejected (credentials)';
+  }
+  if (/403|forbidden|permission/i.test(combined)) {
+    return 'The provider refused the request (permissions/quota)';
+  }
+  // OpenAI Codex usage limit: the error body carries a reset timestamp —
+  // surface it, the user needs to know when the plan window reopens.
+  const resetsAt = Number((err as any)?.resets_at ?? /"resets_at":\s*(\d+)/.exec(body)?.[1]);
+  if (Number.isFinite(resetsAt) && resetsAt > 0) {
+    return `Usage limit reached on this plan — resets ${new Date(resetsAt * 1000).toLocaleTimeString()}`;
+  }
+  if (/429|rate limit|too many requests/i.test(combined)) {
+    return 'Rate limited — too many requests right now';
+  }
+  if (/max[_ -]?tokens|context (length|window)|too large|exceed/i.test(combined)) {
+    return 'The request exceeded the model limit';
+  }
+  if (/(5\d\d|bad gateway|service unavailable|timeout|timed out|ECONNRESET|ENOTFOUND|fetch failed|network)/i.test(combined)) {
+    return 'Provider server error or network timeout';
+  }
+  return raw.split('\n')[0].replace(/\s+/g, ' ').slice(0, 120) || 'unknown error';
+}
+
+/**
+ * Coding-shaped task detector for the Mercury Code hand-off prompt.
+ * Conservative — only messages that clearly describe build/repair work on a
+ * codebase match (build/repair verbs + code artifacts, source-file paths,
+ * shell/package-manager commands, or fenced code). Conceptual chat questions
+ * about code ("what is a pointer", "explain recursion") never match, so the
+ * prompt stays rare.
+ */
+export function looksLikeCodingTask(text: string): boolean {
+  const t = text.toLowerCase();
+  if (t.length < 16 || t.startsWith('/')) return false;
+
+  // Concept-chat noise never prompts.
+  const chatNoise = /\b(what is|what's|whats|who is|explain|difference between|meaning of|how does|how do)\b/;
+  if (chatNoise.test(t)) return false;
+
+  const intent = /\b(implement|refactor|write|create|build|develop|add|fix|debug|migrate|restructure|scaffold|optimize|clean up|cleanup)\b/;
+  const artifact = /\b(code|function|method|class|component|module|feature|endpoint|api|route|handler|script|library|package|bug|regression|test suite|codebase|repository|repo|app|application|plugin|migration|schema|database|service|ui|frontend|backend)\b/;
+  const pathOrCommand = /(^|[\s"'(])[\w./@~-]+\.(ts|tsx|js|jsx|py|rs|go|java|kt|rb|php|c|cpp|cs|swift|sh)\b|\b(npm|pnpm|yarn|pip|cargo|git|docker|make|gradle|mvn)\s+\w+/;
+  const fence = /```/;
+
+  return (intent.test(t) && artifact.test(t)) || pathOrCommand.test(t) || fence.test(t);
+}
+
 
 export class Agent {
   readonly lifecycle: Lifecycle;
   readonly scheduler: Scheduler;
   readonly capabilities: CapabilityRegistry;
   private running = false;
-  private messageQueue: ChannelMessage[] = [];
-  private processing = false;
-  private telegramStreaming: boolean;
-  private currentMessage: ChannelMessage | null = null;
-  private currentAbort: AbortController | null = null;
+  private messageQueue: Array<{ message: ChannelMessage; workKey?: string }> = [];
+  private queuedWorkKeys = new Set<string>();
+  processing = false;
+  telegramStreaming: boolean;
+  currentMessage: ChannelMessage | null = null;
+  currentAbort: AbortController | null = null;
+  currentAbortReason: 'stalled' | 'time-limit' | 'memory-pressure' | 'backgrounded' | 'stopped' | 'halted' | null = null;
   private lastProgressAt = 0;
-  private currentActivity = '';
-  private completedStepCount = 0;
-  private stepNarrative: import('../utils/tool-label.js').NarrativeStep[] = [];
-  private supervisor?: import('../core/supervisor.js').SubAgentSupervisor;
+  currentActivity = '';
+  completedStepCount = 0;
+  stepNarrative: import('../utils/tool-label.js').NarrativeStep[] = [];
+  supervisor?: import('../core/supervisor.js').SubAgentSupervisor;
+  botManager?: import('../bots/bot-manager.js').BotManager;
+  /** Bot awaiting a persona from the next message (post-create setup flow). */
+  /**
+   * A terminal beside a live daemon (ADR-024): the daemon owns persisted
+   * schedules, interrupted-work recovery and undelivered replies — running
+   * them here too would fire every cron twice and replay work twice.
+   */
+  terminalOnly = false;
+  pendingPersonaFor: string | null = null;
+  /** The chat whose next message is the persona (Telegram/web/Discord — channels without a bot thread). */
+  pendingPersonaChannelId: string | null = null;
+  /** True while the pending persona capture belongs to a JUST-created bot —
+   * gates the fleet (solo vs lead) onboarding step in finalizePersona. */
+  pendingPersonaNewlyCreated = false;
+  /** Bot awaiting a daily token budget answer (final onboarding step). */
+  pendingBudgetFor: string | null = null;
+  /** Owner Model (ADR-026): per chat, the numbering of the last belief list printed
+   * (`/memory learned|beliefs|contested`), so `/memory confirm <n>` knows what n is. */
+  readonly lastBeliefListing = new Map<string, string[]>();
+  /** Owner Model (ADR-026): per chat, the belief announced by the last `☿ Noted:` line,
+   * so a plain "forget that" undoes it. Set by the per-turn learner; cleared on undo. */
+  readonly lastNotedBeliefId = new Map<string, string>();
+  /** When the last "☿ Noted" went out per channel: at most one every few minutes, so an upgrade's backlog never floods a chat. */
+  private readonly lastNotedAt = new Map<string, number>();
   readonly programmingMode: ProgrammingMode;
-  private spotifyClient?: SpotifyClient;
+  readonly researchMode: ResearchMode;
+  readonly saverMode: SaverMode;
+  spotifyClient?: SpotifyClient;
   private skillBatcher: SkillBatcher | null = null;
   private skillLoader?: SkillLoader;
   readonly backgroundTasks: BackgroundTaskManager;
+  private titleGenerationInFlight = new Set<string>();
+  // Mercury Code status-verb refresh (see core/status-verbs.ts): per-session
+  // turn counter + in-flight/disabled markers keep the one-shot LLM call rare.
+  private statusVerbTurnCount = 0;
+  private statusVerbsInFlight = false;
+  private statusVerbsDisabled = false;
+  sessionSyncEnabled = false;
+  private readonly workLedger: WorkLedger;
+  private currentWorkKey: string | null = null;
+  private outboxRetryTimer: ReturnType<typeof setInterval> | null = null;
+  private replayingOutbox = false;
+  /** Beliefs injected into the current turn's prompt (set by retrieveMemoryContext, ADR-026). */
+  lastInjectedBeliefIds: string[] = [];
+  /** "About {owner}" / "How to work with {owner}", recomputed only when the beliefs change (keeps the prompt prefix cacheable). */
+  private readonly ownerSections = createOwnerSectionsMemo();
+  private reflectionInFlight: Promise<void> | null = null;
+  /** Beliefs the previous turn acted on; credited as "acted on without objection" once the next owner message shows no correction. */
+  private pendingActedOn: { ids: string[]; sessionId?: string } | null = null;
 
   constructor(
-    private config: MercuryConfig,
-    private providers: ProviderRegistry,
+    public config: MercuryConfig,
+    public providers: ProviderRegistry,
     private identity: Identity,
-    private shortTerm: ShortTermMemory,
+    public shortTerm: ShortTermMemory,
     private longTerm: LongTermMemory,
     private episodic: EpisodicMemory,
-    private userMemory: UserMemoryStore | null,
-    private channels: ChannelRegistry,
-    private tokenBudget: TokenBudget,
+    public userMemory: UserMemoryStore | null,
+    public channels: ChannelRegistry,
+    public tokenBudget: TokenBudget,
     capabilities: CapabilityRegistry,
     scheduler: Scheduler,
+    public sessions: SessionRepository,
+    private generateTitle?: (input: { userMessage: string; assistantMessage: string; providerName: string }) => Promise<string>,
   ) {
     this.lifecycle = new Lifecycle();
     this.scheduler = scheduler;
     this.capabilities = capabilities;
+    this.installProgressPulse();
     this.telegramStreaming = config.channels.telegram.streaming ?? true;
     this.programmingMode = new ProgrammingMode();
+    this.researchMode = new ResearchMode();
+    this.saverMode = new SaverMode(config);
+    this.wireResearchModeToCapabilities();
     this.backgroundTasks = new BackgroundTaskManager();
+    this.workLedger = new WorkLedger();
 
     this.backgroundTasks.onGlobalComplete((task) => {
       this.notifyBackgroundTaskComplete(task);
@@ -332,6 +649,12 @@ export class Agent {
       await this.heartbeat();
     });
 
+    // After a migration (or when asked), reflect soon after boot instead of
+    // waiting an hour, so migrated candidates are judged against real sessions.
+    if (this.userMemory?.beliefs.getMeta('reflection_force') === '1') {
+      setTimeout(() => { void this.reflectNow(); }, 2 * 60 * 1000).unref();
+    }
+
     setAskUserHandler(async (question, choices, channelId, channelType) => {
       return this.presentChoice(question, choices, channelId, channelType);
     });
@@ -344,15 +667,61 @@ export class Agent {
     }
   }
 
+  /** Wire the Mercury Bots runtime (see bots/bot-manager.ts, BOTS-ARCHITECTURE.md). */
+  setBotManager(botManager: import('../bots/bot-manager.js').BotManager): void {
+    this.botManager = botManager;
+    botManager.setNotify(async (channelType, channelId, message) => {
+      const channel = this.channels.get(channelType as ChannelType);
+      if (channel) {
+        await channel.send(message, channelId).catch((e) => logger.warn({ e }, 'bot notify channel send failed'));
+      }
+    });
+    botManager.setSendFile(async (channelType, channelId, filePath) => {
+      const channel = this.channels.get(channelType as any);
+      if (channel) await channel.sendFile(filePath, channelId);
+    });
+    botManager.setAlert(async (message) => {
+      const channel = this.channels.getNotificationChannel();
+      // The CLI is NOT a needs-you surface: an alert printed there lands in
+      // the main chat (bot thread leak) — the bot's own thread already
+      // carries the event via botManager's own notify.
+      if (channel && channel.type !== 'cli') {
+        await channel.send(message).catch((e) => logger.warn({ e }, 'bot alert send failed'));
+      }
+    });
+  }
+
+  getBotManager(): import('../bots/bot-manager.js').BotManager | undefined {
+    return this.botManager;
+  }
+
+  setSessionSyncEnabled(enabled: boolean): void {
+    this.sessionSyncEnabled = enabled;
+  }
+
+  isSessionSyncEnabled(): boolean {
+    return this.sessionSyncEnabled;
+  }
+
+  acknowledgeCloudDelivery(requestId: string): void {
+    const key = `request:${requestId}`;
+    if (this.workLedger.get(key)) this.workLedger.markDelivered(key);
+  }
+
+  private wireResearchModeToCapabilities(): void {
+    this.capabilities.setResearchModeGetter(() => this.researchMode.isActive());
+  }
+
   setSupervisor(supervisor: import('../core/supervisor.js').SubAgentSupervisor): void {
     this.supervisor = supervisor;
     if (this.skillLoader) {
       this.skillBatcher = new SkillBatcher(supervisor, this.backgroundTasks);
     }
+    supervisor.setSaverMode(this.saverMode);
     supervisor.setNotifyCallback(async (channelType, channelId, message) => {
       const channel = this.channels.get(channelType as any);
       if (channel) {
-        await channel.send(message, channelId).catch(() => {});
+        await channel.send(message, channelId).catch((e) => logger.warn({ e }, 'channel send failed'));
       }
     });
     supervisor.setLifecycleCallback((event) => {
@@ -367,6 +736,9 @@ export class Agent {
 
       if (event.type === 'complete' && event.result) {
         const result = event.result;
+        // A step-budget pause is neither complete nor failed — the supervisor
+        // auto-resumes it; the background task stays open meanwhile.
+        if (result.status === 'paused') return;
         const status = result.status === 'completed' ? 'completed' : result.status === 'halted' ? 'cancelled' : 'failed';
         this.backgroundTasks.completeAgentTask(bgTask.id, status === 'completed' ? 0 : 1, status, result.output);
         this.syncBgTasksToTui();
@@ -374,10 +746,143 @@ export class Agent {
     });
   }
 
-  private enqueueMessage(msg: ChannelMessage): void {
+  enqueueMessage(msg: ChannelMessage): void {
     logger.info({ from: msg.channelType, content: msg.content.slice(0, 50) }, 'Message enqueued');
 
     const trimmed = msg.content.trim();
+
+    // Onboarding from a chat without a bot thread (Telegram, web, Discord):
+    // the next plain message in THAT chat is the new bot's persona — same
+    // state machine as the TUI, same choices, just addressed to the chat
+    // that asked. A slash command means the owner moved on.
+    if (this.pendingPersonaFor && this.pendingPersonaChannelId === msg.channelId && this.botManager) {
+      const botId = this.pendingPersonaFor;
+      const channel = this.channels.getChannelForMessage(msg);
+      if (trimmed.toLowerCase() === '/skip') {
+        this.pendingPersonaFor = null;
+        this.pendingPersonaChannelId = null;
+        channel?.send(`⏭ Keeping the starter persona — change it anytime with \`/bots persona ${botId} <text>\`.`, msg.channelId).catch(() => {});
+        return;
+      }
+      if (trimmed.startsWith('/')) {
+        this.pendingPersonaFor = null;
+        this.pendingPersonaChannelId = null;
+      } else if (channel) {
+        this.pendingPersonaChannelId = null;
+        this.finalizePersona(this.botManager, botId, trimmed, msg, this.pendingPersonaNewlyCreated).catch((err) => {
+          logger.warn({ err, botId }, 'Persona onboarding failed');
+        });
+        return;
+      }
+    }
+
+    // Mercury Bots never touch the main message queue — /bots is always
+    // fast-path, whether the main loop is busy or idle.
+    if (trimmed.startsWith('/bots')) {
+      const channel = this.channels.getChannelForMessage(msg);
+      if (channel) {
+        this.handleBotsCommand(trimmed, msg, channel).catch((err) => {
+          logger.error({ err: (err as any)?.message ?? err, content: trimmed.slice(0, 50) }, '/bots command failed');
+        });
+      }
+      return;
+    }
+
+    // A plugin setup or menu waiting for an answer in this chat ("2", "+91…").
+    if (!trimmed.startsWith('/') && hasPluginDialog(msg.channelId)) {
+      const channel = this.channels.getChannelForMessage(msg);
+      if (channel) {
+        answerPluginDialog(trimmed, msg, channel).catch((err) => {
+          logger.error({ err: err instanceof Error ? err.message : err }, 'plugin dialog failed');
+        });
+        return;
+      }
+    }
+
+    // /call and /calls: scheduled calls, worked out in code (no model turn).
+    if (/^\/calls?(\s|$)/.test(trimmed)) {
+      const channel = this.channels.getChannelForMessage(msg);
+      if (channel) {
+        void channel.send(handleCallCommand(trimmed, msg.senderRole === 'member'), msg.channelId).catch(() => {});
+      }
+      return;
+    }
+
+    // /plugins is fast-path like /bots: installing or toggling a plugin must
+    // work while a turn is running (that's often when you notice you need it).
+    if (/^\/plugins?(\s|$)/.test(trimmed)) {
+      const channel = this.channels.getChannelForMessage(msg);
+      if (channel) {
+        handlePluginsCommand(trimmed, msg, channel).catch((err) => {
+          logger.error({ err: err instanceof Error ? err.message : err, content: trimmed.slice(0, 50) }, '/plugins command failed');
+        });
+      }
+      return;
+    }
+
+    // Slash commands contributed by plugins. Built-in names are reserved,
+    // so a plugin can never take over /help, /stop, /bots and so on.
+    if (trimmed.startsWith('/')) {
+      const channel = this.channels.getChannelForMessage(msg);
+      if (channel && tryPluginCommand(trimmed, msg, channel)) return;
+    }
+
+    // /bot <id> <message> — talk to a named bot from ANY channel (TUI,
+    // Telegram, web). Durable enqueue; the run's output is delivered back
+    // to the requesting chat via the job's source (Telegram first).
+    if (trimmed.startsWith('/bot ')) {
+      if (!this.botManager) {
+        // Bots disabled: do NOT swallow the message — tell the user and stop.
+        const channel = this.channels.getChannelForMessage(msg);
+        void channel?.send('Bots are not enabled on this instance (set `bots.enabled: true` in mercury.yaml).', msg.channelId)
+          .catch((err) => logger.warn({ err }, 'bots-disabled notice failed'));
+        return;
+      }
+      const rest = trimmed.slice('/bot '.length).trim();
+      const spaceIndex = rest.indexOf(' ');
+      const rawTarget = (spaceIndex === -1 ? rest : rest.slice(0, spaceIndex)).toLowerCase();
+      const message = spaceIndex === -1 ? '' : rest.slice(spaceIndex + 1).trim();
+      // `/bot start <id>` etc. — a fleet-control verb typed on the message
+      // slash: the first token resolves to NO bot, so it was never a target.
+      // Route it to /bots (the control surface) instead of failing with a
+      // confusing "Could not message start: target_unknown".
+      if (BOT_CONTROL_VERBS.has(rawTarget) && !this.botManager.resolveBotId(rawTarget)) {
+        const channel = this.channels.getChannelForMessage(msg);
+        if (channel) {
+          this.handleBotsCommand(trimmed.replace(/^\/bot\b/, '/bots'), msg, channel).catch((err) => {
+            logger.error({ err: (err as any)?.message ?? err, content: trimmed.slice(0, 50) }, '/bots command failed');
+          });
+          return;
+        }
+      }
+      const botId = this.botManager.resolveBotId(rawTarget) ?? rawTarget;
+      if (botId && message) {
+        void this.dispatchToBot(botId, message, msg);
+      }
+      return;
+    }
+
+    // @<botId|name> <message> — mention-style routing (Telegram groups, etc.).
+    // Only intercepts when the first token resolves to a configured bot, so
+    // ordinary @-messages are never hijacked.
+    if (trimmed.startsWith('@') && this.botManager) {
+      const mention = this.parseBotMention(trimmed);
+      if (mention) {
+        void this.dispatchToBot(mention.botId, mention.message, msg);
+        return;
+      }
+    }
+
+    // /stop is asynchronous: the abort lands, the turn unwinds, THEN
+    // processing clears. A command typed in that window used to be answered
+    // "Agent is busy" — wait for the stop to finish and route it normally.
+    if (this.processing && trimmed.startsWith('/') && this.currentAbortReason && !msg.metadata?.waitedForStop) {
+      void this.waitUntilIdle(5000).then(() => {
+        msg.metadata = { ...msg.metadata, waitedForStop: true };
+        this.enqueueMessage(msg);
+      });
+      return;
+    }
 
     if (this.processing && trimmed.startsWith('/')) {
       this.handleFastPathCommand(msg).catch((err) => {
@@ -386,102 +891,297 @@ export class Agent {
       return;
     }
 
-    this.messageQueue.push(msg);
+    let workKey: string | undefined;
+    if (!trimmed.startsWith('/')) {
+      msg.metadata = {
+        ...msg.metadata,
+        workCwd: typeof msg.metadata?.workCwd === 'string' ? msg.metadata.workCwd : this.capabilities.getCwd(),
+      };
+      const accepted = this.workLedger.accept(msg);
+      workKey = accepted.entry.key;
+      if (!accepted.accepted) {
+        void this.handleDuplicateWork(accepted.entry);
+        return;
+      }
+    }
+
+    // Research-y message prompt: when research mode is off and the message looks
+    // like a deep-research request, ask whether to run a full research pass.
+    // Never prompt in Mercury Code (the coding TUI) — its questions are about
+    // the repo, not web research, so the prompt is pure friction there.
+    const isUserMessage = msg.channelType !== 'internal' && msg.senderId !== 'system' && !trimmed.startsWith('/');
+    const promptChannel = this.channels.getChannelForMessage(msg);
+    const inMercuryCode = promptChannel instanceof CLIChannel && promptChannel.getTuiState().mercuryCode != null;
+    // The word filter only decides whether to ask the model; the model
+    // decides whether the owner actually wants a research article. An
+    // instruction ("do X with the latest file") or a quick question never
+    // gets the prompt, and a failed or slow check means no prompt.
+    if (isUserMessage && !inMercuryCode && !this.researchMode.isActive() && looksResearchy(trimmed)) {
+      void this.wantsResearch(trimmed).then((wanted) => {
+        if (!wanted) {
+          this.routeIncoming(msg, workKey, trimmed, isUserMessage, inMercuryCode, promptChannel);
+          return;
+        }
+        this.promptResearchMode(msg, workKey).catch((err) => {
+          logger.warn({ err: err.message }, 'Research-mode prompt failed — proceeding with normal message');
+          this.queueMessage(msg, workKey);
+          this.processQueue();
+        });
+      });
+      return;
+    }
+
+    this.routeIncoming(msg, workKey, trimmed, isUserMessage, inMercuryCode, promptChannel);
+  }
+
+  /** After the research check: the Mercury Code hand-off, then the queue. */
+  private routeIncoming(
+    msg: ChannelMessage,
+    workKey: string | undefined,
+    trimmed: string,
+    isUserMessage: boolean,
+    inMercuryCode: boolean,
+    promptChannel: ReturnType<ChannelRegistry['getChannelForMessage']>,
+  ): void {
+    // Mercury Code hand-off: in the normal chat TUI, a coding-shaped task may
+    // belong in the coding TUI. Ask once; no answer within the timeout is
+    // treated as "No" and the request proceeds in normal chat — never blocked.
+    // The research prompt takes precedence when both match.
+    if (isUserMessage && !inMercuryCode && promptChannel instanceof CLIChannel && looksLikeCodingTask(trimmed)) {
+      this.promptMercuryCodeHandoff(promptChannel, msg, workKey).catch((err) => {
+        logger.warn({ err: err.message }, 'Mercury Code hand-off prompt failed — proceeding with normal message');
+        this.queueMessage(msg, workKey);
+        this.processQueue();
+      });
+      return;
+    }
+
+    this.queueMessage(msg, workKey);
     this.processQueue();
   }
 
-  private async handleFastPathCommand(msg: ChannelMessage): Promise<void> {
-    const trimmed = msg.content.trim();
-    const channel = this.channels.getChannelForMessage(msg);
-    if (!channel) return;
+  /**
+   * Mercury Code hand-off, with SESSION memory (like the session permission
+   * modes): an explicit Yes/No is remembered for the current session —
+   *
+   *   'code'  → later coding tasks auto-switch to Mercury Code, and every
+   *            automatic switch says WHY ("you chose it earlier this session")
+   *   'chat'  → later coding tasks never ask; they continue in normal chat
+   *
+   * A TIMEOUT is not a choice — nothing is remembered, and the next coding
+   * task asks again. The prompt itself still has a timeout so the request is
+   * never left blocked.
+   */
+  private async promptMercuryCodeHandoff(channel: CLIChannel, msg: ChannelMessage, workKey?: string): Promise<void> {
+    const preferenceKey = this.sessions.getOrCreateBound(msg.channelType, 'current', msg.sessionId ?? undefined).id;
+    const remembered = this.mercuryCodeHandoffPreferences.get(preferenceKey);
 
-    const activeAgents = this.supervisor ? this.supervisor.getActiveAgents() : [];
-    const hasActiveAgents = activeAgents.length > 0;
-    const busyPrefix = hasActiveAgents ? '' : '';
+    if (remembered === 'chat') {
+      // Remembered "No": keep chatting, never ask again this session.
+      this.queueMessage(msg, workKey);
+      this.processQueue();
+      return;
+    }
+    if (remembered === 'code') {
+      // Remembered "Yes": switch back automatically — and say why.
+      const cwd = this.capabilities.getCwd();
+      const entered = channel.enterMercuryCode(cwd, channel.getTuiState().version || 'dev');
+      if (entered.ok) {
+        this.syncProgrammingModeForCode(cwd, channel);
+        await channel.send('Switching to Mercury Code — you chose it for coding tasks earlier this session.', msg.channelId).catch(() => {});
+      }
+      this.queueMessage(msg, workKey);
+      this.processQueue();
+      return;
+    }
 
-    if (trimmed === '/agents' || trimmed === '/status') {
-      if (this.supervisor) {
-        const agents = this.supervisor.getActiveAgents();
-        if (agents.length === 0) {
-          await channel.send('No active sub-agents.', msg.channelId);
-        } else {
-          let text = '**Sub-Agents:**\n\n';
-          for (const a of agents) {
-            const icon = a.status === 'running' ? '🔄' : a.status === 'pending' ? '⏳' : a.status === 'completed' ? '✅' : '❌';
-            text += `${icon} **${a.id}**: ${a.task.slice(0, 60)}${a.task.length > 60 ? '...' : ''} — ${a.status}${a.progress ? ` (${a.progress})` : ''}\n`;
-          }
-          await channel.send(text, msg.channelId);
-        }
+    const choice = await this.presentChoiceWithTimeout(
+      'This looks like a coding task. Open it in Mercury Code (full-screen coding TUI — plan + build in one flow)?',
+      ['Yes — switch to Mercury Code (remembered for this session)', 'No — continue in normal chat (not asked again this session)'],
+      msg.channelId,
+      msg.channelType,
+      MERCURY_CODE_HANDOFF_TIMEOUT_MS,
+      1, // time-weighted default: No (not remembered — nobody answered)
+    );
+
+    if (choice.startsWith('Yes')) {
+      this.mercuryCodeHandoffPreferences.set(preferenceKey, 'code');
+      const cwd = this.capabilities.getCwd();
+      const entered = channel.enterMercuryCode(cwd, channel.getTuiState().version || 'dev');
+      if (entered.ok) {
+        this.syncProgrammingModeForCode(cwd, channel);
+        await channel.send('Mercury Code active (AUTO) — continuing your request here. I\'ll open it automatically for coding tasks for the rest of this session.', msg.channelId).catch(() => {});
       } else {
-        await channel.send('Sub-agents not enabled.', msg.channelId);
+        await channel.send(`Could not open Mercury Code (${entered.message}) — continuing in normal chat.`, msg.channelId).catch(() => {});
       }
-      return;
-    }
-
-    if (trimmed === '/halt' || trimmed === '/stop') {
-      if (this.supervisor) {
-        await this.supervisor.haltAll();
-        if (trimmed === '/stop') {
-          this.supervisor.clearTaskBoard();
-        }
-        await channel.send(trimmed === '/halt' ? 'All sub-agents halted.' : 'All agents stopped, locks released, task board cleared.', msg.channelId);
-      }
-      return;
-    }
-
-    if (trimmed.startsWith('/bg')) {
-      await this.handleBgCommand(trimmed, msg, channel);
-      return;
-    }
-
-    if (trimmed === '/progress' || trimmed === '/still') {
-      if (!this.processing || !this.currentMessage) {
-        await channel.send('No active foreground task.', msg.channelId);
-        return;
-      }
-      const elapsedSec = Math.round((Date.now() - this.currentMessage.timestamp) / 1000);
-      const stepInfo = this.completedStepCount > 0 ? ` · step ${this.completedStepCount}/${MAX_STEPS}` : '';
-      const narrative = formatNarrative(this.stepNarrative, this.currentActivity, 10);
-      const narrativeBlock = narrative ? `\n${narrative}` : '';
-      await channel.send(
-        `⏳ Task in progress (${elapsedSec}s${stepInfo})${narrativeBlock}\nUse /bg current to move it to background.`,
-        msg.channelId,
-      );
-      return;
-    }
-
-    if (trimmed === '/help') {
-      await channel.send('Agent is busy. Available: /agents, /halt, /stop, /progress, /spotify, /code, /memory, /bg', msg.channelId);
-      return;
-    }
-
-    if (trimmed.startsWith('/spotify')) {
-      await this.handleFastPathSpotify(trimmed, msg, channel);
-      return;
-    }
-
-    if (trimmed.startsWith('/code')) {
-      await this.handleFastPathCode(trimmed, msg, channel);
-      return;
-    }
-
-    if (trimmed === '/memory') {
-      await channel.send('Agent is busy. Memory management will be available after current task completes.', msg.channelId);
-      return;
-    }
-
-    if (hasActiveAgents) {
-      const agentList = activeAgents.map(a => `**${a.id}**: ${a.task.slice(0, 40)}`).join(', ');
-      await channel.send(`I'm busy working on sub-agent tasks (${agentList}). Your message has been queued — I'll respond once I'm free. Use /agents to check status.`, msg.channelId);
     } else {
-      const elapsedSec = this.currentMessage ? Math.round((Date.now() - this.currentMessage.timestamp) / 1000) : 0;
-      await channel.send(`I'm busy processing${elapsedSec > 0 ? ` (${elapsedSec}s elapsed)` : ''}. Use /progress for live status or /bg current to move this task to the background.`, msg.channelId);
+      await channel.send('Continuing in normal chat — I won\'t ask again this session.', msg.channelId).catch(() => {});
     }
-
-    this.messageQueue.push(msg);
+    this.queueMessage(msg, workKey);
+    this.processQueue();
   }
 
-  private async handleFastPathSpotify(trimmed: string, msg: ChannelMessage, channel: any): Promise<void> {
+  /** AUTO flow + project context, mirrored from the /code handler. */
+  private syncProgrammingModeForCode(cwd: string, channel: CLIChannel): void {
+    this.programmingMode.setAuto();
+    this.programmingMode.setProjectContext(cwd);
+    channel.setProgrammingStatus(this.programmingMode.getState(), this.programmingMode.getProjectContext());
+  }
+
+  /**
+   * presentChoice with a time-weighted default: if the user does not answer
+   * within `timeoutMs`, the fallback choice wins and the work continues; a
+   * later answer is discarded. The visible prompt is dismissed on timeout so
+   * it never lingers waiting for input nobody will give.
+   */
+  private async presentChoiceWithTimeout(
+    question: string,
+    choices: string[],
+    channelId: string,
+    channelType: string,
+    timeoutMs: number,
+    fallbackIndex: number,
+  ): Promise<string> {
+    const fallback = choices[fallbackIndex];
+    const channel = this.channels.get(channelType as any);
+    const timeoutPromise = new Promise<string>((resolve) => {
+      setTimeout(() => {
+        if (channel instanceof CLIChannel) channel.resolveChoicePromptWithDefault(String(fallbackIndex));
+        resolve(fallback);
+      }, timeoutMs);
+    });
+    return Promise.race([
+      this.presentChoice(question, choices, channelId, channelType).catch(() => fallback),
+      timeoutPromise,
+    ]);
+  }
+
+  queueMessage(message: ChannelMessage, workKey?: string): void {
+    if (workKey && this.queuedWorkKeys.has(workKey)) return;
+    this.messageQueue.push({ message, workKey });
+    if (workKey) this.queuedWorkKeys.add(workKey);
+  }
+
+  private async handleDuplicateWork(entry: WorkEntry): Promise<void> {
+    if (entry.status === 'completed' && !entry.delivered && entry.finalResponse) {
+      await this.deliverLedgerEntry(entry);
+      return;
+    }
+    const channel = this.channels.getChannelForMessage(entry.message);
+    if (!channel || entry.message.channelType === 'internal') return;
+    // For the web (Cloud chat) channel, don't send duplicate-status messages
+    // to the user. The Cloud dashboard already handles dedup on its end, and
+    // sending "This request is already running" creates a bad UX — the user
+    // sees a confusing system message instead of silence.
+    if (entry.message.channelType === 'web') return;
+    const status = entry.status === 'completed'
+      ? 'This request already completed and its result was delivered.'
+      : entry.status === 'failed'
+        ? `This request previously failed: ${entry.error || 'unknown error'}`
+        : entry.status === 'paused'
+          ? 'This task was paused before completing. Send "continue" to resume it with the work preserved.'
+          : entry.status === 'cancelled'
+            ? 'This request was cancelled earlier and was not resumed. Send it again if you want Mercury to run it.'
+            : `This request is already ${entry.status}${entry.attempts > 0 ? ` (attempt ${entry.attempts})` : ''}.`;
+    await channel.send(status, entry.message.channelId).catch((error) => {
+      logger.warn({ error, workKey: entry.key }, 'Unable to send duplicate work status');
+    });
+  }
+
+  /** One small model call: does this message ask for a full research article? */
+  private async wantsResearch(text: string): Promise<boolean> {
+    let model: ReturnType<ReturnType<ProviderRegistry['getDefault']>['getModelInstance']>;
+    try {
+      model = this.learningProviders().getDefault().getModelInstance();
+    } catch {
+      return false;
+    }
+    const verdict = await classifyResearchIntent(text, async (system, user) => {
+      const result = await generateText({ model, system, messages: [{ role: 'user', content: user }], maxOutputTokens: 8 });
+      return result.text;
+    });
+    logger.debug({ verdict }, 'Research intent');
+    return verdict === 'research';
+  }
+
+  private async promptResearchMode(msg: ChannelMessage, workKey?: string): Promise<void> {
+    const channel = this.channels.getChannelForMessage(msg);
+    if (!channel) {
+      this.queueMessage(msg, workKey);
+      this.processQueue();
+      return;
+    }
+
+    const explanation =
+      'Research mode will search the web, cross-check multiple sources, gather images, and produce a full research article as rich markdown. It runs longer than a quick answer and will not be killed early.';
+
+    // Time-weighted default (same contract as the Mercury Code hand-off): an
+    // unanswered prompt must never hold a chat message hostage. No answer
+    // within the window → "Quick answer", nothing remembered, and the next
+    // research-shaped question asks again. Quick answer is listed FIRST, so
+    // the picker starts on it and an accidental Enter never starts a long
+    // research run.
+    const choice = await this.presentChoiceWithTimeout(
+      `This looks like a research question. ${explanation}\n\nHow do you want to proceed?`,
+      ['Quick answer (normal conversation)', 'Full research mode (deep, multi-source article)'],
+      msg.channelId,
+      msg.channelType,
+      MERCURY_CODE_HANDOFF_TIMEOUT_MS,
+      0, // unanswered = Quick answer (not remembered — nobody chose)
+    );
+
+    if (choice.toLowerCase().startsWith('full')) {
+      this.researchMode.setOn(msg.content.trim().slice(0, 120));
+      if (channel instanceof WebChannel) {
+        channel.sendHeartbeat('Research mode: On. Gathering sources and building the article now — this may take a while.', msg.channelId);
+      } else {
+        await channel.send('Research mode: **On**. Gathering sources and building the article now — this may take a while.', msg.channelId).catch(() => {});
+      }
+    }
+    this.queueMessage(msg, workKey);
+    this.processQueue();
+  }
+
+  /**
+   * Stop all current work with /stop semantics. Shared by the chat fast-path
+   * command and the Cloud `task.stop` control so a remote stop behaves
+   * exactly like typing /stop locally. Returns the confirmation note.
+   */
+  async stopAllWork(reason: 'stopped' | 'halted'): Promise<string> {
+    if (this.currentAbort && !this.currentAbort.signal.aborted) {
+      this.currentAbortReason = reason;
+      this.currentAbort.abort();
+    }
+    // The user deliberately killed this work — cancel its ledger entry so
+    // a restart never tries to resume it. (Only real crashes auto-resume.)
+    if (this.currentWorkKey) {
+      const label = reason === 'stopped' ? 'Stopped by the user (/stop).' : 'Halted by the user (/halt).';
+      try { this.workLedger.markCancelled(this.currentWorkKey, label); } catch { /* entry may not exist */ }
+    }
+    if (this.supervisor) {
+      await this.supervisor.haltAll();
+      if (reason === 'stopped') {
+        this.supervisor.clearTaskBoard();
+      }
+      return reason === 'halted' ? 'All sub-agents halted.' : 'All agents stopped, locks released, task board cleared.';
+    }
+    return reason === 'halted' ? 'Foreground task halted.' : 'Foreground task stopped, locks released, task board cleared.';
+  }
+
+  /** Resolves when no turn is running (or after the deadline). */
+  private waitUntilIdle(maxMs: number): Promise<void> {
+    const deadline = Date.now() + maxMs;
+    return new Promise((resolve) => {
+      const tick = () => { if (!this.processing || Date.now() >= deadline) resolve(); else setTimeout(tick, 50); };
+      tick();
+    });
+  }
+
+  private async handleFastPathCommand(msg: ChannelMessage): Promise<void> {
+    return handleFastPathCommandImpl(this, msg);
+  }
+
+  async handleFastPathSpotify(trimmed: string, msg: ChannelMessage, channel: any): Promise<void> {
     if (!this.spotifyClient) {
       await channel.send('Spotify is not connected.', msg.channelId);
       return;
@@ -515,163 +1215,440 @@ export class Agent {
     await channel.send('Agent is busy. Full Spotify controls will be available after current task completes.', msg.channelId);
   }
 
-  private async handleFastPathCode(trimmed: string, msg: ChannelMessage, channel: any): Promise<void> {
+  async handleFastPathCode(trimmed: string, msg: ChannelMessage, channel: any): Promise<void> {
     const rawArgs = trimmed.slice('/code'.length).trim().toLowerCase();
     if (rawArgs === 'status') {
       await channel.send(this.programmingMode.getStatusText(), msg.channelId);
       return;
     }
+    if (rawArgs === 'exit' || rawArgs === 'quit') {
+      if (channel instanceof CLIChannel && channel.getTuiState().mercuryCode) {
+        channel.setMercuryCodeExitConfirm(true);
+        return;
+      }
+      this.programmingMode.setOff();
+      await channel.send('Programming mode: **Off**', msg.channelId);
+      return;
+    }
+    if (rawArgs === 'diff') {
+      try {
+        const { runGit } = await import('../capabilities/git/git-path.js');
+        const diff = await runGit('git', ['--no-pager', 'diff', '--no-color', 'HEAD'], { cwd: this.capabilities.getCwd(), timeoutMs: 30000 });
+        await channel.send(diff.trim() ? '```\n' + (diff.length > 20000 ? diff.slice(-20000) : diff) + '\n```' : 'Working tree is clean.', msg.channelId);
+      } catch (err: any) {
+        await channel.send(`git diff failed: ${err?.message || String(err)}`, msg.channelId);
+      }
+      return;
+    }
+    if (rawArgs === 'auto') {
+      this.programmingMode.setAuto();
+      if (channel instanceof CLIChannel) channel.setProgrammingStatus(this.programmingMode.getState(), this.programmingMode.getProjectContext());
+      await channel.send('Programming mode: **Auto** — Mercury plans and builds in one flow, confirming before large changes only.', msg.channelId);
+      return;
+    }
+    if (rawArgs === 'plan') {
+      this.programmingMode.setPlan();
+      if (channel instanceof CLIChannel) channel.setProgrammingStatus(this.programmingMode.getState(), this.programmingMode.getProjectContext());
+      await channel.send('Programming mode: **Plan**', msg.channelId);
+      return;
+    }
     await channel.send('Agent is busy. Programming mode changes will be available after current task completes.', msg.channelId);
   }
 
-  private async handleBgCommand(trimmed: string, msg: ChannelMessage, channel: any): Promise<void> {
-    const parts = trimmed.trim().split(/\s+/);
-    const sub = parts.length > 1 ? parts[1] : '';
-    const args = parts.slice(1).join(' ');
+  /**
+   * Persona finalization: before anything is written to persona.md, offer
+   * "Convert to template" (LLM-restructured, restructure-only) vs save
+   * as-is. TUI gets a real choice prompt; other channels default to
+   * template with graceful raw fallback on provider failure.
+   */
+  async finalizePersona(bm: import('../bots/bot-manager.js').BotManager, botId: string, raw: string, msg: ChannelMessage, newlyCreated = false): Promise<void> {
+    const channel = this.channels.getChannelForMessage(msg);
+    const manifest = bm.store.get(botId);
+    if (!channel || !manifest) return;
+    const channelType = msg.channelType as any;
+    const target = this.onboardingTarget(botId, msg, channel);
 
-    if (sub === 'current') {
-      if (!this.processing || !this.currentMessage) {
-        await channel.send('No active task to background.', msg.channelId);
-        return;
-      }
-      const taskDescription = this.currentMessage.content.trim();
-      const sourceChannelId = this.currentMessage.channelId;
-      const sourceChannelType = this.currentMessage.channelType as any;
+    let choice = 'template';
+    try {
+      choice = await this.presentChoice(
+        `Persona for **${manifest.name}** — how should it be saved?`,
+        ['Convert to template (recommended — structured, precise)', 'Save as-is', 'Cancel — that was a task, not a persona'],
+        msg.channelId,
+        channelType,
+      );
+    } catch {
+      choice = 'template';
+    }
 
-      if (this.currentAbort) {
-        this.currentAbort.abort();
-      }
+    if (choice.startsWith('Cancel')) {
+      // Escape hatch (review K1): the text was a real task — dispatch it,
+      // touch nothing on disk, and drop the pending capture.
+      this.pendingPersonaFor = null;
+      this.pendingBudgetFor = null;
+      await this.dispatchToBot(botId, raw, msg);
+      return;
+    }
 
-      if (this.supervisor) {
-        const agentId = await this.supervisor.spawn({
-          task: taskDescription,
-          sourceChannelId,
-          sourceChannelType,
-        });
-        const bgId = this.backgroundTasks.spawnAgent(taskDescription, this.capabilities.getCwd(), agentId);
-        await channel.send(`📋 Active task moved to background as ${bgId}. I'll notify you when it completes.`, msg.channelId);
+    let finalPersona = raw;
+    if (choice.startsWith('Convert')) {
+      // The builder is an LLM call (10-60s on slower providers) — the user
+      // must see it is working, or onboarding reads as a hang.
+      await channel.send('⏳ Running the persona builder — structuring your text (typically 10–60s)…', target).catch(() => {});
+      (channel as any).sendHeartbeat?.('⏳ Persona builder running…');
+      const refined = await refinePersona(raw, manifest.name, this.providers.getDefault());
+      (channel as any).clearHeartbeat?.();
+      if (refined) {
+        finalPersona = refined;
       } else {
-        await channel.send('Cannot background: sub-agents not available. The active task has been aborted.', msg.channelId);
+        await channel.send('⚠ Template conversion unavailable (provider) — saving your text as-is. Edit `persona.md` anytime.', msg.channelId).catch(() => {});
       }
-
-      this.syncBgTasksToTui();
-      return;
     }
 
-    if (sub === 'list' || sub === '' || sub === 'ls') {
-      const tasks = this.backgroundTasks.getAllSummaries();
-      if (tasks.length === 0) {
-        await channel.send('No background tasks.', msg.channelId);
-        return;
-      }
-      const lines = tasks.map((t) => {
-        const icon = t.status === 'running' ? '⏳' : t.status === 'completed' ? '✅' : t.status === 'failed' ? '❌' : t.status === 'timed_out' ? '⏱' : '⛔';
-        const label = t.command || t.task || t.id;
-        const elapsed = t.runningMs ? ` (${Math.round(t.runningMs / 1000)}s)` : t.completedAt ? ` (${((t.completedAt - t.startedAt) / 1000).toFixed(1)}s)` : '';
-        const short = label.length > 60 ? label.slice(0, 57) + '...' : label;
-        return `${icon} ${t.id}: ${short}${elapsed} — ${t.status}`;
-      });
-      await channel.send(`**Background Tasks:**\n${lines.join('\n')}\n\nUse /bg <id> for details, /bg cancel <id> to cancel, /bg clear to prune completed tasks.`, msg.channelId);
-      return;
+    bm.store.writePersona(botId, finalPersona.endsWith('\n') ? finalPersona : finalPersona + '\n');
+    bm.invalidateRuntime(botId);
+    this.pendingPersonaFor = null;
+    const mode = finalPersona === raw ? 'as-is' : 'as a structured template';
+    await channel.send(`✍️ Persona saved ${mode}.`, target).catch(() => {});
+
+    // New-bot onboarding: permission tier, then solo vs fleet (edits later never ask).
+    if (newlyCreated) {
+      await this.offerPermissionTier(bm, botId, manifest.name, msg, channel);
+      await this.offerFleetStep(bm, botId, manifest.name, msg, channel);
     }
 
-    if (sub === 'clear') {
-      const cleared = this.backgroundTasks.clearCompleted();
-      await channel.send(`Cleared ${cleared} completed task(s).`, msg.channelId);
-      this.syncBgTasksToTui();
+    // Final onboarding step: the daily token budget. Every bot has one
+    // (ADR-020) — the presets are sizes, not a yes/no.
+    const standard = this.config.bots?.suggestedDailyTokenBudget ?? 5_000_000;
+    if (channel.type !== 'cli') {
+      await this.offerBudgetChoice(bm, botId, manifest.name, msg, channel, standard);
       return;
     }
-
-    if (sub === 'cancel' || sub === 'stop' || sub === 'kill') {
-      const taskId = parts[2];
-      if (!taskId) {
-        await channel.send(`Usage: /bg ${sub} <id>`, msg.channelId);
-        return;
-      }
-      const cancelled = this.backgroundTasks.cancel(taskId);
-      if (cancelled) {
-        await channel.send(`⛔ Stopped background task ${taskId}.`, msg.channelId);
-      } else {
-        await channel.send(`Task "${taskId}" not found or not running.`, msg.channelId);
-      }
-      this.syncBgTasksToTui();
-      return;
-    }
-
-    if (sub === 'killall' || sub === 'stopall') {
-      const count = this.backgroundTasks.cancelAll();
-      if (count === 0) {
-        await channel.send('No running background tasks to stop.', msg.channelId);
-      } else {
-        await channel.send(`⛔ Stopped ${count} background task${count === 1 ? '' : 's'}.`, msg.channelId);
-      }
-      this.syncBgTasksToTui();
-      return;
-    }
-
-    const specificTask = this.backgroundTasks.getSummary(sub);
-    if (specificTask) {
-      const task = this.backgroundTasks.get(sub)!;
-      const label = task.command || task.task || task.id;
-      const elapsed = task.status === 'running'
-        ? `Running for ${Math.round((Date.now() - task.startedAt) / 1000)}s`
-        : task.completedAt
-          ? `Completed in ${((task.completedAt - task.startedAt) / 1000).toFixed(1)}s`
-          : task.status;
-      const output = (task.stdout + '\n' + task.stderr).trim();
-      const preview = output.length > 2000 ? output.slice(-2000) : output;
-      await channel.send(`**${specificTask.id}**: ${label}\nStatus: ${elapsed}\nExit code: ${task.exitCode ?? 'N/A'}\n\n${preview || '(no output)'}`, msg.channelId);
-      return;
-    }
-
-    const colonIdx = trimmed.indexOf(':');
-    if (colonIdx !== -1 && trimmed[colonIdx + 1] === ' ') {
-      const taskDescription = trimmed.slice(colonIdx + 1).trim();
-      if (!taskDescription) {
-        await channel.send('Usage: /bg: <natural language task> or /bg <shell command>', msg.channelId);
-        return;
-      }
-      if (!this.supervisor) {
-        await channel.send('Sub-agents are not available. Use /bg <command> for shell commands.', msg.channelId);
-        return;
-      }
-      const agentId = await this.supervisor.spawn({
-        task: taskDescription,
-        sourceChannelId: msg.channelId,
-        sourceChannelType: msg.channelType as any,
-      });
-      const bgId = this.backgroundTasks.spawnAgent(taskDescription, this.capabilities.getCwd(), agentId);
-      this.backgroundTasks.registerComplete(bgId, (task) => {
-        if (task.status === 'running') return;
-      });
-      await channel.send(`📋 Background agent ${bgId} started: "${taskDescription.slice(0, 50)}${taskDescription.length > 50 ? '...' : ''}"`, msg.channelId);
-      this.syncBgTasksToTui();
-      return;
-    }
-
-    const command = args || '';
-    if (!command) {
-      await channel.send('Usage:\n• /bg <command> — run a shell command in the background\n• /bg: <task> — delegate an LLM task to the background\n• /bg current — move the active task to the background\n• /bg list — show all background tasks\n• /bg <id> — show task details\n• /bg stop <id> — stop a running task\n• /bg killall — stop all running tasks\n• /bg clear — prune completed tasks', msg.channelId);
-      return;
-    }
-
-    const cwd = this.capabilities.getCwd();
-    const bgId = this.backgroundTasks.spawnShell(command, cwd);
-    await channel.send(`📋 Background task ${bgId} started: "${command.slice(0, 50)}${command.length > 50 ? '...' : ''}"`, msg.channelId);
-    this.syncBgTasksToTui();
+    this.pendingBudgetFor = botId;
+    const home = homedir();
+    const folder = bm.store.deliverablesDir(botId);
+    await channel.send(
+      `Last step — how much may **${manifest.name}** spend per day?\n` +
+      `• \`light\` — 1M tokens/day (a few runs)\n` +
+      `• \`standard\` — ${standard.toLocaleString()}/day (default — just type your first task)\n` +
+      `• \`heavy\` — 20M/day (a busy fleet)\n` +
+      `• a number, or \`none\` for no cap\n` +
+      `When the cap is hit the bot pauses until tomorrow; you are warned at 80%. Change anytime: \`/bots budget ${botId} <tokens|suggest|none>\`.\n` +
+      `📁 Its results will appear in \`${folder.startsWith(home) ? '~' + folder.slice(home.length) : folder}\` (\`/bots folder ${botId}\` opens it).`,
+      target,
+    ).catch(() => {});
   }
 
-  private syncBgTasksToTui(): void {
+  /**
+   * Where onboarding talks: the bot's own thread in the TUI, the chat that
+   * asked everywhere else (Telegram cannot resolve `bot:<id>`).
+   */
+  private onboardingTarget(botId: string, msg: ChannelMessage, channel: { type?: string }): string {
+    return channel.type === 'cli' ? `bot:${botId}` : msg.channelId;
+  }
+
+  /** Budget step as buttons (Telegram/web): sizes, not a typed keyword. */
+  private async offerBudgetChoice(bm: import('../bots/bot-manager.js').BotManager, botId: string, botName: string, msg: ChannelMessage, channel: { send: (text: string, target?: string) => Promise<void> }, standard: number): Promise<void> {
+    const home = homedir();
+    const folder = bm.store.deliverablesDir(botId);
+    const options = [
+      `Standard — ${standard.toLocaleString()}/day (recommended)`,
+      'Light — 1M/day',
+      'Heavy — 20M/day',
+      'No cap',
+    ];
+    let choice = options[0];
+    try {
+      choice = await this.presentChoice(
+        `Last step — how much may **${botName}** spend per day? When the cap is hit it pauses until tomorrow (warned at 80%). Change anytime: \`/bots budget ${botId} <tokens|suggest|none>\`.\n📁 Results will appear in \`${folder.startsWith(home) ? '~' + folder.slice(home.length) : folder}\`.`,
+        options,
+        msg.channelId,
+        msg.channelType,
+      );
+    } catch {
+      choice = options[0];
+    }
+    const keyword = choice.startsWith('Light') ? 'light' : choice.startsWith('Heavy') ? 'heavy' : choice.startsWith('No cap') ? 'none' : 'standard';
+    this.pendingBudgetFor = botId;
+    await this.applyBudgetAnswer(bm, botId, keyword, msg);
+    await channel.send(`✅ **${botName}** is ready. Give it work with \`/bot ${botId} <task>\` or \`@${botId} <task>\` — results come back here, with the files.`, msg.channelId).catch(() => {});
+  }
+
+  /**
+   * Permission-tier onboarding step (new bots only): one clear question
+   * instead of silent fail-closed defaults + manual file editing. Change
+   * anytime with `/bots permissions <id> <tier>`.
+   */
+  private async offerPermissionTier(bm: import('../bots/bot-manager.js').BotManager, botId: string, botName: string, msg: ChannelMessage, channel: any): Promise<void> {
+    const target = this.onboardingTarget(botId, msg, channel);
+    let choice = 'Read-only (recommended default)';
+    try {
+      choice = await this.presentChoice(
+        `What should **${botName}** be allowed to do?\n` +
+        Object.values(PERMISSION_TIERS).map(t => `• **${t.label}** — ${t.description}`).join('\n') +
+        '\n(Path scopes always stay fail-closed — a tool only reaches what its Access grants cover.)',
+        Object.values(PERMISSION_TIERS).map(t => t.label),
+        msg.channelId,
+        msg.channelType as any,
+      );
+    } catch {
+      choice = 'Read-only (recommended default)';
+    }
+    const tier = (Object.entries(PERMISSION_TIERS).find(([, t]) => choice.startsWith(t.label))?.[0] ?? 'readonly') as PermissionTier;
+    // The tier must EXECUTE: write the full permission file (tool gate +
+    // path scopes) — the single source of truth. The old manifest-only write
+    // left the path gate at fail-closed defaults, so a "full access" bot
+    // still could not read anything outside its sandbox.
+    bm.store.writePermissions(botId, tierPermissionsFile(tier));
+    bm.store.update(botId, m => { delete (m as any).tools; });
+    bm.invalidateRuntime(botId);
+    await channel.send(`🔐 Permissions for **${botName}**: **${PERMISSION_TIERS[tier].label}**. Change anytime with \`/bots permissions ${botId} <readonly|builder|operator|full>\`.`, target).catch(() => {});
+  }
+
+  /**
+   * Fleet onboarding step (new bots only): solo vs lead. Auto-build asks one
+   * LLM call for a matched crew; manual points at `/bots add-crew`. The
+   * budget step follows either way.
+   */
+  async offerFleetStep(bm: import('../bots/bot-manager.js').BotManager, botId: string, botName: string, msg: ChannelMessage, channel: any): Promise<void> {
+    const target = this.onboardingTarget(botId, msg, channel);
+    let choice = 'Solo bot';
+    try {
+      choice = await this.presentChoice(
+        `Should **${botName}** work solo, or lead a fleet of sub-bots?`,
+        ['Solo bot', 'Lead a fleet — auto-build the crew', 'Lead a fleet — I\'ll add crew myself'],
+        msg.channelId,
+        msg.channelType as any,
+      );
+    } catch {
+      choice = 'Solo bot';
+    }
+    if (choice.startsWith('Solo')) return;
+
+    // Promote to lead before any crew exists.
+    bm.store.update(botId, m => { m.fleetRole = 'lead'; });
+    bm.invalidateRuntime(botId);
+
+    if (choice.startsWith('Lead a fleet — I\'ll')) {
+      await channel.send(
+        `👑 **${botName}** is now a fleet lead. Add specialists anytime:\n` +
+        `\`/bots add-crew ${botId} <id> "Name" "Description" "persona (optional)"\`\n` +
+        `Review the fleet with \`/bots crew ${botId}\` — or just tell **${botName}** to hire its own crew (it has bot_spawn).`,
+        target,
+      ).catch(() => {});
+      return;
+    }
+
+    // Auto-build: one LLM proposal, created through the standard path. This
+    // is an LLM call (30-90s) — it must NOT hold onboarding hostage: run it
+    // detached with visible progress, and deliver the roster when ready.
+    await channel.send(`👑 **${botName}** is now a fleet lead — building the crew in the background…`, target).catch(() => {});
+    (channel as any).sendHeartbeat?.('⏳ Proposing fleet crew (up to ~90s)…');
+    const persona = bm.store.readPersona(botId);
+    const leadDescription = bm.store.get(botId)?.description ?? '';
+    void (async () => {
+      try {
+        const proposals = await proposeCrew(botName, leadDescription, persona, this.providers.getDefault(), bm.maxCrew());
+        (channel as any).clearHeartbeat?.();
+        if (proposals.length === 0) {
+          await channel.send(`⚠ Crew proposal unavailable (provider) — **${botName}** is a lead with an empty crew. Add members with \`/bots add-crew ${botId} <id> "Name" "Description" "persona"\` or tell the lead to hire its own.`, target).catch(() => {});
+          return;
+        }
+        const lines: string[] = [`👑 **${botName}** fleet ready — ${proposals.length} crew member(s) created:`, ''];
+        for (const p of proposals) {
+          const result = bm.addCrew(botId, p);
+          if (result.ok) {
+            lines.push(result.duplicate
+              ? `• **${p.name}** (\`${result.manifest.id}\`) — already on the crew, skipped`
+              : `• **${p.name}** (\`${result.manifest.id}\`) — ${p.description || 'specialist'}`);
+          } else {
+            lines.push(`⚠ ${p.name} (${p.id}): ${result.error}`);
+          }
+        }
+        lines.push('', 'Dispatch tasks with `/bot <crewId> <task>` or tell the lead to delegate — it can also spawn more crew itself.');
+        await channel.send(lines.join('\n'), target).catch(() => {});
+      } catch (err: any) {
+        (channel as any).clearHeartbeat?.();
+        await channel.send(`⚠ Fleet auto-build failed: ${err?.message ?? err} — **${botName}** is a lead with an empty crew; add members with \`/bots add-crew ${botId} <id> "Name" "Description" "persona"\`.`, target).catch(() => {});
+      }
+    })();
+  }
+
+  /** Apply the budget answer typed after the persona step (or a later task). */
+  private async applyBudgetAnswer(bm: import('../bots/bot-manager.js').BotManager, botId: string, message: string, msg: ChannelMessage): Promise<boolean> {
+    const value = message.trim().toLowerCase();
+    const isBudgetCommand = /^\d+$/.test(value) || ['suggest', 'none', 'skip', 'light', 'standard', 'heavy', 'unlimited'].includes(value);
+    if (!isBudgetCommand) {
+      // Not a budget answer — treat as the user's first task; budget stays unset.
+      this.pendingBudgetFor = null;
+      return false;
+    }
+    this.pendingBudgetFor = null;
+    const manifest = bm.store.get(botId);
+    const suggested = this.config.bots?.suggestedDailyTokenBudget ?? 5_000_000;
+    let applied: string;
+    const presets: Record<string, number> = { light: 1_000_000, heavy: 20_000_000 };
+    if (value === 'suggest' || value === 'standard' || value === 'skip') {
+      // The fleet default applies (ADR-020): nothing to write.
+      bm.store.update(botId, m => { if (m.autonomy) delete m.autonomy.dailyTokenBudget; });
+      applied = `${suggested.toLocaleString()}/day (default)`;
+    } else if (value === 'none' || value === 'unlimited') {
+      bm.store.update(botId, m => { m.autonomy = { ...m.autonomy, dailyTokenBudget: 0 }; });
+      applied = 'no cap (unlimited)';
+    } else if (presets[value]) {
+      bm.store.update(botId, m => { m.autonomy = { ...m.autonomy, dailyTokenBudget: presets[value] }; });
+      applied = `${presets[value].toLocaleString()}/day`;
+    } else {
+      const n = parseInt(value, 10);
+      bm.store.update(botId, m => { m.autonomy = { ...m.autonomy, dailyTokenBudget: n }; });
+      applied = `${n.toLocaleString()}/day`;
+    }
+    bm.invalidateRuntime(botId);
+    const channel = this.channels.getChannelForMessage(msg);
+    await channel?.send(`💰 Budget for **${manifest?.name ?? botId}**: ${applied}. When the cap is hit the bot pauses until the next day — never killed.`, channel ? this.onboardingTarget(botId, msg, channel) : msg.channelId)
+      .catch(() => {});
+    return true;
+  }
+
+  /** Enqueue a bot turn from any channel, with ack + reply-back routing. */
+  private async dispatchToBot(botId: string, message: string, msg: ChannelMessage): Promise<void> {
+    const bm = this.botManager;
+    if (!bm) return;
+    const channel = this.channels.getChannelForMessage(msg);
+    if (!channel) return;
+
+    // Budget step runs after the persona step: the next message answers it
+    // if it looks like one; anything else is the user's first real task.
+    if (this.pendingBudgetFor) {
+      if (this.pendingBudgetFor !== botId) {
+        this.pendingBudgetFor = null;
+      } else {
+        const handled = await this.applyBudgetAnswer(bm, botId, message, msg);
+        if (handled) return;
+      }
+    }
+
+    // Post-create persona setup: the first message typed into the new bot's
+    // chat becomes its persona instead of a task (send /skip to keep the
+    // template). Any dispatch to a different bot cancels the pending setup.
+    if (this.pendingPersonaFor) {
+      if (this.pendingPersonaFor !== botId) {
+        this.pendingPersonaFor = null;
+      } else if (message.trim().toLowerCase() === '/skip') {
+        this.pendingPersonaFor = null;
+        await channel.send('⏭ Keeping the starter persona — edit it anytime with `/persona` here or `/bots persona <id> <text>`.', `bot:${botId}`)
+          .catch(() => {});
+        return;
+      } else {
+        // Offer the "convert to template" step before anything hits disk.
+        await this.finalizePersona(bm, botId, message.trim(), msg, this.pendingPersonaNewlyCreated);
+        return;
+      }
+    }
+    // Dispatched from inside that bot's TUI chat → ack and reply land in
+    // the bot's own transcript (targetId `bot:<id>`; cli.ts routes it).
+    const pendingBot = (channel as any).consumePendingBotChatTarget?.() ?? null;
+    const inBotChat = pendingBot === botId;
+    const replyTarget = inBotChat ? `bot:${botId}` : msg.channelId;
+    const result = bm.enqueue(botId, {
+      trigger: 'chat',
+      prompt: message,
+      source: { channelType: msg.channelType, channelId: replyTarget },
+    });
+    if (result.accepted) {
+      await channel.send(`🤖 Queued for **${botId}** (job ${result.jobId}) — the reply will arrive in this chat.`, replyTarget)
+        .catch((err) => logger.warn({ err }, '/bot ack send failed'));
+    } else {
+      await channel.send(`Could not message **${botId}**: [reason: ${result.reasonCode}]`, replyTarget)
+        .catch((err) => logger.warn({ err }, '/bot ack send failed'));
+    }
+  }
+
+  /**
+   * Parse `@<botId|Name> <message>` into a bot routing when the first token
+   * resolves to a configured bot; null for any other @-message.
+   */
+  private parseBotMention(content: string): { botId: string; message: string } | null {
+    const bm = this.botManager;
+    if (!bm) return null;
+    const firstSpace = content.indexOf(' ');
+    const token = (firstSpace === -1 ? content : content.slice(0, firstSpace)).replace(/^@/, '').trim();
+    const message = firstSpace === -1 ? '' : content.slice(firstSpace + 1).trim();
+    if (!token || !message) return null;
+    const botId = bm.resolveBotId(token);
+    return botId ? { botId, message } : null;
+  }
+
+  /**
+   * /bots — Mercury Bots control surface (BOTS-ARCHITECTURE.md §2.7).
+   * Always fast-path: bots live outside the main message queue, so bot
+   * control stays responsive while the agent is busy.
+   */
+  async handleBotsCommand(trimmed: string, msg: ChannelMessage, channel: any): Promise<void> {
+    return handleBotsCommandImpl(this, trimmed, msg, channel);
+  }
+
+  async handleBgCommand(trimmed: string, msg: ChannelMessage, channel: any): Promise<void> {
+    return handleBgCommandImpl(this, trimmed, msg, channel);
+  }
+
+  syncBgTasksToTui(): void {
     const cliChannel = this.channels.get('cli');
     if (cliChannel && cliChannel instanceof CLIChannel) {
       (cliChannel as CLIChannel).updateBackgroundTasks(this.backgroundTasks.getAllSummaries());
     }
   }
 
+  /**
+   * Long-running tools (run_command) pulse this while they are alive so the
+   * foreground heartbeat and the StallWatchdog do not abort a legitimate
+   * ten-minute build as a "stalled provider". See core/progress-pulse.ts.
+   */
+  private installProgressPulse(): void {
+    setProgressPulse(() => this.markProgress());
+  }
+
   private markProgress(activity?: string): void {
     this.lastProgressAt = Date.now();
     if (activity) {
       this.currentActivity = activity;
+    }
+  }
+
+  /**
+   * Push a phase change to the CLI live feedback block in real time.
+   * Cheap no-op for non-CLI channels.
+   */
+  private pushLiveActivity(phase: string, detail?: string): void {
+    const ch = this.channels.get('cli');
+    if (ch instanceof CLIChannel) ch.setLiveActivity(phase, detail);
+  }
+
+  /**
+   * Push a tool execution event to the CLI live feedback in real time.
+   * Unlike onStepFinish (which fires after the whole LLM step), this fires at
+   * tool start/finish so the TUI shows running work during long operations.
+   */
+  private pushLiveToolEvent(
+    callId: string,
+    toolName: string,
+    argsOrResult: Record<string, any> | unknown,
+    status: 'running' | 'done' | 'error',
+    durationMs?: number,
+  ): void {
+    // Channels that narrate progress themselves (plugin channels: a voice call
+    // speaks "still searching the web…") hear about every tool start.
+    if (status === 'running' && this.currentMessage) {
+      const current = this.channels.getChannelForMessage(this.currentMessage) as { toolStarted?: (channelId: string, toolName: string) => void } | undefined;
+      if (typeof current?.toolStarted === 'function') {
+        try { current.toolStarted(this.currentMessage.channelId, toolName); } catch { /* best effort */ }
+      }
+    }
+    const ch = this.channels.get('cli');
+    if (!(ch instanceof CLIChannel)) return;
+    if (status === 'running') {
+      void ch.sendToolEvent(toolName, argsOrResult as Record<string, any>, callId).catch(() => {});
+    } else {
+      ch.completeToolEvent(toolName, argsOrResult, status === 'error', durationMs, callId);
     }
   }
 
@@ -685,6 +1662,12 @@ export class Agent {
     })();
   }
 
+  private withProviderDeadline<T>(operation: PromiseLike<T>, controller: AbortController, deadlineAt: number): Promise<T> {
+    return withAbortDeadline(operation, controller, deadlineAt - Date.now(), () => {
+      this.currentAbortReason = 'time-limit';
+    });
+  }
+
   private startForegroundHeartbeat(msg: ChannelMessage): () => void {
     if (msg.channelType === 'internal') return () => {};
 
@@ -695,20 +1678,23 @@ export class Agent {
     const tick = () => {
       if (!this.processing || !this.currentMessage || this.currentMessage.id !== msg.id) return;
       const channel = this.channels.getChannelForMessage(msg);
-      if (!channel) return;
 
       const elapsedMs = Date.now() - this.currentMessage.timestamp;
       const stallMs = Date.now() - this.lastProgressAt;
       const elapsedSec = Math.round(elapsedMs / 1000);
       const stallSec = Math.round(stallMs / 1000);
 
-      if (stallMs >= MAX_STALL_MS && this.currentAbort && !this.currentAbort.signal.aborted) {
+      if (stallMs >= MAX_STALL_MS * this.researchMode.getStallMsMultiplier() && this.currentAbort && !this.currentAbort.signal.aborted) {
         logger.warn({ elapsedSec, stallSec, msgId: msg.id }, 'Foreground task stalled — aborting');
+        this.currentAbortReason = 'stalled';
         this.currentAbort.abort();
-        void channel.send(
-          `⚠ Task stalled (no progress for ${stallSec}s). Stopped to avoid hanging. You can retry or use /bg current sooner for long tasks.`,
-          msg.channelId,
-        ).catch(() => {});
+        if (channel) {
+          void channel.send(
+            `Mercury detected a stalled provider after ${stallSec}s without progress. Reconnecting and retrying automatically.`,
+            msg.channelId,
+          ).catch((e) => logger.warn({ e }, 'channel send failed'));
+        }
+        timer = setTimeout(tick, HEARTBEAT_MAX_MS);
         return;
       }
 
@@ -721,10 +1707,26 @@ export class Agent {
         : '';
       const narrative = formatNarrative(this.stepNarrative, this.currentActivity, 3);
       const narrativeBlock = narrative ? `\n${narrative}` : '';
-      void channel.send(
-        `⏳ Working... ${elapsedSec}s elapsed${stepInfo}.${narrativeBlock}${handoffHint}`,
-        msg.channelId,
-      ).catch(() => {});
+      const heartbeatText = `⏳ Working... ${elapsedSec}s elapsed${stepInfo}.${narrativeBlock}${handoffHint}`;
+
+      // CLI: update one message in place instead of stacking new ones.
+      // Web/cloud: send a non-terminal heartbeat so the cloud response handler stays alive.
+      // Other channels (Telegram): still send as separate messages.
+      if (channel instanceof CLIChannel) {
+        (channel as CLIChannel).sendHeartbeat(heartbeatText);
+      } else if (channel instanceof WebChannel) {
+        (channel as WebChannel).sendHeartbeat(heartbeatText, msg.channelId);
+      } else if (channel && (channel as { quietProgress?: boolean }).quietProgress) {
+        // Phone chats (plugin channels like WhatsApp): keep "typing…" alive, and
+        // say once, early, that this one is taking a while and what it's doing.
+        void channel.typing(msg.channelId).catch(() => {});
+        if (heartbeatCount === 1) {
+          const doing = this.currentActivity ? this.currentActivity.replace(/[.…]+$/, '') : 'working on it';
+          void channel.send(`⏳ This one takes a moment. Still on it: ${doing.charAt(0).toLowerCase()}${doing.slice(1)}…`, msg.channelId).catch(() => {});
+        }
+      } else if (channel) {
+        void channel.send(heartbeatText, msg.channelId).catch((e) => logger.warn({ e }, 'channel send failed'));
+      }
 
       // Escalate: 20s → 30s → 45s → 60s (cap)
       if (heartbeatCount <= 2) {
@@ -741,6 +1743,14 @@ export class Agent {
 
     return () => {
       if (timer) clearTimeout(timer);
+      // The task is over — remove any lingering heartbeat message (the
+      // "⏳ Working... Ns elapsed" block with step list / "Streaming
+      // response...") from the TUI so nothing trails a finished task.
+      // Late ticks can fire after the final send already cleared it.
+      try {
+        const ch = this.channels.getChannelForMessage(msg);
+        if (ch instanceof CLIChannel) (ch as CLIChannel).clearHeartbeat();
+      } catch { /* best effort */ }
     };
   }
 
@@ -769,11 +1779,19 @@ export class Agent {
 
     const cliCh = this.channels.get('cli');
     if (cliCh) {
-      (cliCh as CLIChannel).send(message).catch(() => {});
+      (cliCh as CLIChannel).send(message).catch((e) => logger.warn({ e }, 'channel send failed'));
     }
     const tgCh = this.channels.get('telegram');
     if (tgCh) {
-      tgCh.send(message).catch(() => {});
+      tgCh.send(message).catch((e) => logger.warn({ e }, 'channel send failed'));
+    }
+    const dcCh = this.channels.get('discord');
+    if (dcCh) {
+      dcCh.send(message).catch((e) => logger.warn({ e }, 'channel send failed'));
+    }
+    const slCh = this.channels.get('slack');
+    if (slCh) {
+      slCh.send(message).catch((e) => logger.warn({ e }, 'channel send failed'));
     }
 
     this.syncBgTasksToTui();
@@ -782,39 +1800,328 @@ export class Agent {
   private async processQueue(): Promise<void> {
     if (this.processing) return;
     if (this.messageQueue.length === 0) return;
+    if (!this.running) return;
     if (!this.lifecycle.is('idle')) return;
 
     this.processing = true;
 
-    while (this.messageQueue.length > 0) {
-      const msg = this.messageQueue.shift()!;
-      try {
-        await this.handleMessage(msg);
-      } catch (err) {
-        logger.error({ err, msg: msg.content.slice(0, 50) }, 'Failed to handle message');
+    try {
+      while (this.messageQueue.length > 0) {
+        const item = this.messageQueue.shift()!;
+        const msg = item.message;
+        if (item.workKey) this.queuedWorkKeys.delete(item.workKey);
+        this.currentWorkKey = item.workKey ?? null;
+        try {
+          if (item.workKey) this.workLedger.markRunning(item.workKey);
+          await this.handleMessage(msg);
+          if (item.workKey && this.workLedger.get(item.workKey)?.status === 'running') {
+            this.workLedger.markFailed(item.workKey, 'Work ended without producing a durable final response');
+          }
+        } catch (err) {
+          if (item.workKey) {
+            const entry = this.workLedger.get(item.workKey);
+            if (entry?.status === 'completed') this.workLedger.markDeliveryError(item.workKey, err);
+            else this.workLedger.markFailed(item.workKey, err);
+          }
+          logger.error({ err, msg: msg.content.slice(0, 50) }, 'Failed to handle message');
+        } finally {
+          this.currentWorkKey = null;
+          if (!this.lifecycle.is('idle') && this.lifecycle.canTransitionTo('idle')) {
+            this.lifecycle.transition('idle');
+          }
+        }
       }
+    } finally {
+      this.processing = false;
+      if (this.messageQueue.length > 0) void this.processQueue();
     }
-
-    this.processing = false;
   }
 
-  private async switchSessionProvider(providerName: string): Promise<{ ok: boolean; message: string }> {
+  /**
+   * One inline continuation round: re-enter generation with the full tool
+   * loop and a fresh step budget, nudged by a system-style user message.
+   * Used by the completion-contract paths (step-budget resume, verification
+   * gate). Throws on provider interruption — the caller decides whether that
+   * is fatal for its path.
+   */
+  private async runInlineContinuationRound(opts: {
+    messages: unknown[];
+    systemPrompt: string;
+    /** Per-turn context block (memory, loop warnings); see withCachedSystem. */
+    volatileSystem?: string;
+    provider: any;
+    maxOutputTokens: number;
+    maxSteps: number;
+    abortController: AbortController;
+    channel: any;
+    channelId: string;
+    /** Mechanically force the first step to contain a tool call. */
+    forceFirstTool?: boolean;
+    onStep: (toolCalls: any[] | undefined, toolResults: any[] | undefined) => void | Promise<void>;
+  }): Promise<{ text: string; usage: any; reasoning?: any; finishReason?: string }> {
+    this.markProgress(`Resuming with ${opts.provider.name}...`);
+    const deadlineAt = Date.now() + MAX_PROVIDER_ATTEMPT_MS;
+    const stream = streamText({
+      model: opts.provider.getModelInstance(),
+      // Mercury builds this system message itself (trusted, not user input);
+      // opting in stops the SDK printing a warning on every call.
+      allowSystemInMessages: true,
+      messages: this.withCachedSystem(opts.systemPrompt, opts.messages, opts.volatileSystem),
+      tools: this.capabilities.getTools(),
+      maxOutputTokens: opts.maxOutputTokens,
+      stopWhen: stepCountIs(opts.maxSteps),
+      // forceFirstTool: the first step MUST contain a tool call — narration
+      // rounds are converted into action rounds mechanically.
+      prepareStep: opts.forceFirstTool
+        ? ({ steps }) => (steps.length === 0 ? { toolChoice: 'required' as const } : {})
+        : undefined,
+      // Live tool-step UI during continuation rounds: forced/verification
+      // rounds land file writes, and the user must SEE which file is being
+      // written at the bottom, exactly as in the main loop.
+      experimental_onToolCallStart: ({ toolCall }: any) => {
+        const tc = toolCall as any;
+        this.markProgress(formatToolStep(tc.toolName, tc.input as Record<string, any> || {}));
+        this.pushLiveToolEvent(tc.toolCallId ?? `${tc.toolName}:${Date.now()}`, tc.toolName, tc.input as Record<string, any> || {}, 'running');
+      },
+      experimental_onToolCallFinish: ({ toolCall, success, output, error, durationMs }: any) => {
+        const tc = toolCall as any;
+        this.pushLiveToolEvent(
+          tc.toolCallId ?? `${tc.toolName}:${Date.now()}`,
+          tc.toolName,
+          success ? output : error,
+          success ? 'done' : 'error',
+          durationMs,
+        );
+      },
+      abortSignal: opts.abortController.signal,
+      experimental_include: { requestBody: false },
+      onStepFinish: async ({ toolCalls, toolResults }) => {
+        await opts.onStep(toolCalls as any[], toolResults as any[]);
+      },
+    });
+    const text = (opts.channel
+      ? await this.withProviderDeadline(
+        opts.channel.stream(stepAwareTextStream(stream.fullStream), opts.channelId),
+        opts.abortController,
+        deadlineAt,
+      )
+      : '') as string;
+    const finish = await this.withProviderDeadline(
+      stream.finishReason,
+      opts.abortController,
+      deadlineAt,
+    );
+    if (finish === 'error') throw new Error('Continuation stream ended with an error');
+    const completion = classifyStreamCompletion({ finishReason: finish, hasText: text.length > 0 });
+    if (completion === 'interrupted') {
+      throw new Error('Continuation stream was interrupted (no finish signal from provider)');
+    }
+    return { text, usage: await stream.usage, reasoning: stream.reasoning, finishReason: finish };
+  }
+
+  /**
+   * Emit a bounded, syntax-highlighted file-change preview into the coding
+   * TUI transcript when a file tool succeeds ("sometimes, not always" — the
+   * size heuristics live in buildFileChangePreview). Never throws: a preview
+   * failure must not break the tool loop.
+   */
+  private maybeShowFileChange(
+    channel: any,
+    msg: ChannelMessage,
+    toolName: string,
+    input: unknown,
+    result: unknown,
+  ): void {
+    try {
+      if (!(channel instanceof CLIChannel)) return;
+      const tui = channel.getTuiState();
+      if (tui.mode !== 'mercury-code' && tui.mode !== 'coding') return;
+      const tr = result as any;
+      const resultText = typeof tr === 'string' ? tr : JSON.stringify(tr ?? '');
+      const preview = buildFileChangePreview({
+        toolName,
+        args: (input ?? {}) as Record<string, any>,
+        resultText,
+        ok: !isFailedToolResult(resultText || ''),
+      });
+      if (preview) channel.showFileChange(preview);
+    } catch { /* preview must never break the tool loop */ }
+  }
+
+  /**
+   * Record the model's plan checklist (update_plan tool) into the TUI so the
+   * user sees which step is being implemented. Never throws.
+   */
+  private maybeRecordPlanProgress(channel: any, toolName: string, input: unknown): void {
+    try {
+      if (toolName !== 'update_plan') return;
+      if (!(channel instanceof CLIChannel)) return;
+      channel.setPlanProgress((input as any)?.steps);
+    } catch { /* checklist must never break the tool loop */ }
+  }
+
+  private scheduleDurableRetry(msg: ChannelMessage, workKey: string, error: unknown, continuation = false): number {
+    const attempts = this.workLedger.get(workKey)?.attempts ?? 1;
+    const delayMs = continuation
+      ? Math.min(2_000 * 2 ** Math.min(attempts - 1, 5), 60_000)
+      : Math.min(5_000 * 2 ** Math.min(attempts - 1, 6), 5 * 60_000);
+    this.workLedger.markRetry(workKey, error, Date.now() + delayMs, {
+      continuation,
+      workCwd: this.capabilities.getCwd(),
+      activity: this.currentActivity,
+      summary: formatNarrative(this.stepNarrative, this.currentActivity, 8),
+    });
+    const timer = setTimeout(() => {
+      const entry = this.workLedger.get(workKey);
+      if (!entry || entry.status !== 'queued') return;
+      this.queueMessage(entry.message, workKey);
+      void this.processQueue();
+    }, delayMs);
+    timer.unref?.();
+    return delayMs;
+  }
+
+  private isRetryableProviderError(error: unknown): boolean {
+    const message = (error instanceof Error ? error.message : String(error)).toLowerCase();
+    return /timeout|timed out|network|socket|connection|temporar|unavailable|overloaded|rate.?limit|\b429\b|\b5\d\d\b|econn|fetch failed|stalled/.test(message);
+  }
+
+  /**
+   * Durable provider fallback notice. On the CLI TUI (Mercury Code included)
+   * it goes through sendSystemNotice — a durable system row that renders in
+   * the coding transcript and survives the turn; on other channels it rides
+   * the heartbeat or a plain send as before.
+   */
+  private async sendFallbackNotice(msg: ChannelMessage, line: string): Promise<void> {
+    const channel = this.channels.getChannelForMessage(msg);
+    if (!channel || msg.channelType === 'internal') return;
+    if (channel instanceof CLIChannel) {
+      channel.sendSystemNotice(line);
+      return;
+    }
+    if (channel instanceof WebChannel) {
+      channel.sendHeartbeat(line, msg.channelId);
+      return;
+    }
+    await channel.send(line, msg.channelId);
+  }
+
+  private async sendProgressNotice(msg: ChannelMessage, message: string): Promise<void> {
+    const channel = this.channels.getChannelForMessage(msg);
+    if (!channel || msg.channelType === 'internal') return;
+    if (channel instanceof WebChannel) {
+      channel.sendHeartbeat(message, msg.channelId);
+      return;
+    }
+    if (channel instanceof CLIChannel) {
+      channel.sendHeartbeat(message);
+      return;
+    }
+    await channel.send(message, msg.channelId);
+  }
+
+  private channelProviderOverrides = new Map<string, { providerName: string; modelName: string; provider: BaseProvider }>();
+  /** Dedupes the "served by a fallback provider" notice — one per (default → served) pair per runtime. */
+  private lastFallbackNoticeKey: string | null = null;
+  /** Mercury Code hand-off preference, remembered PER SESSION (like the
+   * session permission modes): 'code' = auto-switch on coding tasks, 'chat' =
+   * never ask in this session. Only EXPLICIT answers are remembered — a
+   * timeout (nobody answered) asks again on the next coding task. */
+  private mercuryCodeHandoffPreferences = new Map<string, 'chat' | 'code'>();
+
+  async listChatModelOptions(): Promise<Array<{ provider: string; label: string; model: string; models: string[]; selected: boolean }>> {
+    const active = getActiveProviders(this.config);
+    const current = this.getCurrentProvider();
+    return Promise.all(active.map(async (provider) => {
+      let models = [provider.model].filter(Boolean);
+      try {
+        const catalog = await fetchProviderModelCatalog(provider.name as any, provider.name === 'mercuryCloud'
+          ? {
+            ...provider,
+            apiKey: this.config.cloud.accessKey || this.config.cloud.jwt || provider.apiKey,
+            baseUrl: this.config.cloud.apiUrl || provider.baseUrl,
+          }
+          : provider);
+        models = [...new Set([provider.model, catalog.recommendedModel, ...catalog.models].filter(Boolean))];
+      } catch (err) {
+        logger.debug({ provider: provider.name, err }, 'Unable to fetch provider model catalog; using configured model');
+        models = [...new Set([provider.model, ...getPreferredModelsForProvider(provider.name as any)].filter(Boolean))];
+      }
+
+      return {
+        provider: provider.name,
+        label: provider.name,
+        model: provider.model,
+        models,
+        selected: provider.name === current.name,
+      };
+    }));
+  }
+
+  async setChannelProviderOverride(
+    channelId: string,
+    providerName: string,
+    modelName?: string,
+    options: { persist?: boolean } = {},
+  ): Promise<{ ok: boolean; message: string; provider?: string; model?: string }> {
+    const active = getActiveProviders(this.config);
+    const config = active.find((provider) => provider.name === providerName);
+    if (!config) {
+      return { ok: false, message: `Provider \`${providerName}\` is not configured for this local agent.` };
+    }
+
+    const provider = await createProvider(
+      { ...config, model: modelName || config.model },
+      providerName === 'mercuryCloud' ? getCloudTokenStore() : undefined,
+    );
+    if (!provider) {
+      return { ok: false, message: `Provider \`${providerName}\` is not available in the running registry.` };
+    }
+
+    const previousOverride = this.channelProviderOverrides.get(channelId)?.provider as (BaseProvider & { destroy?: () => void }) | undefined;
+    if (previousOverride !== provider && this.providers.get(previousOverride?.name) !== previousOverride) {
+      previousOverride?.destroy?.();
+    }
+    this.channelProviderOverrides.set(channelId, { providerName, modelName: provider.getModel(), provider });
+
+    if (options.persist && providerName in this.config.providers) {
+      const providerKey = providerName as ProviderName;
+      const providerConfig = this.config.providers[providerKey];
+      providerConfig.model = provider.getModel();
+      providerConfig.enabled = true;
+      this.config.providers.default = providerName as ProviderName;
+      this.providers.set(providerName, provider);
+      this.providers.setDefault(providerName);
+      saveConfig(this.config);
+      updateCliProviderStatus(this.channels.get('cli'), providerName, provider.getModel());
+    }
+
+    const saved = options.persist ? ' Saved as the default for future sessions.' : '';
+    return { ok: true, message: `This chat will use **${providerName}** · **${provider.getModel()}**.${saved}`, provider: providerName, model: provider.getModel() };
+  }
+
+  async switchSessionProvider(providerName: string): Promise<{ ok: boolean; message: string }> {
     const active = getActiveProviders(this.config).map((p) => p.name);
     if (!active.includes(providerName)) {
       return { ok: false, message: `Provider \`${providerName}\` is not configured. Run \`mercury doctor\` to add/configure models.` };
     }
 
     this.config.providers.default = providerName as any;
-    this.providers = await ProviderRegistryImpl.create(this.config);
+    const previousProviders = this.providers;
+    this.providers = await ProviderRegistryImpl.create(this.config, getCloudTokenStore());
+    previousProviders.destroy();
     const selected = this.providers.getDefault();
     const model = selected.getModel();
 
-    const cliChannel = this.channels.get('cli');
-    if (cliChannel && cliChannel instanceof CLIChannel) {
-      cliChannel.setProvider(providerName, model);
-    }
+    // Persist: `/models use` is an explicit default change — it must survive
+    // restart. It used to mutate only the in-memory config, so the switch was
+    // silently lost (or half-persisted by an unrelated saveConfig) on restart.
+    saveConfig(this.config);
+    updateCliProviderStatus(this.channels.get('cli'), providerName, model);
 
-    return { ok: true, message: `Session model switched to **${providerName}** · **${model}**.` };
+    // "Saved for future sessions" read as "takes effect next session"; it
+    // applies to the next message and stays the default after a restart.
+    return { ok: true, message: `✓ Switched to **${model}** (${providerName}). In effect from your next message, and kept as the default.` };
   }
 
   /** Returns the currently active provider name and model. */
@@ -828,7 +2135,24 @@ export class Agent {
   }
 
   /** Public wrapper for web API model switching. */
-  async switchProvider(providerName: string): Promise<{ ok: boolean; message: string }> {
+  async switchProvider(providerName: string, model?: string): Promise<{ ok: boolean; message: string }> {
+    // Providers like Ollama Local serve many models; pin the requested one
+    // before the registry is rebuilt from config. Both values come from the
+    // web API, so validate before writing: an unchecked key such as
+    // "__proto__" would write onto Object.prototype, and the model id is
+    // persisted to mercury.yaml.
+    if (model !== undefined) {
+      if (typeof model !== 'string' || model.length === 0 || model.length > 256 || [...model].some((ch) => ch.charCodeAt(0) < 32 || ch.charCodeAt(0) === 127)) {
+        return { ok: false, message: 'Invalid model id.' };
+      }
+      const providers = this.config.providers as unknown as Record<string, unknown>;
+      const configured = getActiveProviders(this.config).some((p) => p.name === providerName);
+      if (!configured || !Object.hasOwn(providers, providerName)) {
+        return { ok: false, message: `Provider \`${providerName}\` is not configured.` };
+      }
+      const pc = providers[providerName];
+      if (pc && typeof pc === 'object') (pc as { model?: string }).model = model;
+    }
     return this.switchSessionProvider(providerName);
   }
 
@@ -841,10 +2165,20 @@ export class Agent {
   async wake(): Promise<void> {
     this.lifecycle.transition('onboarding');
     this.lifecycle.transition('idle');
-    this.scheduler.restorePersistedTasks();
-    this.scheduler.startHeartbeat();
+    if (!this.terminalOnly) {
+      this.scheduler.restorePersistedTasks();
+      this.scheduler.startHeartbeat();
+    }
     await this.channels.startAll();
     this.running = true;
+
+    if (!this.terminalOnly) {
+      const recovered = this.workLedger.recoverInterrupted();
+      for (const entry of recovered) this.queueMessage(entry.message, entry.key);
+      await this.replayUndeliveredResponses();
+    }
+    this.startOutboxRetry();
+    void this.processQueue();
 
     const activeChannels = this.channels.getActiveChannels();
     const toolNames = this.capabilities.getToolNames();
@@ -853,21 +2187,403 @@ export class Agent {
 
   async sleep(): Promise<void> {
     this.running = false;
+    if (this.outboxRetryTimer) {
+      clearInterval(this.outboxRetryTimer);
+      this.outboxRetryTimer = null;
+    }
     this.scheduler.stopAll();
     await this.channels.stopAll();
     this.lifecycle.transition('sleeping');
     logger.info('Mercury is sleeping');
   }
 
+  private async replayUndeliveredResponses(): Promise<void> {
+    if (this.replayingOutbox) return;
+    this.replayingOutbox = true;
+    try {
+      for (const entry of this.workLedger.getUndeliveredResponses()) {
+        await this.deliverLedgerEntry(entry);
+      }
+    } finally {
+      this.replayingOutbox = false;
+    }
+  }
+
+  private startOutboxRetry(): void {
+    if (this.outboxRetryTimer) return;
+    this.outboxRetryTimer = setInterval(() => {
+      if (this.running) void this.replayUndeliveredResponses();
+    }, 30_000);
+    this.outboxRetryTimer.unref?.();
+  }
+
+  private async deliverLedgerEntry(entry: WorkEntry): Promise<void> {
+    const channel = this.channels.getChannelForMessage(entry.message);
+    if (!channel || !entry.finalResponse) return;
+    const requestId = typeof entry.message.metadata?.requestId === 'string' ? entry.message.metadata.requestId : undefined;
+    const isCloudRequest = channel instanceof WebChannel
+      && typeof entry.message.metadata?.externalConversationId === 'string'
+      && requestId;
+    if (isCloudRequest && !channel.hasCloudEventHandler(requestId)) return;
+    try {
+      if (entry.status === 'failed' && channel instanceof WebChannel) {
+        if (!channel.sendError(entry.finalResponse, entry.message.channelId)) throw new Error('Cloud WebSocket could not accept the terminal error');
+      } else {
+        await channel.send(entry.finalResponse, entry.message.channelId);
+      }
+      if (!isCloudRequest) this.workLedger.markDelivered(entry.key);
+    } catch (error) {
+      this.workLedger.markDeliveryError(entry.key, error);
+      logger.warn({ error, workKey: entry.key }, 'Durable response replay failed');
+    }
+  }
+
+  private finalizeChannelTask(msg: ChannelMessage): void {
+    const channel = this.channels.getChannelForMessage(msg);
+    if (channel instanceof TelegramChannel || channel instanceof SignalChannel || channel instanceof DiscordChannel || channel instanceof SlackChannel) {
+      channel.endTask(msg.channelId);
+      channel.resetStepCounter(msg.channelId);
+    } else if (channel && typeof (channel as { endTask?: unknown }).endTask === 'function') {
+      // Any other channel that wants to know a turn finished (plugin channels: a
+      // voice call waits for the turn's answer).
+      try { (channel as unknown as { endTask: (id: string) => void }).endTask(msg.channelId); } catch { /* best effort */ }
+    }
+  }
+
+  /**
+   * Skill intent routing and batch execution (see the strategy note at the
+   * call site): an explicit `#skill` pick, a clear multi-skill batch, or an
+   * ambiguous match the user disambiguates. May rewrite or append to
+   * `messages`; never ends the turn on its own.
+   */
+  private async routeSkillIntent(msg: ChannelMessage, trimmed: string, messages: Array<{ role: string; content: unknown }>): Promise<void> {
+    if (this.skillBatcher && this.skillLoader && msg.channelType !== 'internal') {
+      try {
+        const intentRouter = this.skillLoader.intentRouter;
+
+        // (1) Explicit `#skill-name <rest>` shortcut from the # picker.
+        const hashMatch = trimmed.match(/^#([a-z0-9_:.-]+)\b\s*(.*)$/i);
+        if (intentRouter && intentRouter.isInitialized() && hashMatch) {
+          const skillName = hashMatch[1];
+          const rest = hashMatch[2].trim();
+          const knownSkills = this.skillLoader.getDiscovered?.() || [];
+          const known = knownSkills.some((s: any) => s.name === skillName);
+          if (known) {
+            messages[messages.length - 1] = {
+              role: 'user',
+              content: rest || trimmed,
+            };
+            messages.push({
+              role: 'user',
+              content: `[Routing] The user explicitly selected the \`${skillName}\` skill via #-prefix. Invoke it via \`use_skill\` with name="${skillName}" before doing anything else, then act on the result.`,
+            });
+            // Skip the rest of routing — explicit pick wins.
+          } else {
+            // Unknown #tag: just strip it and let routing proceed on the rest.
+            const stripped = rest || trimmed.replace(/^#\S+\s*/, '');
+            if (stripped) {
+              messages[messages.length - 1] = { role: 'user', content: stripped };
+            }
+          }
+        }
+
+        if (intentRouter && intentRouter.isInitialized() && !hashMatch) {
+          const analysis = intentRouter.analyzeMatch(trimmed, { clearThreshold: 0.85, gap: 0.15 });
+
+          // (2a) Ambiguous → ask the user to pick before executing anything.
+          if (analysis.ambiguous && analysis.closeContenders.length >= 2) {
+            const contenders = analysis.closeContenders.slice(0, 5);
+            const choices = [
+              ...contenders.map(c => {
+                const desc = intentRouter.getSkillDescription?.(c.name) || '';
+                return desc ? `${c.name} — ${desc}` : c.name;
+              }),
+              'None of these — answer normally',
+            ];
+            const channel = this.channels.getChannelForMessage(msg);
+            let picked: string | null = null;
+            try {
+              picked = await this.presentChoice(
+                `I matched several skills for that request and I'm not sure which you meant. Pick one:`,
+                choices,
+                msg.channelId,
+                msg.channelType,
+              );
+            } catch {
+              picked = null;
+            }
+            if (picked && !picked.startsWith('None of these')) {
+              const chosenName = picked.split(' — ')[0].trim();
+              messages.push({
+                role: 'user',
+                content: `[Routing] User clarified: use the \`${chosenName}\` skill. Invoke it via \`use_skill\` with name="${chosenName}" before doing anything else.`,
+              });
+              if (channel) {
+                await channel.send(`Routing to **${chosenName}**.`, msg.channelId).catch((e) => logger.warn({ e }, 'channel send failed'));
+              }
+            }
+            // If the user picked "None of these" we just fall through silently.
+          } else {
+            // (2b) Clear-enough match → use the existing batch path, but
+            //      only when the *top batch alone* has 2+ skills (genuine
+            //      multi-step request like "download and notify"). Cross-
+            //      category fan-out is what caused the 10-skill explosion.
+            const batches = intentRouter.matchToBatches(trimmed, 0.6);
+            const totalMatchedSkills = batches.reduce((sum, b) => sum + b.skills.length, 0);
+
+            if (batches.length > 0 && totalMatchedSkills >= 1) {
+              const topBatch = batches[0];
+              const matchedSkillNames = topBatch.skills.map(s => s.name);
+              this.markProgress(`Matched intents: ${matchedSkillNames.join(', ')}...`);
+
+              if (topBatch.skills.length >= 2 && analysis.clearWinner) {
+                const plan = this.skillBatcher.planExecution([topBatch]);
+                if (plan.batches.length > 0) {
+                  const channel = this.channels.getChannelForMessage(msg);
+                  if (channel) {
+                    await channel.send(`🧠 Routing to ${topBatch.skills.length} skills in **${topBatch.categoryLabel}**: ${matchedSkillNames.join(', ')}.`, msg.channelId).catch((e) => logger.warn({ e }, 'channel send failed'));
+                  }
+
+                  const batchResults = await this.skillBatcher.execute(plan, trimmed, msg.channelId, msg.channelType);
+                  const summary = this.skillBatcher.summarizeResults(batchResults);
+
+                  if (summary) {
+                    messages.push({
+                      role: 'user',
+                      content: `[Skill Batch Execution Results]\n${summary}\n\nSynthesize a coherent response based on these results. Mention what was done, any failures, and key findings.`,
+                    });
+                    messages.push({
+                      role: 'assistant',
+                      content: 'Acknowledged. I will synthesize the batch execution results into a coherent response.',
+                    });
+                  }
+                }
+              }
+              // Single clear-winner skill: let the LLM call use_skill itself.
+            }
+          }
+        }
+      } catch (err) {
+        logger.warn({ err }, 'Intent routing / batch execution failed — continuing without it');
+      }
+    }
+  }
+
+  /**
+   * Memory retrieved for this message: Second Brain recall, then the shared
+   * cloud pool when local recall is weak (fail-open), or long-term facts when
+   * Second Brain is off. Returned blocks go into the per-turn system block.
+   */
+  private async retrieveMemoryContext(msg: ChannelMessage): Promise<string[]> {
+    const blocks: string[] = [];
+    this.lastInjectedBeliefIds = [];
+    if (this.userMemory) {
+      // Beliefs relevant to this message (ADR-026): up to 5 held/confirmed
+      // ones, with confidence, so the model can lean on them and the next
+      // turn can credit them as "acted on without objection".
+      try {
+        const words = ownerWords(msg.content);
+        const selfAsk = asksAboutSelf(words);
+        const relevant = selfAsk
+          ? this.userMemory.beliefs.strongest(12)
+          : this.userMemory.beliefs.searchRelevant(words, 5);
+        if (relevant.length > 0) {
+          // Only sure beliefs earn "acted on without objection" credit;
+          // a candidate the model happened to see proves nothing yet.
+          const ids = relevant.map((b) => b.id);
+          this.userMemory.beliefs.markUsed(ids);
+          this.lastInjectedBeliefIds = relevant.filter((b) => b.status === 'held' || b.status === 'confirmed').map((b) => b.id);
+          const line = (b: typeof relevant[number]) => {
+            const status = b.status === 'candidate' ? 'unverified, seen once' : b.status;
+            return `- (confidence ${b.confidence.toFixed(2)}, ${status}${b.context !== '*' ? `, ${b.context}` : ''}) ${b.statement}`;
+          };
+          const heading = selfAsk
+            ? 'The owner is asking what you know about them. Your strongest beliefs (say which are unverified; the search_memory tool finds more):'
+            : 'Beliefs about the owner relevant to this message (treat "unverified" ones as hunches, not facts):';
+          blocks.push(heading + '\n' + relevant.map(line).join('\n'));
+        }
+      } catch (err) {
+        logger.debug({ err: (err as Error).message }, 'belief retrieval failed');
+      }
+
+      // The beliefs above are the only local recall (ADR-026: one source);
+      // their statements are what the pool search dedupes against.
+      const localRecall = this.lastInjectedBeliefIds
+        .map((id) => this.userMemory?.beliefs.get(id)?.statement)
+        .filter((s): s is string => typeof s === 'string');
+
+      // Local-first, then pool: query the cloud SharedMemoryPool for additional
+      // context the second brain didn't surface. Gated by config, fails open
+      // (any error → proceed with local-only context). 5-min cache per query.
+      // Skipped when local recall was already strong: the pool call is an
+      // awaited network round-trip on the path to the first token.
+      const ck = this.config.memory.collaborativeKnowledge;
+      const cloud = this.config.cloud;
+      const tokenStore = getCloudTokenStore();
+      const localRecallIsStrong = localRecall.length >= 3;
+      if (ck?.poolSearch !== false && cloud?.enabled && cloud?.jwt && cloud?.apiUrl && !localRecallIsStrong) {
+        try {
+          const { searchPool, formatPoolContextBlock, dedupeAgainstLocal } = await import('../cloud/pool-search.js');
+          const poolHits = await searchPool(
+            cloud.apiUrl,
+            cloud.jwt,
+            cloud.refreshToken,
+            msg.content,
+            { limit: 10 },
+            (newJwt, newRefresh) => {
+              // Route every rotation through the shared store so all
+              // consumers see the new tokens. Fallback to direct config
+              // mutation if the store isn't initialized (older code path).
+              if (tokenStore) {
+                tokenStore.setTokensAndPersist(newJwt, newRefresh);
+              } else {
+                cloud.jwt = newJwt;
+                cloud.refreshToken = newRefresh;
+                this.config.providers.mercuryCloud.apiKey = newJwt;
+                saveConfig(this.config);
+              }
+            },
+          );
+          const deduped = dedupeAgainstLocal(poolHits, localRecall);
+          const poolBlock = formatPoolContextBlock(deduped, 1500);
+          if (poolBlock) blocks.push(poolBlock);
+        } catch (err) {
+          logger.debug({ err: (err as Error).message }, 'pool search failed (fail-open)');
+        }
+      }
+    } else {
+      const relevantFacts = this.longTerm.search(msg.content, 3);
+      if (relevantFacts.length > 0) {
+        blocks.push('Relevant facts from memory:\n' + relevantFacts.map(f => `- ${f.fact}`).join('\n'));
+      }
+    }
+    return blocks;
+  }
+
   private async handleMessage(msg: ChannelMessage): Promise<void> {
     this.lifecycle.transition('thinking');
     const startTime = Date.now();
+    // Short id printed on every terminal message and resolvable with /trace.
+    const traceId = (msg.id || '').replace(/[^a-z0-9]/gi, '').slice(-8) || Date.now().toString(36);
+    let loopAbortController = new AbortController();
+    this.currentMessage = msg;
+    this.currentAbort = loopAbortController;
+    this.currentAbortReason = null;
+    const durableCwd = typeof msg.metadata?.workCwd === 'string' ? msg.metadata.workCwd : undefined;
+    if (durableCwd && existsSync(durableCwd)) {
+      this.capabilities.setCwd(durableCwd);
+      this.capabilities.permissions.addTempScope(durableCwd, true, true);
+    }
     this.currentActivity = '';
     this.completedStepCount = 0;
     this.stepNarrative = [];
-    const stopHeartbeat = this.startForegroundHeartbeat(msg);
-    this.markProgress('Starting...');
-    let wallTimeout: ReturnType<typeof setTimeout> | null = null;
+    // A slash command is handled below without the model: no "Processing"
+    // block, no heartbeat — those are raised only if it falls through to a
+    // real turn. (/memory opens a menu that blocks here for as long as it is
+    // open; with the indicator up it read as a hung agent.)
+    const isSlashCommand = msg.content.trim().startsWith('/');
+    let turnIndicatorUp = false;
+    const raiseTurnIndicator = (): void => {
+      if (turnIndicatorUp) return;
+      turnIndicatorUp = true;
+      this.markProgress('Starting...');
+      this.pushLiveActivity('Starting task');
+    };
+    if (!isSlashCommand) raiseTurnIndicator();
+    const stopHeartbeat = isSlashCommand ? () => {} : this.startForegroundHeartbeat(msg);
+    const heapBaseline = process.memoryUsage().heapUsed;
+    const heapAbortThreshold = taskHeapAbortThreshold(getHeapStatistics().heap_size_limit, heapBaseline);
+    const heapExitThreshold = taskHeapExitThreshold(getHeapStatistics().heap_size_limit, heapBaseline);
+    const governorThresholds = memoryGovernorThresholds({
+      heapSizeLimit: getHeapStatistics().heap_size_limit,
+      baselineHeapUsed: heapBaseline,
+    });
+    const memoryGovernor = (phase: string): 'ok' | 'abort' | 'exit' => {
+      const verdict = memoryGovernorVerdict(process.memoryUsage().heapUsed, governorThresholds);
+      if (verdict === 'abort') {
+        logger.warn({ phase, heapMB: Math.round(process.memoryUsage().heapUsed / 1048576) }, 'Step governor: relief threshold exceeded — trimming conversation');
+      }
+      return verdict === 'ok' || verdict === 'relief' ? 'ok' : verdict;
+    };
+    const memoryGuard = setInterval(() => {
+      const usage = process.memoryUsage();
+      // Stage 2 — emergency: abort was attempted but the allocator kept
+      // running outside the abortable path. Exit deliberately while the work
+      // ledger and session store are still writable, so recovery survives.
+      if (isTaskHeapUnsafe(usage.heapUsed, heapExitThreshold)) {
+        logger.error({
+          heapUsed: usage.heapUsed,
+          threshold: heapExitThreshold,
+          activity: this.currentActivity,
+        }, 'Memory continued growing after abort — exiting to preserve work state');
+        try {
+          const { writeCrashFlag } = require('./crash-flag.js');
+          writeCrashFlag({
+            reason: `Memory safety exit at ${Math.round(usage.heapUsed / 1048576)}MB (abort threshold ${Math.round(heapAbortThreshold / 1048576)}MB). Task: ${this.currentActivity?.slice(0, 150) || 'unknown'}`,
+            timestamp: Date.now(),
+            activeTask: this.currentActivity || undefined,
+            channelId: msg.channelId,
+            channelType: msg.channelType,
+          });
+        } catch { /* best effort */ }
+        try {
+          process.stderr.write(
+            `\n⚠ Mercury stopped the current task: memory grew to ${Math.round(usage.heapUsed / 1048576)}MB.\n  Your work is saved and will be recoverable on the next start. Details: ~/.mercury/crash-report.log\n`,
+          );
+        } catch { /* stderr gone */ }
+        process.exit(0);
+      }
+      // Stage 1 — attempt graceful stop of the current generation.
+      if (!isTaskHeapUnsafe(usage.heapUsed, heapAbortThreshold) || this.currentAbortReason === 'memory-pressure') return;
+      this.currentAbortReason = 'memory-pressure';
+      const error = new Error(
+        `Task stopped at ${Math.round(usage.heapUsed / 1048576)}MB heap usage before Mercury reached the V8 crash limit`,
+      );
+      logger.error({
+        heapUsed: usage.heapUsed,
+        heapTotal: usage.heapTotal,
+        rss: usage.rss,
+        threshold: heapAbortThreshold,
+        activity: this.currentActivity,
+      }, 'Task memory safety limit reached');
+      loopAbortController.abort(error);
+      // Forensics: capture a heap snapshot in the background. If growth
+      // continues past the exit threshold, this .heapsnapshot identifies the
+      // exact retainer. Best-effort — never throw from the guard.
+      void (async () => {
+        try {
+          const { writeHeapSnapshot } = await import('node:v8');
+          const { getMercuryHome } = await import('../utils/config.js');
+          const { join } = await import('node:path');
+          const file = join(getMercuryHome(), `heap-task-${Date.now()}.heapsnapshot`);
+          await writeHeapSnapshot(file as any);
+          logger.error({ file }, 'Heap snapshot captured for memory forensics');
+        } catch { /* forensics must never break the guard */ }
+      })();
+    }, 1000);
+    memoryGuard.unref?.();
+    // Stall watchdog: the memory guard covers heap growth; this covers time.
+    // A task that emits nothing (no chunks, no tool events, no steps) for
+    // minutes is almost certainly dead — surface it, then abort the attempt
+    // so the continuation/approval machinery can inspect and resume.
+    const stallWatchdog = new StallWatchdog({
+      getHeartbeat: () => this.lastProgressAt,
+      getActivity: () => this.currentActivity,
+      onSoft: (silentMs, activity) => {
+        logger.info({ silentMs, activity }, 'Stall watchdog: soft threshold — surfacing still-working pulse');
+        this.pushLiveActivity(
+          `Still working — ${activity || 'working'} · ${Math.round(silentMs / 1000)}s silent`,
+          'stall watchdog',
+        );
+      },
+      onHard: (silentMs, activity) => {
+        if (loopAbortController.signal.aborted) return;
+        logger.warn({ silentMs, activity }, 'Stall watchdog: no progress past hard threshold — aborting attempt for inspection/resume');
+        loopAbortController.abort(new Error(`Task stalled ${Math.round(silentMs / 60000)} minutes with no progress (was: ${activity || 'unknown'})`));
+      },
+    });
+    stallWatchdog.start();
+    let canonicalSessionId: string | undefined;
 
     if (this.supervisor && msg.channelType !== 'internal') {
       const activeAgents = this.supervisor.getActiveAgents();
@@ -876,16 +2592,16 @@ export class Agent {
         const channel = this.channels.getChannelForMessage(msg);
         if (channel) {
           const agentLines = runningAgents.map(a => `  🔄 ${a.id}: ${a.task.slice(0, 45)}${a.task.length > 45 ? '...' : ''}`);
-          await channel.send(`**Multi-agent mode** — ${runningAgents.length} agent${runningAgents.length > 1 ? 's' : ''} active:\n${agentLines.join('\n')}`, msg.channelId).catch(() => {});
+          await channel.send(`**Multi-agent mode** — ${runningAgents.length} agent${runningAgents.length > 1 ? 's' : ''} active:\n${agentLines.join('\n')}`, msg.channelId).catch((e) => logger.warn({ e }, 'channel send failed'));
         }
       }
     }
 
       const isInternal = msg.channelType === 'internal';
-      const isScheduled = msg.senderId === 'system' && msg.channelType !== 'internal';
-      if (isInternal || isScheduled) {
-        this.capabilities.permissions.setAutoApproveAll(true);
-        this.capabilities.permissions.addTempScope('/', true, true);
+      if (isInternal) {
+        // Turn-scoped grant on the root context only (ADR-016): running
+        // sub-agents keep their own context and new ones do not inherit it.
+        this.capabilities.permissions.beginTurnGrant({ scopes: [{ path: '/', read: true, write: true }] });
       }
 
     try {
@@ -923,10 +2639,11 @@ export class Agent {
           this.telegramStreaming = !this.telegramStreaming;
         }
         const ch = this.channels.get(msg.channelType as any);
+        const streamingLabel = msg.channelType === 'discord' ? 'Discord' : msg.channelType === 'slack' ? 'Slack' : 'Telegram';
         if (ch) await ch.send(
           this.telegramStreaming
-            ? 'Telegram streaming enabled. Responses will appear progressively.'
-            : 'Telegram streaming disabled. Responses will arrive as a single message.',
+            ? `${streamingLabel} streaming enabled. Responses will appear progressively.`
+            : `${streamingLabel} streaming disabled. Responses will arrive as a single message.`,
           msg.channelId,
         );
         this.lifecycle.transition('idle');
@@ -964,202 +2681,320 @@ export class Agent {
         return;
       }
 
-      const systemPrompt = this.buildSystemPrompt();
-      const recentMemory = this.shortTerm.getRecent(msg.channelId, 10);
+      // Token Saver Mode auto-engagement check. When usage crosses the
+      // configured threshold (default 75%), saver activates and the user
+      // is notified once so they understand response style may change.
+      {
+        const transition = this.saverMode.evaluateAuto(this.tokenBudget.getUsagePercentage());
+        if (transition.activated) {
+          const notice = this.saverMode.consumeAutoActivationNotice();
+          if (notice && msg.channelType !== 'internal') {
+            const ch = this.channels.get(msg.channelType as any);
+            if (ch) await ch.send(notice, msg.channelId).catch((e) => logger.warn({ e }, 'channel send failed'));
+          }
+          this.syncSaverToCli();
+        } else if (transition.deactivated && msg.channelType !== 'internal') {
+          const ch = this.channels.get(msg.channelType as any);
+          if (ch) await ch.send('⚡ Token Saver Mode auto-disengaged (usage dropped). Normal response settings restored.', msg.channelId).catch((e) => logger.warn({ e }, 'channel send failed'));
+          this.syncSaverToCli();
+        }
+      }
+
+      let systemPrompt = this.buildSystemPrompt();
+      if (msg.metadata?.workContinuation === true) {
+        const attempt = typeof msg.metadata.continuationAttempt === 'number' ? msg.metadata.continuationAttempt : 1;
+        const reason = typeof msg.metadata.continuationReason === 'string' ? msg.metadata.continuationReason : 'The prior execution was interrupted.';
+        const activity = typeof msg.metadata.continuationActivity === 'string' ? msg.metadata.continuationActivity : 'unknown';
+        const summary = typeof msg.metadata.continuationSummary === 'string' ? msg.metadata.continuationSummary : 'No structured progress summary is available.';
+        const cwd = typeof msg.metadata.workCwd === 'string' ? msg.metadata.workCwd : this.capabilities.getCwd();
+        systemPrompt += `\n\n[SYSTEM: DURABLE CONTINUATION ${attempt}] Do not restart this task. Continue from the artifacts and side effects already present. First inspect the current filesystem and relevant external state, especially ${cwd}. Prior interruption: ${reason}. Last activity: ${activity}. Recorded progress: ${summary}. Do not repeat the failed strategy. If a file or tool payload was too large, use a different bounded approach: inspect what exists, generate smaller components, append or patch in small verified chunks, or generate repetitive content programmatically. Verify each existing artifact before changing it. Keep working until there is a usable final deliverable, then clearly report its location and validation result.`;
+      } else if (msg.metadata?.workRecovered === true) {
+        systemPrompt += '\n\n[SYSTEM: RECOVERED WORK] This request was recovered after the agent restarted or its prior run was interrupted. Inspect the current filesystem, external state, and conversation before acting. Do not repeat side effects that may already have completed. Continue from observed state, and explicitly report any ambiguity you cannot safely resolve.';
+      }
+      const suppliedSessionId = msg.sessionId ?? (typeof msg.metadata?.sessionId === 'string' ? msg.metadata.sessionId : undefined);
+      const externalConversationId = msg.channelType === 'cli'
+        ? 'current'
+        : typeof msg.metadata?.externalConversationId === 'string' ? msg.metadata.externalConversationId : msg.channelId;
+      const canonicalSession = this.sessions.getOrCreateBound(msg.channelType, externalConversationId, suppliedSessionId);
+      canonicalSessionId = canonicalSession.id;
+      const canonicalMessageId = typeof msg.metadata?.canonicalMessageId === 'string' ? msg.metadata.canonicalMessageId : undefined;
+      const requestId = typeof msg.metadata?.requestId === 'string' ? msg.metadata.requestId : undefined;
+      this.sessions.appendMessage(canonicalSession.id, {
+        id: canonicalMessageId,
+        role: 'user',
+        content: msg.content,
+        timestamp: msg.timestamp,
+        externalMessageId: msg.id,
+        metadata: { channelType: msg.channelType, channelId: msg.channelId, workCwd: this.capabilities.getCwd(), ...(requestId ? { requestId } : {}) },
+      });
+      // One read of the session per turn (it used to be re-read three times).
+      const activeSession = this.sessions.get(canonicalSession.id);
+      if (msg.channelType === 'cli') {
+        const cliChannel = this.channels.get('cli');
+        if (cliChannel instanceof CLIChannel) cliChannel.setCurrentSession(activeSession);
+      }
+      // Context window v2: history is budgeted by tokens rather than a fixed
+      // ten messages, and includes the compact tool trace written at the end
+      // of each turn, so this turn remembers what the previous one read and
+      // wrote instead of starting blind.
+      const recentMemory = selectHistoryWindow(
+        activeSession.messages,
+        this.saverMode.isActive() ? HISTORY_TOKEN_BUDGET_SAVER : HISTORY_TOKEN_BUDGET,
+      );
 
       const messages: any[] = [];
+      // Per-turn context (retrieved memory, shared-pool hits, loop warnings)
+      // goes into a second, volatile system block instead of being staged as
+      // fake user/assistant dialogue: the fake "Noted. I'll keep this in
+      // mind." turns primed terse acknowledgements and polluted history.
+      const contextBlocks: string[] = [];
+      contextBlocks.push(budgetContext(this.tokenBudget.getStatusText(), this.tokenBudget.getUsagePercentage()));
 
-      const recentSteps = this.shortTerm.getRecent(msg.channelId, 6);
-      let loopWarning: string | null = null;
-      if (recentSteps.length >= 3) {
-        const toolCallPattern = /\[Using: (.+?)\]/g;
-        const toolCalls: string[] = [];
-        for (const m of recentSteps) {
-          if (m.role === 'assistant') {
-            let match;
-            while ((match = toolCallPattern.exec(m.content)) !== null) {
-              toolCalls.push(match[1]);
-            }
-          }
-        }
-        if (toolCalls.length >= 3) {
-          const last3 = toolCalls.slice(-3);
-          if (last3[0] === last3[1] && last3[1] === last3[2]) {
-            loopWarning = `[SYSTEM WARNING] You have called ${last3[0]} 3+ times in a row with the same result. Stop repeating this call. Try a different approach — if you're failing on permissions, try a different path. If you're failing on git push auth, use github_api with PUT /repos/{owner}/{repo}/contents/{path} to push files directly through the API.`;
-          }
-        }
+      const loopWarning = detectRepetitionLoop(recentMemory);
+      if (loopWarning) contextBlocks.push(loopWarning);
 
-        if (!loopWarning) {
-          const assistantMessages = recentSteps.filter(m => m.role === 'assistant' && m.content.length > 20);
-          if (assistantMessages.length >= 3) {
-            const last3 = assistantMessages.slice(-3);
-            const normalizeText = (t: string) => t.toLowerCase().replace(/[^\w\s]/g, '').replace(/\s+/g, ' ').trim().slice(0, 150);
-            const normalized = last3.map(m => normalizeText(m.content));
-            const words0 = new Set(normalized[0].split(' '));
-            const overlap01 = normalized[0] && normalized[1] ? [...words0].filter(w => new Set(normalized[1].split(' ')).has(w)).length / Math.max(words0.size, 1) : 0;
-            const overlap12 = normalized[1] && normalized[2] ? [...new Set(normalized[1].split(' '))].filter(w => new Set(normalized[2].split(' ')).has(w)).length / Math.max(new Set(normalized[1].split(' ')).size, 1) : 0;
-            if (overlap01 > 0.75 && overlap12 > 0.75) {
-              loopWarning = `[SYSTEM WARNING] Your last 3 responses are nearly identical. You are stuck in a text repetition loop. Stop immediately and give a completely different response. If you cannot complete the task, tell the user clearly why.`;
-            }
-          }
-        }
-      }
+      // Chat channels can carry an access level and guidance (plugin API 1.1,
+      // e.g. WhatsApp): "general" means no tools, no personal memory and no
+      // learning from the turn; the guidance tells the model where it is and
+      // how to write for it.
+      // A scheduled task the owner approved with specific plugin tools runs them unattended.
+      this.capabilities.permissions.setTurnPluginGrants(
+        msg.senderId === 'system' && Array.isArray(msg.metadata?.allowTools) ? (msg.metadata.allowTools as unknown[]).filter((t): t is string => typeof t === 'string') : [],
+      );
+      const generalAccess = msg.metadata?.channelAccess === 'general';
+      this.capabilities.setToolsDisabled(generalAccess);
+      const guidance = typeof msg.metadata?.channelGuidance === 'string' ? msg.metadata.channelGuidance.slice(0, 2000) : '';
+      if (guidance) contextBlocks.unshift(guidance);
+      if (!generalAccess) contextBlocks.push(...(await this.retrieveMemoryContext(msg)));
 
-      if (loopWarning) {
-        messages.push({ role: 'user', content: loopWarning });
-        messages.push({ role: 'assistant', content: 'Acknowledged. I will stop repeating and respond differently, or clearly state if the task cannot be completed.' });
-      }
+      for (const m of recentMemory) messages.push(toModelMessage(m));
 
-      if (this.userMemory) {
-        const memoryContext = this.userMemory.retrieveRelevant(msg.content, { maxRecords: 5, maxChars: 900 });
-        if (memoryContext.context) {
-          messages.push({
-            role: 'user',
-            content: `[Second Brain — auto-retrieved context]\n${memoryContext.context}\n[End auto-retrieved context]`,
-          });
-          messages.push({ role: 'assistant', content: 'Noted. I\'ll keep this in mind.' });
-        }
-      } else {
-        const relevantFacts = this.longTerm.search(msg.content, 3);
-        if (relevantFacts.length > 0) {
-          messages.push({
-            role: 'user',
-            content: 'Relevant facts from memory:\n' + relevantFacts.map(f => `- ${f.fact}`).join('\n'),
-          });
-          messages.push({ role: 'assistant', content: 'Noted. I\'ll use these facts.' });
-        }
-      }
+      if (!canonicalSessionId) messages.push({ role: 'user', content: msg.content });
 
-      if (recentMemory.length > 0) {
-        for (const m of recentMemory) {
-          messages.push({
-            role: m.role === 'user' ? 'user' : 'assistant',
-            content: m.content,
-          });
-        }
-      }
-
-      messages.push({ role: 'user', content: msg.content });
+      const volatileSystem = contextBlocks.length > 0
+        ? `## Context for this turn\n\n${contextBlocks.join('\n\n')}`
+        : '';
+      // Mode-aware tool exposure: niche tool groups (Spotify) are left out of
+      // the request unless the turn is about them. Schemas are re-sent on
+      // every step, so this saves tokens on every step of every turn.
+      const activeTools = selectActiveTools(
+        Object.keys(this.capabilities.getTools()),
+        msg.content,
+        recentMemory.map((m) => m.content),
+      );
 
       // ── Skill Intent Routing & Batch Execution ──
-      if (this.skillBatcher && this.skillLoader && msg.channelType !== 'internal') {
-        try {
-          const intentRouter = this.skillLoader.intentRouter;
-          if (intentRouter && intentRouter.isInitialized()) {
-            const batches = intentRouter.matchToBatches(trimmed, 0.4);
-            const totalMatchedSkills = batches.reduce((sum, b) => sum + b.skills.length, 0);
-
-            if (batches.length > 0 && totalMatchedSkills >= 1) {
-              const matchedSkillNames = batches.flatMap(b => b.skills.map(s => s.name));
-              this.markProgress(`Matched intents: ${matchedSkillNames.join(', ')}...`);
-
-              // For 2+ skills, batch execute via sub-agents
-              // For single skill, let the LLM handle it normally via use_skill
-              if (totalMatchedSkills >= 2) {
-                const plan = this.skillBatcher.planExecution(batches);
-                if (plan.batches.length > 0) {
-                  const channel = this.channels.getChannelForMessage(msg);
-                  if (channel) {
-                    await channel.send(`🧠 Intent routing matched **${totalMatchedSkills}** skills: ${matchedSkillNames.join(', ')}. Executing batch in background...`, msg.channelId).catch(() => {});
-                  }
-
-                  // Execute and wait for results
-                  const batchResults = await this.skillBatcher.execute(plan, trimmed, msg.channelId, msg.channelType);
-                  const summary = this.skillBatcher.summarizeResults(batchResults);
-
-                  if (summary) {
-                    messages.push({
-                      role: 'user',
-                      content: `[Skill Batch Execution Results]\n${summary}\n\nSynthesize a coherent response based on these results. Mention what was done, any failures, and key findings.`,
-                    });
-                    messages.push({
-                      role: 'assistant',
-                      content: 'Acknowledged. I will synthesize the batch execution results into a coherent response.',
-                    });
-                  }
-                }
-              }
-            }
-          }
-        } catch (err) {
-          logger.warn({ err }, 'Intent routing / batch execution failed — continuing without it');
-        }
-      }
+      //
+      // Routing strategy:
+      //   1. Explicit pick via `#skill-name` prefix → run that skill directly,
+      //      no ambiguity resolution needed.
+      //   2. Otherwise consult the intent router:
+      //      - Clear winner (high confidence + clear gap) → let the LLM invoke
+      //        it normally via use_skill (single skill) OR batch-execute when
+      //        the top batch is multi-skill in the same category.
+      //      - Ambiguous (multiple contenders bunched near the top) → ask the
+      //        user to disambiguate before doing anything.
+      //      - No usable match → fall through to the normal LLM loop.
+      // A command that reached the model is a real turn after all.
+      raiseTurnIndicator();
+      await this.routeSkillIntent(msg, trimmed, messages);
 
       this.lifecycle.transition('responding');
 
       const channel = this.channels.getChannelForMessage(msg);
       if (channel) {
-        await channel.typing(msg.channelId).catch(() => {});
+        await channel.typing(msg.channelId).catch((e) => logger.warn({ e }, 'channel send failed'));
         this.markProgress();
       }
 
       this.capabilities.setChannelContext(msg.channelId, msg.channelType);
       this.capabilities.permissions.setCurrentChannelType(msg.channelType);
+      this.capabilities.permissions.setCurrentSenderRole(msg.senderRole);
 
-      const fallbackIterator = this.providers.getFallbackIterator();
+      const providerContextId = msg.sessionId ?? (typeof msg.metadata?.sessionId === 'string' ? msg.metadata.sessionId : msg.channelId);
+      const channelOverride = this.channelProviderOverrides.get(providerContextId);
+      const fallbackIterator = channelOverride
+        ? [channelOverride.provider, ...this.providers.getFallbackIterator(channelOverride.providerName)]
+          .filter((provider, index, list) => list.findIndex((item) => item.name === provider.name && item.getModel() === provider.getModel()) === index)
+          [Symbol.iterator]()
+        : this.providers.getFallbackIterator();
       let result: any = null;
       let usedProvider: { name: string; model: string } | null = null;
       let lastError: any = null;
-      let streamedText = '';
+      let hasCompletedTool = false;
+      let hasStreamedOutput = false;
+      let cliResponseStreamed = false;
+      let requiresContinuationApproval = false;
+      let memoryPressureStop = false;
       const loopDetector = new ToolCallLoopDetector();
-      const loopAbortController = new AbortController();
       let loopWarningSent = false;
       let selfCheckCount = 0;
-
-      this.currentMessage = msg;
-      this.currentAbort = loopAbortController;
-      wallTimeout = setTimeout(() => {
-        if (!loopAbortController.signal.aborted) {
-          loopAbortController.abort();
+      // Execute-mode completion guard: every tool invoked this turn, so a
+      // narration-only turn cannot be celebrated as "Task complete".
+      // toolsSucceeded records whether each mutating tool produced at least
+      // one non-error result — a failed write is not "work done".
+      const executeTurnToolsUsed = new Set<string>();
+      const executeToolSucceeded = new Map<string, boolean>();
+      let executeGuardRounds = 0;
+      // Completion-contract state: how did the FINAL round end, and what
+      // evidence exists that the work actually finished?
+      const executeCommandsRun: string[] = [];
+      let lastVerificationNote = '';
+      // Evidence tracking: the LAST verification command and whether it
+      // actually passed, plus the step of the last successful mutation. A
+      // verification only counts as evidence when it ran clean AND after the
+      // last edit — a failing or timed-out `npm test`, or a test that ran
+      // before five more files were written, is not "verified".
+      let lastVerification: { command: string; ok: boolean; step: number } | null = null;
+      let lastMutationStep = -1;
+      const recordVerification = (command: string, resultText: string): void => {
+        const ok = isVerificationOutputOk(resultText);
+        lastVerification = { command, ok, step: this.completedStepCount };
+        lastVerificationNote = `${command.slice(0, 60)} ${ok ? '✓' : '✗'}`;
+      };
+      const verifiedAfterLastMutation = (): boolean =>
+        lastVerification != null && lastVerification.ok && lastVerification.step >= lastMutationStep;
+      // Compact per-turn tool trace, written to the session at turn end so
+      // the next turn's history carries what was read and written.
+      const turnToolTrace: string[] = [];
+      const noteToolSteps = (toolCalls: readonly any[] | undefined, toolResults: readonly any[] | undefined): void => {
+        if (!toolCalls || !toolResults) return;
+        for (let i = 0; i < toolCalls.length; i++) {
+          const tc = toolCalls[i];
+          const raw = toolResultValue(toolResults[i]);
+          const text = typeof raw === 'string' ? raw : JSON.stringify(raw ?? '');
+          turnToolTrace.push(formatToolTraceLine({
+            tool: tc.toolName,
+            args: summarizeToolArgs(tc.input),
+            outcome: summarizeToolResult(raw, !isFailedToolResult(text)),
+          }));
         }
-      }, MAX_FOREGROUND_WALL_MS);
+      };
+      let lastStepHadToolCalls = false;
+      let lastRoundSteps = 0;
+      let stepBudgetContinuations = 0;
+      let verificationContinuations = 0;
+      // Second wind: when the first full set of guard rounds fails to start
+      // the work, the agent does not pause — it wakes the task up with a
+      // blunt, maximally-constrained retry cycle before reporting honestly.
+      let narrationSecondWind = false;
+      let lastGuardToolFailure = '';
+      // OpenCode practice: on memory pressure, COMPACT and continue — the
+      // task gets one aggressive compaction chance before any abort.
+      let memoryCompactedForTask = false;
 
-      const canStream = msg.channelType === 'cli' || msg.channelType === 'web' || (msg.channelType === 'telegram' && this.telegramStreaming);
+      const recordExecuteToolResult = (toolName: string, resultText: unknown): void => {
+        const text = typeof resultText === 'string' ? resultText : JSON.stringify(resultText ?? '');
+        const ok = !isFailedToolResult(text);
+        executeToolSucceeded.set(toolName, (executeToolSucceeded.get(toolName) ?? false) || ok);
+        if (ok && EXECUTE_MUTATING_TOOLS.has(toolName)) lastMutationStep = this.completedStepCount;
+      };
 
-      const tgChannel = this.channels.get('telegram');
-      if (msg.channelType === 'telegram' && tgChannel) {
-        (tgChannel as TelegramChannel).resetStepCounter(msg.channelId);
-        (tgChannel as TelegramChannel).beginTask(msg.channelId);
-      }
+      const canStream = msg.channelType === 'cli' || msg.channelType === 'web' || (msg.channelType === 'telegram' && this.telegramStreaming) || msg.channelType === 'signal' || (msg.channelType === 'discord' && this.config.channels.discord.streaming) || (msg.channelType === 'slack' && this.config.channels.slack.streaming);
 
-      for (const provider of fallbackIterator) {
-        try {
-          this.markProgress(`Calling ${provider.name}...`);
-          const deepseekProviderOptions = provider instanceof DeepSeekProvider && provider.isReasoner
-            ? { deepseek: { thinking: { type: 'enabled' as const } } }
-            : undefined;
+      // One feedback contract for every channel (see core/task-surface.ts):
+      // begin → steps → done-with-evidence | pause | fail. The per-channel
+      // if/else chains that used to live here drifted apart; now channels
+      // render and the agent decides.
+      const surface = createTaskSurface(channel, msg.channelType, msg.channelId);
+      surface.begin();
 
-          logger.info({ provider: provider.name, model: provider.getModel(), steps: MAX_STEPS, stream: canStream }, 'Generating agentic response');
+      // Saver-mode-aware request limits. When saver is off these resolve to
+      // the original constants (byte-identical to pre-saver behavior).
+      let effectiveMaxOutputTokens = this.saverMode.adjustMaxOutputTokens(MODEL_OUTPUT_TOKEN_LIMIT);
+      const effectiveMaxSteps = this.saverMode.adjustMaxSteps(MAX_STEPS) * this.researchMode.getMaxStepsMultiplier();
+      const saverWasActive = this.saverMode.isActive();
 
-          if (canStream && channel) {
-            const streamResult = streamText({
-              model: provider.getModelInstance(),
-              system: systemPrompt,
-              messages,
-              tools: this.programmingMode.isPlan() ? this.capabilities.getPlanTools() : this.capabilities.getTools(),
-              maxOutputTokens: MAX_RESPONSE_TOKENS,
-              stopWhen: stepCountIs(MAX_STEPS),
-              abortSignal: loopAbortController.signal,
-              ...(deepseekProviderOptions ? { providerOptions: deepseekProviderOptions } : {}),
-              onStepFinish: async ({ toolCalls, toolResults }) => {
+      const providersForAttempt = [...fallbackIterator];
+      // Per-provider failure ledger: when EVERY provider fails, the final
+      // error must show WHY each one failed (dead token, bad key, rate
+      // limit) — showing only the last error hides the real fix from the
+      // user.
+      const providerFailures = new Map<string, string>();
+      // Per-turn dedupe for the whitelabeled fallback notices — the same
+      // provider failing repeatedly (guard rounds, retries) must not spam the
+      // transcript with identical lines.
+      const noticedProviderFailures = new Set<string>();
+      // Guard-round provider rotation cursor (round 1 = current provider,
+      // then walks the fallback chain — a narration-locked model is not the
+      // only worker the agent has).
+      let guardProviderCursor = 0;
+      // One step handler for both model-call paths (streaming and
+      // non-streaming): they were two ~295-line copies that differed only
+      // in their memory-checkpoint label and drifted on every change. The
+      // continuation rounds (resume / verification) share a lighter handler.
+      const stepHandler = (path: 'stream' | 'gen') => async ({ toolCalls, toolResults }: { toolCalls?: any[]; toolResults?: any[] }): Promise<void> => {
                 this.completedStepCount++;
+                // Completion-contract tracking: per-round step usage and how
+                // the step ended (tool calls pending = work in progress).
+                lastRoundSteps++;
+                lastStepHadToolCalls = !!(toolCalls && toolCalls.length > 0);
+                const cliCh = this.channels.get('cli');
+                if (cliCh instanceof CLIChannel) cliCh.bumpLiveActivitySteps();
+                // Every tool step goes into the per-turn trace (session history
+                // and /trace), not only the guard/continuation rounds.
+                noteToolSteps(toolCalls, toolResults);
+                // Step-level memory checkpoint: deterministic, runs even when
+                // the event loop is saturated (unlike the wall-clock guard).
+                const verdict = memoryGovernor(`${path}-step-${this.completedStepCount}`);
+                if (verdict === 'exit') {
+                  try {
+                    const { writeCrashFlag } = await import('./crash-flag.js');
+                    writeCrashFlag({ reason: 'Step governor: heap beyond exit threshold mid-step', timestamp: Date.now() });
+                  } catch { /* best effort */ }
+                  process.exit(0);
+                }
+                if (verdict === 'abort' && !loopAbortController.signal.aborted && this.currentAbortReason !== 'memory-pressure') {
+                  // Compact FIRST, continue (OpenCode's compact-on-overflow
+                  // practice): a long coding task must not die at memory
+                  // pressure when old tool bulk can be summarized away.
+                  if (!memoryCompactedForTask) {
+                    memoryCompactedForTask = true;
+                    try {
+                      const freed = compactConversation(messages);
+                      logger.warn({ freedChars: freed, heapMB: Math.round(process.memoryUsage().heapUsed / 1048576) }, 'Step governor: memory pressure — compacted conversation, continuing');
+                      this.pushLiveActivity('Freeing memory — compacting the conversation', 'auto-compact');
+                    } catch { /* compaction is best-effort */ }
+                    return;
+                  }
+                  this.currentAbortReason = 'memory-pressure';
+                  loopAbortController.abort(new Error(`Task stopped at ${Math.round(process.memoryUsage().heapUsed / 1048576)}MB heap usage (step governor)`));
+                  return;
+                }
                 if (toolCalls && toolCalls.length > 0) {
                   for (const tc of toolCalls as any[]) {
                     this.stepNarrative.push({ tool: tc.toolName, label: formatToolStep(tc.toolName, tc.input as Record<string, any> || {}) });
                   }
                   const labels = toolCalls.map((tc: any) => formatToolStep(tc.toolName, tc.input as Record<string, any> || {}));
                   this.markProgress(labels.join(' → '));
+                  this.pushLiveActivity(labels[labels.length - 1]);
                 } else {
                   this.markProgress('Thinking...');
+                  this.pushLiveActivity('Thinking', 'model reasoning');
                 }
                 if (toolCalls && toolResults && toolCalls.length > 0) {
+                  if (toolResults.length > 0) hasCompletedTool = true;
                   const names = toolCalls.map((tc: any) => tc.toolName).join(', ');
                   logger.info({ tools: names }, 'Tool call step');
                   for (let i = 0; i < toolCalls.length; i++) {
                     const tc = toolCalls[i];
-                    const tr = toolResults[i] as any;
-                    const resultStr = typeof tr?.result === 'string' ? tr.result : JSON.stringify(tr?.result ?? '');
+                    executeTurnToolsUsed.add(tc.toolName);
+                    if (tc.toolName === 'run_command') {
+                      const cmd = (tc.input as any)?.command;
+                      if (typeof cmd === 'string') {
+                      executeCommandsRun.push(cmd);
+                      if (VERIFICATION_COMMAND_PATTERN.test(cmd)) {
+                        const vResult = toolResultValue(toolResults[i]);
+                        const vText = typeof vResult === 'string' ? vResult : JSON.stringify(vResult ?? '');
+                        recordVerification(cmd, vText);
+                      }
+                    }
+                    }
+                    const trValue = toolResultValue(toolResults[i]);
+                    recordExecuteToolResult(tc.toolName, trValue);
+                    this.maybeShowFileChange(channel, msg, tc.toolName, tc.input, trValue);
+                    this.maybeRecordPlanProgress(channel, tc.toolName, tc.input);
+                    const resultStr = typeof trValue === 'string' ? trValue : JSON.stringify(trValue ?? '');
                     const failed = resultStr.length < 5000 && (
                       resultStr.startsWith('Error:') ||
                       resultStr.startsWith('⚠') ||
@@ -1172,7 +3007,7 @@ export class Agent {
                   if (loopDetector.detectAbsoluteLimit()) {
                     logger.warn('Absolute tool call limit reached — aborting');
                     if (channel && msg.channelType !== 'internal') {
-                      await channel.send('⚠ Tool call limit reached (25 calls). Stopping to prevent runaway loop.', msg.channelId).catch(() => {});
+                      await channel.send('⚠ Tool call limit reached (25 calls). Stopping to prevent runaway loop.', msg.channelId).catch((e) => logger.warn({ e }, 'channel send failed'));
                     }
                     loopAbortController.abort();
                     return;
@@ -1185,7 +3020,7 @@ export class Agent {
                     logger.warn({ tool: hardLoop.tool, count: hardLoop.count }, 'Hard loop detected — aborting');
                     if (!loopWarningSent && channel && msg.channelType !== 'internal') {
                       loopWarningSent = true;
-                      await channel.send(`☿ **Mercury Autopilot** · Identical call loop — ${hardLoop.tool} called ${hardLoop.count}x with same params. Stopping this path.`, msg.channelId).catch(() => {});
+                      await channel.send(`☿ **Mercury Autopilot** · Identical call loop — ${hardLoop.tool} called ${hardLoop.count}x with same params. Stopping this path.`, msg.channelId).catch((e) => logger.warn({ e }, 'channel send failed'));
                     }
                     loopAbortController.abort();
                     return;
@@ -1195,7 +3030,7 @@ export class Agent {
                     logger.warn({ tool: similarLoop.tool, count: similarLoop.count }, 'Failing loop detected — aborting');
                     if (!loopWarningSent && channel && msg.channelType !== 'internal') {
                       loopWarningSent = true;
-                      await channel.send(`☿ **Mercury Autopilot** · Failing loop — ${similarLoop.tool} called ${similarLoop.count}x, all failing. Stopping this path.`, msg.channelId).catch(() => {});
+                      await channel.send(`☿ **Mercury Autopilot** · Failing loop — ${similarLoop.tool} called ${similarLoop.count}x, all failing. Stopping this path.`, msg.channelId).catch((e) => logger.warn({ e }, 'channel send failed'));
                     }
                     loopAbortController.abort();
                     return;
@@ -1227,7 +3062,7 @@ export class Agent {
                           });
                           if (!shouldContinue) {
                             logger.warn({ tool: analysis.tool, count: analysis.count }, 'Mercury Autopilot: AI verdict — unproductive, aborting');
-                            await channel.send(`☿ **Mercury Autopilot** · ${analysis.tool} repeated ${analysis.count}x with low progress (${Math.round(analysis.paramDiversity * 100)}% diversity, ${Math.round(analysis.successRate * 100)}% success). Stopping this path.`, msg.channelId).catch(() => {});
+                            await channel.send(`☿ **Mercury Autopilot** · ${analysis.tool} repeated ${analysis.count}x with low progress (${Math.round(analysis.paramDiversity * 100)}% diversity, ${Math.round(analysis.successRate * 100)}% success). Stopping this path.`, msg.channelId).catch((e) => logger.warn({ e }, 'channel send failed'));
                             loopAbortController.abort();
                             return;
                           }
@@ -1235,7 +3070,7 @@ export class Agent {
                         // Not yet at check limit — let it continue with a note
                         loopDetector.reset();
                         loopWarningSent = false;
-                        await channel.send(`☿ **Mercury Autopilot** · Observing ${analysis.tool} (${analysis.count} calls, ${Math.round(analysis.paramDiversity * 100)}% diversity). Continuing under monitoring.`, msg.channelId).catch(() => {});
+                        await channel.send(`☿ **Mercury Autopilot** · Observing ${analysis.tool} (${analysis.count} calls, ${Math.round(analysis.paramDiversity * 100)}% diversity). Continuing under monitoring.`, msg.channelId).catch((e) => logger.warn({ e }, 'channel send failed'));
                       } else {
                         loopWarningSent = true;
                         const shouldContinue = await channel.askToContinue(
@@ -1253,7 +3088,7 @@ export class Agent {
                       // verdict === 'stuck'
                       if (this.capabilities.permissions.isAutoApproveAll()) {
                         logger.warn({ tool: analysis.tool, count: analysis.count, diversity: analysis.paramDiversity, successRate: analysis.successRate }, 'Mercury Autopilot: stuck loop detected');
-                        await channel.send(`☿ **Mercury Autopilot** · ${analysis.tool} is stuck (${analysis.count} calls, ${Math.round(analysis.paramDiversity * 100)}% diversity, ${Math.round(analysis.successRate * 100)}% success). Stopping this path.`, msg.channelId).catch(() => {});
+                        await channel.send(`☿ **Mercury Autopilot** · ${analysis.tool} is stuck (${analysis.count} calls, ${Math.round(analysis.paramDiversity * 100)}% diversity, ${Math.round(analysis.successRate * 100)}% success). Stopping this path.`, msg.channelId).catch((e) => logger.warn({ e }, 'channel send failed'));
                         loopAbortController.abort();
                         return;
                       } else {
@@ -1274,28 +3109,42 @@ export class Agent {
                   if (channel && msg.channelType !== 'internal') {
                     if (channel instanceof CLIChannel) {
                       for (const tc of toolCalls) {
-                        void (channel as CLIChannel).sendToolFeedback(tc.toolName, tc.input as Record<string, any>).catch(() => {});
+                        void (channel as CLIChannel).sendToolFeedback(tc.toolName, tc.input as Record<string, any>).catch((e) => logger.warn({ e }, 'channel send failed'));
                       }
                       if (toolResults) {
                         for (let i = 0; i < toolResults.length; i++) {
                           const tr = toolResults[i] as any;
                           const tcName = toolCalls[i]?.toolName as string | undefined;
                           if (tcName) {
-                            (channel as CLIChannel).sendStepDone(tcName, tr.result ?? tr);
+                            (channel as CLIChannel).sendStepDone(tcName, toolResultValue(tr));
                           }
                         }
                       }
                     } else if (channel instanceof TelegramChannel) {
                       const tgCh = channel as TelegramChannel;
                       for (const tc of toolCalls) {
-                        void tgCh.sendToolFeedback(tc.toolName, tc.input as Record<string, any>, msg.channelId).catch(() => {});
+                        void tgCh.sendToolFeedback(tc.toolName, tc.input as Record<string, any>, msg.channelId).catch((e) => logger.warn({ e }, 'channel send failed'));
                       }
                       if (toolResults) {
                         for (let i = 0; i < toolResults.length; i++) {
                           const tr = toolResults[i] as any;
                           const tcName = toolCalls[i]?.toolName as string | undefined;
                           if (tcName) {
-                            await tgCh.sendStepDone(tcName, tr.result ?? tr, msg.channelId).catch(() => {});
+                            void tgCh.sendStepDone(tcName, toolResultValue(tr), msg.channelId).catch((e) => logger.warn({ e }, 'channel send failed'));
+                          }
+                        }
+                      }
+                    } else if (channel instanceof SignalChannel) {
+                      const sigCh = channel as SignalChannel;
+                      for (const tc of toolCalls) {
+                        void sigCh.sendToolFeedback(tc.toolName, tc.input as Record<string, any>, msg.channelId).catch((e) => logger.warn({ e }, 'channel send failed'));
+                      }
+                      if (toolResults) {
+                        for (let i = 0; i < toolResults.length; i++) {
+                          const tr = toolResults[i] as any;
+                          const tcName = toolCalls[i]?.toolName as string | undefined;
+                          if (tcName) {
+                            void sigCh.sendStepDone(tcName, toolResultValue(tr), msg.channelId).catch((e) => logger.warn({ e }, 'channel send failed'));
                           }
                         }
                       }
@@ -1309,12 +3158,41 @@ export class Agent {
                           const tr = toolResults[i] as any;
                           const tcName = toolCalls[i]?.toolName as string | undefined;
                           if (tcName) {
-                            webCh.sendStepDone(tcName, tr.result ?? tr, msg.channelId);
+                            webCh.sendStepDone(tcName, toolResultValue(tr), msg.channelId);
+                          }
+                        }
+                      }
+                    } else if (channel instanceof DiscordChannel) {
+                      const dcCh = channel as DiscordChannel;
+                      for (const tc of toolCalls) {
+                        void dcCh.sendToolFeedback(tc.toolName, tc.input as Record<string, any>, msg.channelId).catch((e) => logger.warn({ e }, 'channel send failed'));
+                      }
+                      if (toolResults) {
+                        for (let i = 0; i < toolResults.length; i++) {
+                          const tr = toolResults[i] as any;
+                          const tcName = toolCalls[i]?.toolName as string | undefined;
+                          if (tcName) {
+                            void dcCh.sendStepDone(tcName, toolResultValue(tr), msg.channelId).catch((e) => logger.warn({ e }, 'channel send failed'));
+                          }
+                        }
+                      }
+                    } else if (channel instanceof SlackChannel) {
+                      const slCh = channel as SlackChannel;
+                      for (const tc of toolCalls) {
+                        void slCh.sendToolFeedback(tc.toolName, tc.input as Record<string, any>, msg.channelId);
+                      }
+                      if (toolResults) {
+                        for (let i = 0; i < toolResults.length; i++) {
+                          const tr = toolResults[i] as any;
+                          const tcName = toolCalls[i]?.toolName as string | undefined;
+                          if (tcName) {
+                            void Promise.resolve(slCh.sendStepDone(tcName, toolResultValue(tr), msg.channelId)).catch((e) => logger.warn({ e }, 'channel send failed'));
                           }
                         }
                       }
                     } else {
-                      await channel.send(`  [Using: ${names}]`, msg.channelId).catch(() => {});
+                      if ((channel as { quietProgress?: boolean }).quietProgress) void channel.typing(msg.channelId).catch(() => {});
+                      else void channel.send(`  [Using: ${names}]`, msg.channelId).catch((e) => logger.warn({ e }, 'channel send failed'));
                     }
                     this.markProgress();
                   }
@@ -1328,7 +3206,7 @@ export class Agent {
                     logger.warn('Reasoning loop detected — model keeps thinking without acting, aborting');
                     if (!loopWarningSent && channel && msg.channelType !== 'internal') {
                       loopWarningSent = true;
-                      await channel.send('⚠ I\'m stuck in a reasoning loop (thinking without taking action). Stopping.', msg.channelId).catch(() => {});
+                      await channel.send('⚠ I\'m stuck in a reasoning loop (thinking without taking action). Stopping.', msg.channelId).catch((e) => logger.warn({ e }, 'channel send failed'));
                     }
                     loopAbortController.abort();
                     return;
@@ -1338,341 +3216,995 @@ export class Agent {
                     logger.warn({ pattern: textRepeat.pattern, count: textRepeat.count }, 'Text repetition loop detected — aborting');
                     if (!loopWarningSent && channel && msg.channelType !== 'internal') {
                       loopWarningSent = true;
-                      await channel.send('⚠ I keep generating the same response. Stopping to prevent repetition.', msg.channelId).catch(() => {});
+                      await channel.send('⚠ I keep generating the same response. Stopping to prevent repetition.', msg.channelId).catch((e) => logger.warn({ e }, 'channel send failed'));
                     }
                     loopAbortController.abort();
                   }
                 }
+              };
+      const continuationStepHandler = async (toolCalls: any[] | undefined, toolResults: any[] | undefined): Promise<void> => {
+              this.completedStepCount++;
+              lastRoundSteps++;
+              lastStepHadToolCalls = !!(toolCalls && toolCalls.length > 0);
+              const cliChResume = this.channels.get('cli');
+              if (cliChResume instanceof CLIChannel) cliChResume.bumpLiveActivitySteps();
+              if (toolCalls && toolResults && toolCalls.length > 0) {
+                hasCompletedTool = true;
+                noteToolSteps(toolCalls, toolResults);
+                for (let i = 0; i < toolCalls.length; i++) {
+                  const tc = toolCalls[i];
+                  executeTurnToolsUsed.add(tc.toolName);
+                  if (tc.toolName === 'run_command') {
+                    const cmd = (tc.input as any)?.command;
+                    if (typeof cmd === 'string') {
+                      executeCommandsRun.push(cmd);
+                      if (VERIFICATION_COMMAND_PATTERN.test(cmd)) {
+                        const vResult = toolResultValue(toolResults[i]);
+                        const vText = typeof vResult === 'string' ? vResult : JSON.stringify(vResult ?? '');
+                        recordVerification(cmd, vText);
+                      }
+                    }
+                  }
+                  recordExecuteToolResult(tc.toolName, toolResultValue(toolResults[i]));
+                  this.maybeShowFileChange(channel, msg, tc.toolName, tc.input, toolResultValue(toolResults[i]));
+                  this.maybeRecordPlanProgress(channel, tc.toolName, tc.input);
+                  loopDetector.record(tc.toolName, tc.input as Record<string, any>, false);
+                }
+              }
+            };
+
+      const providerChain = [...providersForAttempt, ...providersForAttempt];
+      for (const provider of providerChain) {
+        // Per-attempt latency accounting: the only way to answer "why is
+        // coding slow" with data instead of guesses.
+        const attemptStartedAt = Date.now();
+        try {
+          const providerDeadlineAt = Date.now() + MAX_PROVIDER_ATTEMPT_MS;
+          this.markProgress(`Calling ${provider.name}...`);
+          this.pushLiveActivity(`Calling ${provider.name}`, provider.getModel());
+          updateCliProviderStatus(this.channels.get('cli'), provider.name, provider.getModel());
+          const deepseekProviderOptions = provider instanceof DeepSeekProvider && provider.isReasoner
+            ? { deepseek: { thinking: { type: 'enabled' as const } } }
+            : undefined;
+          // DeepSeek thinking models require prior reasoning_content to be
+          // passed back with assistant turns (issue #24); other providers
+          // get plain text.
+          // Photos and PDFs from the chat go to models that can take them.
+          setPluginImagesAllowed(modelSeesImages(provider.name, provider.getModel()));
+          const providerMessages = withAttachments(deepseekProviderOptions ? withReasoningParts(messages) : messages, msg, provider.name, provider.getModel());
+          // Per-provider output ceiling: a 32K request is rejected outright by
+          // providers with smaller limits and burned a halve-and-retry round.
+          const providerMaxOutputTokens = Math.min(effectiveMaxOutputTokens, provider.getMaxOutputTokens() ?? Infinity);
+
+          logger.info({ provider: provider.name, model: provider.getModel(), steps: MAX_STEPS, stream: canStream }, 'Generating agentic response');
+
+          // Ensure Mercury Cloud token is fresh before getting model instance
+          if ('ensureFreshToken' in provider && typeof (provider as any).ensureFreshToken === 'function') {
+            await this.withProviderDeadline((provider as any).ensureFreshToken(), loopAbortController, providerDeadlineAt);
+          }
+
+          if (canStream && channel) {
+            let streamError: unknown;
+            let streamAborted = false;
+            const streamResult = streamText({
+              model: provider.getModelInstance(),
+              // Mercury builds this system message itself (trusted, not user input);
+              // opting in stops the SDK printing a warning on every call.
+              allowSystemInMessages: true,
+              messages: this.withCachedSystem(systemPrompt, providerMessages, volatileSystem),
+              tools: this.programmingMode.isPlan() ? this.capabilities.getPlanTools() : this.capabilities.getTools(),
+              maxOutputTokens: providerMaxOutputTokens,
+              ...(activeTools ? { activeTools } : {}),
+              stopWhen: stepCountIs(effectiveMaxSteps),
+              abortSignal: loopAbortController.signal,
+              // Memory: the SDK retains a structuredClone of the whole
+              // conversation (plus raw HTTP bodies) in every step of its
+              // `steps` array. With 75 steps × file-size tool outputs that
+              // is O(N²) heap growth → V8 OOM on long coding tasks. We never
+              // read the raw bodies, so exclude them. (SDK default: true.)
+              experimental_include: { requestBody: false },
+              onError: ({ error }) => {
+                streamError = error;
               },
+              onAbort: () => {
+                streamAborted = true;
+              },
+              // Real-time feedback: these fire at TOOL EXECUTION time, not
+              // step completion — the TUI live block shows what is actually
+              // running during long tool calls instead of nothing.
+              experimental_onToolCallStart: ({ toolCall }) => {
+                const tc = toolCall as any;
+                const label = formatToolStep(tc.toolName, tc.input as Record<string, any> || {});
+                this.markProgress(label);
+                this.pushLiveToolEvent(tc.toolCallId ?? `${tc.toolName}:${Date.now()}`, tc.toolName, tc.input as Record<string, any> || {}, 'running');
+              },
+              experimental_onToolCallFinish: ({ toolCall, success, output, error, durationMs }) => {
+                const tc = toolCall as any;
+                this.pushLiveToolEvent(
+                  tc.toolCallId ?? `${tc.toolName}:${Date.now()}`,
+                  tc.toolName,
+                  success ? output : error,
+                  success ? 'done' : 'error',
+                  durationMs,
+                );
+              },
+              ...(deepseekProviderOptions ? { providerOptions: deepseekProviderOptions } : {}),
+              onStepFinish: stepHandler('stream'),
             });
 
-            let fullText: string;
-
-            if (msg.channelType === 'telegram') {
-              const tgChannel = this.channels.get('telegram');
-              if (tgChannel && 'sendStreamToChat' in tgChannel) {
-                const chatId = msg.channelId.startsWith('telegram:')
-                  ? Number(msg.channelId.split(':')[1])
-                  : Number(msg.channelId);
-                if (!isNaN(chatId)) {
-                  fullText = await (tgChannel as any).sendStreamToChat(chatId, this.withProgressStream(streamResult.textStream));
-                } else {
-                  fullText = await channel.stream(this.withProgressStream(streamResult.textStream), msg.channelId);
-                }
-              } else {
-                fullText = await channel.stream(this.withProgressStream(streamResult.textStream), msg.channelId);
+            const cliChThinking = channel instanceof CLIChannel ? channel : null;
+            const trackedStream = this.withProgressStream((async function* () {
+              for await (const chunk of (stepAwareTextStream(streamResult.fullStream, (preview) => {
+                cliChThinking?.showThinkingPreview(preview);
+              }))) {
+                if (chunk) hasStreamedOutput = true;
+                cliChThinking?.showThinkingPreview(null);
+                yield chunk;
               }
-            } else {
-              fullText = await channel.stream(this.withProgressStream(streamResult.textStream), msg.channelId);
+            })());
+            const streamedText = await this.withProviderDeadline(
+              channel.stream(trackedStream, msg.channelId),
+              loopAbortController,
+              providerDeadlineAt,
+            );
+            cliResponseStreamed = channel instanceof CLIChannel;
+
+            // Surface the REAL provider error BEFORE awaiting the result
+            // promises: a stream that errored (401, invalid key) records zero
+            // steps, and the SDK's flush then rejects usage/finishReason with
+            // a generic "No output generated" — which would mask the actual
+            // auth failure.
+            if (streamError) throw streamError;
+            if (streamAborted) {
+              throw new Error('Model stream was aborted before completion');
             }
 
-            const [usage] = await Promise.all([
-              streamResult.usage,
-            ]);
-
-            const streamReasoning = await streamResult.reasoning;
-
-            result = { text: fullText, usage, reasoning: streamReasoning };
-            streamedText = fullText;
-            loopDetector.recordStepText(fullText);
-          } else {
-            result = await generateText({
-              model: provider.getModelInstance(),
-              system: systemPrompt,
-              messages,
-              tools: this.programmingMode.isPlan() ? this.capabilities.getPlanTools() : this.capabilities.getTools(),
-              maxOutputTokens: MAX_RESPONSE_TOKENS,
-              stopWhen: stepCountIs(MAX_STEPS),
-              abortSignal: loopAbortController.signal,
-              ...(deepseekProviderOptions ? { providerOptions: deepseekProviderOptions } : {}),
-              onStepFinish: async ({ toolCalls, toolResults }) => {
-                this.completedStepCount++;
-                if (toolCalls && toolCalls.length > 0) {
-                  for (const tc of toolCalls as any[]) {
-                    this.stepNarrative.push({ tool: tc.toolName, label: formatToolStep(tc.toolName, tc.input as Record<string, any> || {}) });
-                  }
-                  const labels = toolCalls.map((tc: any) => formatToolStep(tc.toolName, tc.input as Record<string, any> || {}));
-                  this.markProgress(labels.join(' → '));
-                } else {
-                  this.markProgress('Thinking...');
-                }
-                if (toolCalls && toolResults && toolCalls.length > 0) {
-                  const names = toolCalls.map((tc: any) => tc.toolName).join(', ');
-                  logger.info({ tools: names }, 'Tool call step');
-                  for (let i = 0; i < toolCalls.length; i++) {
-                    const tc = toolCalls[i];
-                    const tr = toolResults[i] as any;
-                    const resultStr = typeof tr?.result === 'string' ? tr.result : JSON.stringify(tr?.result ?? '');
-                    const failed = resultStr.length < 5000 && (
-                      resultStr.startsWith('Error:') ||
-                      resultStr.startsWith('⚠') ||
-                      resultStr.includes('exited with code') ||
-                      resultStr.includes('Command failed') ||
-                      resultStr.startsWith('Command exited with code')
-                    );
-                    loopDetector.record(tc.toolName, tc.input as Record<string, any>, failed);
-                  }
-                  if (loopDetector.detectAbsoluteLimit()) {
-                    logger.warn('Absolute tool call limit reached — aborting');
-                    if (channel && msg.channelType !== 'internal') {
-                      await channel.send('⚠ Tool call limit reached (25 calls). Stopping to prevent runaway loop.', msg.channelId).catch(() => {});
-                    }
-                    loopAbortController.abort();
-                    return;
-                  }
-                  if (toolCalls.some((tc: any) => tc.toolName === 'use_skill')) {
-                    loopDetector.reset();
-                  }
-                  const hardLoop = loopDetector.detectIdentical();
-                  if (hardLoop) {
-                    logger.warn({ tool: hardLoop.tool, count: hardLoop.count }, 'Hard loop detected — aborting');
-                    if (!loopWarningSent && channel && msg.channelType !== 'internal') {
-                      loopWarningSent = true;
-                      await channel.send(`☿ **Mercury Autopilot** · Identical call loop — ${hardLoop.tool} called ${hardLoop.count}x with same params. Stopping this path.`, msg.channelId).catch(() => {});
-                    }
-                    loopAbortController.abort();
-                    return;
-                  }
-                  const similarLoop = loopDetector.detectSimilarLoop();
-                  if (similarLoop) {
-                    logger.warn({ tool: similarLoop.tool, count: similarLoop.count }, 'Failing loop detected — aborting');
-                    if (!loopWarningSent && channel && msg.channelType !== 'internal') {
-                      loopWarningSent = true;
-                      await channel.send(`☿ **Mercury Autopilot** · Failing loop — ${similarLoop.tool} called ${similarLoop.count}x, all failing. Stopping this path.`, msg.channelId).catch(() => {});
-                    }
-                    loopAbortController.abort();
-                    return;
-                  }
-                  // ── Mercury Autopilot: intelligent repetition analysis ──
-                  const analysis = loopDetector.analyzeRepetition();
-                  if (analysis && !loopWarningSent && channel && msg.channelType !== 'internal') {
-                    if (analysis.verdict === 'productive') {
-                      // Productive iteration — diverse params, high success rate
-                      // Let it run, just log for transparency
-                      logger.info({
-                        tool: analysis.tool,
-                        count: analysis.count,
-                        diversity: analysis.paramDiversity.toFixed(2),
-                        successRate: analysis.successRate.toFixed(2),
-                      }, 'Mercury Autopilot: productive iteration detected — continuing');
-                    } else if (analysis.verdict === 'suspicious') {
-                      // Suspicious but not definitively stuck — observe further
-                      if (this.capabilities.permissions.isAutoApproveAll()) {
-                        selfCheckCount++;
-                        if (selfCheckCount >= MAX_SELF_CHECKS) {
-                          // Escalate: ask AI for final verdict
-                          const recentCalls = loopDetector.getRecentCallSummaries();
-                          const shouldContinue = await this.aiSelfCheck({
-                            toolName: analysis.tool,
-                            callCount: analysis.count,
-                            recentCalls,
-                            taskDescription: msg.content.slice(0, 300),
-                          });
-                          if (!shouldContinue) {
-                            logger.warn({ tool: analysis.tool, count: analysis.count }, 'Mercury Autopilot: AI verdict — unproductive, aborting');
-                            await channel.send(`☿ **Mercury Autopilot** · ${analysis.tool} repeated ${analysis.count}x with low progress (${Math.round(analysis.paramDiversity * 100)}% diversity, ${Math.round(analysis.successRate * 100)}% success). Stopping this path.`, msg.channelId).catch(() => {});
-                            loopAbortController.abort();
-                            return;
-                          }
-                        }
-                        // Not yet at check limit — let it continue with a note
-                        loopDetector.reset();
-                        loopWarningSent = false;
-                        await channel.send(`☿ **Mercury Autopilot** · Observing ${analysis.tool} (${analysis.count} calls, ${Math.round(analysis.paramDiversity * 100)}% diversity). Continuing under monitoring.`, msg.channelId).catch(() => {});
-                      } else {
-                        loopWarningSent = true;
-                        const shouldContinue = await channel.askToContinue(
-                          `☿ Mercury Autopilot: ${analysis.tool} called ${analysis.count}x (${Math.round(analysis.paramDiversity * 100)}% param diversity, ${Math.round(analysis.successRate * 100)}% success rate). Continue?`,
-                          msg.channelId,
-                        ).catch(() => false);
-                        if (shouldContinue) {
-                          loopDetector.reset();
-                          loopWarningSent = false;
-                        } else {
-                          loopAbortController.abort();
-                        }
-                      }
-                    } else {
-                      // verdict === 'stuck'
-                      if (this.capabilities.permissions.isAutoApproveAll()) {
-                        logger.warn({ tool: analysis.tool, count: analysis.count, diversity: analysis.paramDiversity, successRate: analysis.successRate }, 'Mercury Autopilot: stuck loop detected');
-                        await channel.send(`☿ **Mercury Autopilot** · ${analysis.tool} is stuck (${analysis.count} calls, ${Math.round(analysis.paramDiversity * 100)}% diversity, ${Math.round(analysis.successRate * 100)}% success). Stopping this path.`, msg.channelId).catch(() => {});
-                        loopAbortController.abort();
-                        return;
-                      } else {
-                        loopWarningSent = true;
-                        const shouldContinue = await channel.askToContinue(
-                          `☿ Mercury Autopilot: ${analysis.tool} appears stuck (${analysis.count} calls, ${Math.round(analysis.successRate * 100)}% success). Continue anyway?`,
-                          msg.channelId,
-                        ).catch(() => false);
-                        if (shouldContinue) {
-                          loopDetector.reset();
-                          loopWarningSent = false;
-                        } else {
-                          loopAbortController.abort();
-                        }
-                      }
-                    }
-                  }
-                  if (channel && msg.channelType !== 'internal') {
-                    if (channel instanceof CLIChannel) {
-                      for (const tc of toolCalls) {
-                        void (channel as CLIChannel).sendToolFeedback(tc.toolName, tc.input as Record<string, any>).catch(() => {});
-                      }
-                      if (toolResults) {
-                        for (let i = 0; i < toolResults.length; i++) {
-                          const tr = toolResults[i] as any;
-                          const tcName = toolCalls[i]?.toolName as string | undefined;
-                          if (tcName) {
-                            (channel as CLIChannel).sendStepDone(tcName, tr.result ?? tr);
-                          }
-                        }
-                      }
-                    } else if (channel instanceof TelegramChannel) {
-                      const tgCh = channel as TelegramChannel;
-                      for (const tc of toolCalls) {
-                        void tgCh.sendToolFeedback(tc.toolName, tc.input as Record<string, any>, msg.channelId).catch(() => {});
-                      }
-                      if (toolResults) {
-                        for (let i = 0; i < toolResults.length; i++) {
-                          const tr = toolResults[i] as any;
-                          const tcName = toolCalls[i]?.toolName as string | undefined;
-                          if (tcName) {
-                            await tgCh.sendStepDone(tcName, tr.result ?? tr, msg.channelId).catch(() => {});
-                          }
-                        }
-                      }
-                    } else if (channel instanceof WebChannel) {
-                      const webCh = channel as WebChannel;
-                      for (const tc of toolCalls) {
-                        webCh.sendToolFeedback(tc.toolName, tc.input as Record<string, any>, msg.channelId);
-                      }
-                      if (toolResults) {
-                        for (let i = 0; i < toolResults.length; i++) {
-                          const tr = toolResults[i] as any;
-                          const tcName = toolCalls[i]?.toolName as string | undefined;
-                          if (tcName) {
-                            webCh.sendStepDone(tcName, tr.result ?? tr, msg.channelId);
-                          }
-                        }
-                      }
-                    } else {
-                      await channel.send(`  [Using: ${names}]`, msg.channelId).catch(() => {});
-                    }
-                    this.markProgress();
-                  }
-                } else if (toolResults === undefined || (toolCalls === undefined)) {
-                  const stepText_nostream = (toolResults as any)?.text ?? '';
-                  if (stepText_nostream) {
-                    loopDetector.recordStepText(String(stepText_nostream));
-                  }
-                  const noActionLoop = loopDetector.recordNoActionResult();
-                  if (noActionLoop) {
-                    logger.warn('Reasoning loop detected — model keeps thinking without acting, aborting');
-                    if (!loopWarningSent && channel && msg.channelType !== 'internal') {
-                      loopWarningSent = true;
-                      await channel.send('⚠ I\'m stuck in a reasoning loop (thinking without taking action). Stopping.', msg.channelId).catch(() => {});
-                    }
-                    loopAbortController.abort();
-                    return;
-                  }
-                  const textRepeat = loopDetector.detectTextRepetition();
-                  if (textRepeat) {
-                    logger.warn({ pattern: textRepeat.pattern, count: textRepeat.count }, 'Text repetition loop detected — aborting');
-                    if (!loopWarningSent && channel && msg.channelType !== 'internal') {
-                      loopWarningSent = true;
-                      await channel.send('⚠ I keep generating the same response. Stopping to prevent repetition.', msg.channelId).catch(() => {});
-                    }
-                    loopAbortController.abort();
-                  }
-                }
-              },
+            const [usage, finishReason, streamReasoning] = await this.withProviderDeadline(
+              Promise.all([
+                streamResult.usage,
+                streamResult.finishReason,
+                streamResult.reasoning,
+              ]),
+              loopAbortController,
+              providerDeadlineAt,
+            );
+            // Stream integrity: 'other'/missing finish means the provider
+            // dropped the connection mid-generation (no terminal chunk was
+            // emitted). Treating it as success produced silent cut-offs with
+            // "Task complete" banners. Throw so fallback/retry engages.
+            const completion = classifyStreamCompletion({
+              finishReason,
+              hasText: streamedText.length > 0,
             });
+            if (completion === 'interrupted') {
+              logger.error({ provider: provider.name, finishReason, streamedChars: streamedText.length }, 'Stream ended without a provider finish signal — treating as interrupted');
+              throw new Error(`${provider.name} stream was interrupted before completion (no finish signal from provider)`);
+            }
+            const truncated = isLengthTruncation(finishReason);
+            const fullText = truncated
+              ? `${streamedText}\n\n[Response truncated: the model reached its output limit. Ask me to continue from this point.]`
+              : streamedText;
+
+            result = { text: fullText, usage, reasoning: streamReasoning, finishReason };
+            loopDetector.recordStepText(fullText);
+
+            // Auto-continuation: a length-truncated response in code mode
+            // means the implementation stopped mid-way. Nudge the model to
+            // resume (bounded attempts), instead of dead-stopping at
+            // "Ask me to continue".
+            if (truncated && this.programmingMode.isExecute() && !loopAbortController.signal.aborted) {
+              let continuationRound = 0;
+              const MAX_STREAM_CONTINUATIONS = 6;
+              let continuationText = streamedText;
+              let stillTruncated = true;
+              while (stillTruncated && continuationRound < MAX_STREAM_CONTINUATIONS && !loopAbortController.signal.aborted) {
+                continuationRound++;
+                this.markProgress('Writing the next section...');
+                this.pushLiveActivity('Finishing the write — continuing past the size limit', 'auto-resume');
+                const continueResult: Awaited<ReturnType<typeof streamText>> = await this.withProviderDeadline(
+                  Promise.resolve(streamText({
+                    model: provider.getModelInstance(),
+                    // Mercury builds this system message itself (trusted, not user input);
+                    // opting in stops the SDK printing a warning on every call.
+                    allowSystemInMessages: true,
+                    messages: this.withCachedSystem(systemPrompt, [
+                      ...providerMessages,
+                      { role: 'assistant', content: continuationText },
+                      { role: 'user', content: lastStepHadToolCalls
+                        ? toolTruncationContinuationPrompt(msg.content)
+                        : truncationContinuationPrompt(msg.content) },
+                    ], volatileSystem),
+                    tools: this.capabilities.getTools(),
+                    maxOutputTokens: effectiveMaxOutputTokens,
+                    // FULL budget: a one-step round can only read files — the
+                    // model could never reach the write, which is exactly the
+                    // 'drops in the middle' loop.
+                    stopWhen: stepCountIs(effectiveMaxSteps),
+                    abortSignal: loopAbortController.signal,
+                    experimental_include: { requestBody: false },
+                  })),
+                  loopAbortController,
+                  providerDeadlineAt,
+                );
+                const chunk: string[] = [];
+                for await (const c of stepAwareTextStream(continueResult.fullStream)) chunk.push(c);
+                const piece = chunk.join('');
+                const cFinish: string = await continueResult.finishReason;
+                if (cFinish === 'error') throw new Error('Continuation stream ended with an error');
+                const cCompletion = classifyStreamCompletion({ finishReason: cFinish, hasText: piece.length > 0 });
+                if (cCompletion === 'interrupted') {
+                  logger.error({ provider: provider.name, finishReason: cFinish }, 'Continuation stream interrupted');
+                  break;
+                }
+                continuationText += piece;
+                result = {
+                  text: continuationText + (cCompletion === 'truncated' ? '\n\n[Response truncated: the model reached its output limit. Ask me to continue from this point.]' : ''),
+                  usage: await continueResult.usage,
+                  reasoning: streamReasoning,
+                };
+                stillTruncated = cCompletion === 'truncated';
+                if (channel instanceof CLIChannel) {
+                  await channel.stream((async function* () { yield piece; })(), msg.channelId).catch((e) => logger.warn({ e }, 'continuation stream delivery failed'));
+                }
+                loopDetector.recordStepText(piece);
+              }
+              if (stillTruncated && channel && msg.channelType !== 'internal') {
+                await channel.send('⚠ Response reached the output limit again — ask me to continue for the remainder.', msg.channelId).catch((e) => logger.warn({ e }, 'channel send failed'));
+              }
+            }
+          } else {
+            result = await this.withProviderDeadline(generateText({
+              model: provider.getModelInstance(),
+              // Mercury builds this system message itself (trusted, not user input);
+              // opting in stops the SDK printing a warning on every call.
+              allowSystemInMessages: true,
+              messages: this.withCachedSystem(systemPrompt, providerMessages, volatileSystem),
+              tools: this.programmingMode.isPlan() ? this.capabilities.getPlanTools() : this.capabilities.getTools(),
+              maxOutputTokens: providerMaxOutputTokens,
+              ...(activeTools ? { activeTools } : {}),
+              stopWhen: stepCountIs(effectiveMaxSteps),
+              abortSignal: loopAbortController.signal,
+              // Same O(N²) step retention as streamText (see comment above).
+              experimental_include: { requestBody: false, responseBody: false },
+              ...(deepseekProviderOptions ? { providerOptions: deepseekProviderOptions } : {}),
+              experimental_onToolCallStart: ({ toolCall }) => {
+                const tc = toolCall as any;
+                const label = formatToolStep(tc.toolName, tc.input as Record<string, any> || {});
+                this.markProgress(label);
+                this.pushLiveToolEvent(tc.toolCallId ?? `${tc.toolName}:${Date.now()}`, tc.toolName, tc.input as Record<string, any> || {}, 'running');
+              },
+              experimental_onToolCallFinish: ({ toolCall, success, output, error, durationMs }) => {
+                const tc = toolCall as any;
+                this.pushLiveToolEvent(
+                  tc.toolCallId ?? `${tc.toolName}:${Date.now()}`,
+                  tc.toolName,
+                  success ? output : error,
+                  success ? 'done' : 'error',
+                  durationMs,
+                );
+              },
+              onStepFinish: stepHandler('gen'),
+            }), loopAbortController, providerDeadlineAt);
+            if (result.finishReason === 'error') throw new Error('Model generation ended with an error');
+            if (result.finishReason === 'length') {
+              result = { ...result, text: `${result.text}\n\n[Response truncated: the model reached its output limit. Ask me to continue from this point.]` };
+            }
+            if (channel instanceof CLIChannel) {
+              await channel.send(result.text, msg.channelId, Date.now() - startTime);
+              cliResponseStreamed = true;
+            }
           }
 
           usedProvider = { name: provider.name, model: provider.getModel() };
+          logger.info({ provider: provider.name, durationMs: Date.now() - attemptStartedAt, steps: this.completedStepCount }, 'Provider attempt succeeded');
           if (channel instanceof WebChannel) {
             (channel as WebChannel).sendProviderInfo(usedProvider.name, usedProvider.model, msg.channelId);
           }
-          this.providers.markSuccess(provider.name);
+          if (!channelOverride) {
+            this.providers.markSuccess(provider.name);
+            // Respect the configured default: when a fallback provider served
+            // the turn instead of it, SAY SO. The fallback used to be silent —
+            // combined with markSuccess stickiness the user's doctor choice
+            // was invisibly overridden for the rest of the session. One
+            // notice per (default → served) pair per runtime keeps it visible
+            // without spamming every turn.
+            if (provider.name !== this.config.providers.default && msg.channelType !== 'internal') {
+              const noticeKey = `${this.config.providers.default}→${provider.name}`;
+              if (this.lastFallbackNoticeKey !== noticeKey) {
+                this.lastFallbackNoticeKey = noticeKey;
+                const failureReason = providerFailures.get(this.config.providers.default)
+                  ?? 'not registered — run `mercury doctor`';
+                await channel?.send(
+                  `⚠ Configured default \`${this.config.providers.default}\` unavailable (${failureReason}) — served by \`${provider.name}\` this time.`,
+                  msg.channelId,
+                ).catch((e) => logger.warn({ e }, 'channel send failed'));
+              }
+            }
+          }
           break;
         } catch (err: any) {
+          if (this.currentAbortReason === 'memory-pressure') {
+            lastError = loopAbortController.signal.reason instanceof Error
+              ? loopAbortController.signal.reason
+              : new Error('Task stopped by the memory safety limit');
+            requiresContinuationApproval = true;
+            this.currentAbortReason = null;
+            logger.error({ provider: provider.name, err: lastError }, 'Provider attempt stopped before heap exhaustion');
+            // Memory pressure is not a retryable failure: re-running the same
+            // request would grow the heap again and repeat the OOM. Stop the
+            // whole fallback loop and surface a paused state instead.
+            memoryPressureStop = true;
+            break;
+          }
+          if (this.currentAbortReason === 'time-limit') {
+            lastError = new Error(`${provider.name} exceeded the 10-minute provider-attempt limit`);
+            requiresContinuationApproval = true;
+            this.currentAbortReason = null;
+            logger.warn({ provider: provider.name }, 'Provider attempt reached hard deadline; waiting for user decision');
+            break;
+          }
+          if (this.currentAbortReason === 'stalled' && !hasCompletedTool) {
+            lastError = new Error(`${provider.name} stalled without progress`);
+            this.currentAbortReason = null;
+            loopAbortController = new AbortController();
+            this.currentAbort = loopAbortController;
+            this.markProgress(`Retrying after ${provider.name} stalled...`);
+            this.pushLiveActivity('Retrying after stall', provider.name);
+            logger.warn({ provider: provider.name }, 'Provider stalled; retrying with another healthy attempt');
+            continue;
+          }
+          if (this.currentAbortReason === 'backgrounded') {
+            result = { text: 'This task was moved to the background and will report back when it finishes.', usage: undefined };
+            break;
+          }
+          if (this.currentAbortReason === 'stopped' || this.currentAbortReason === 'halted') {
+            result = { text: `⏹ Task ${this.currentAbortReason}. Its work entry was cancelled — a restart will not resume it. Send the request again or ask me to continue if you change your mind.`, usage: undefined };
+            this.currentAbortReason = null;
+            break;
+          }
           if (loopDetector.isHardAborted() || loopAbortController.signal.aborted) {
-            logger.info('Generation aborted due to loop detection — using partial response');
-            if (!result && streamedText) {
-              result = { text: streamedText, usage: undefined };
-            }
-            if (!result) {
-              const elapsedMs = Date.now() - startTime;
-              const timedOut = elapsedMs >= MAX_FOREGROUND_WALL_MS;
-              result = {
-                text: timedOut
-                  ? 'I stopped because this request exceeded the foreground time limit. Please retry with a narrower scope, or move it to background with /bg current sooner.'
-                  : 'I stopped because I detected I was stuck in a loop (repeating the same action without progress). I cannot complete this task as requested. Please let me know if you\'d like me to try a completely different approach, or if there\'s something else I can help with.',
-                usage: undefined,
-              };
-            }
-            if (usedProvider) {
-              this.providers.markSuccess(usedProvider.name);
-            }
+            lastError = new Error(hasCompletedTool
+              ? 'Generation was interrupted after one or more tools completed. Current side effects may be partial; inspect state before retrying.'
+              : 'Generation was aborted by progress or loop safety controls.');
+            logger.info({ hasCompletedTool }, 'Generation aborted; recording an explicit failed state');
             break;
           }
           lastError = err;
+          // Some providers reject a maxOutputTokens above their model's
+          // native limit. Halve and let the next attempt in the chain use
+          // the smaller cap — the task continues instead of dying on a
+          // configuration argument.
+          const limitErr = `${err?.message || ''} ${typeof (err as any)?.responseBody === 'string' ? (err as any).responseBody : ''}`;
+          if (/max[_ -]?tokens|output.?limit|too large|exceed/i.test(limitErr) && effectiveMaxOutputTokens > 4096) {
+            effectiveMaxOutputTokens = Math.max(4096, Math.floor(effectiveMaxOutputTokens / 2));
+            logger.warn({ provider: provider.name, newCap: effectiveMaxOutputTokens }, 'Provider rejected the output cap — clamping for subsequent attempts');
+          }
+          if (!providerFailures.has(provider.name)) {
+            providerFailures.set(provider.name, (err?.message || String(err)).slice(0, 140));
+          }
+          logger.warn({ provider: provider.name, durationMs: Date.now() - attemptStartedAt }, 'Provider attempt failed');
+          if (hasStreamedOutput) {
+            // Partial visible output: silently combining two different
+            // provider responses would be worse than failing loudly. Report
+            // the cut-off honestly instead of emitting "Task complete".
+            lastError = new Error(`Provider stream was interrupted after partial output. Original error: ${err?.message || String(err)}`);
+            logger.error({ provider: provider.name, err }, 'Provider stream interrupted after visible output; fallback suppressed');
+            break;
+          }
+          if (hasCompletedTool) {
+            lastError = new Error(`Provider failed after a tool completed; refusing fallback to avoid duplicate side effects. Original error: ${err?.message || String(err)}`);
+            logger.error({ provider: provider.name, err }, 'Provider interrupted after tool completion; fallback suppressed');
+            break;
+          }
           logger.warn({ provider: provider.name, err: err.message }, 'Provider failed, trying fallback');
-          if (channel && msg.channelType !== 'internal') {
-            await channel.send(`  [Provider ${provider.name} failed, trying fallback...]`, msg.channelId).catch(() => {});
+          // Whitelabeled, durable notice: the user sees WHICH provider failed,
+          // WHY (one respectful line, no stack), and WHERE the task continues —
+          // rendered in Mercury Code too (heartbeat rows are filtered there).
+          // Same provider failing twice in one turn does not repeat the line.
+          const failureKey = `${provider.name}:${(err?.message || String(err)).slice(0, 80)}`;
+          if (!noticedProviderFailures.has(failureKey)) {
+            noticedProviderFailures.add(failureKey);
+            const nextName = providerChain[providerChain.indexOf(provider) + 1]?.name;
+            const line = nextName
+              ? `⚠ ${provider.name}: ${whitelabelProviderError(err)} — switching to \`${nextName}\` and continuing.`
+              : `⚠ ${provider.name}: ${whitelabelProviderError(err)} — no fallback left; retrying the chain.`;
+            await this.sendFallbackNotice(msg, line).catch((e) => logger.warn({ e }, 'channel send failed'));
           }
         }
       }
 
       if (!result) {
-        const errMsg = `All LLM providers failed. Last error: ${lastError?.message || 'unknown'}`;
-        logger.error({ err: lastError }, errMsg);
-        if (channel && msg.channelType !== 'internal') {
-          // End task before sending error so it goes through as a normal message
-          if (channel instanceof TelegramChannel) {
-            (channel as TelegramChannel).endTask(msg.channelId);
-            (channel as TelegramChannel).resetStepCounter(msg.channelId);
+        const failureBlock = providerFailures.size > 0
+          ? `\nPer-provider:\n- ${[...providerFailures.entries()].slice(0, 8).map(([name, reason]) => `${name}: ${reason}`).join('\n- ')}`
+          : '';
+        let errMsg = hasCompletedTool
+          ? `Work stopped in an interrupted/ambiguous state to avoid repeating completed tool side effects. ${lastError?.message || ''}`.trim()
+          : `All LLM providers failed. Last error: ${lastError?.message || 'unknown'}${failureBlock}`;
+        if (memoryPressureStop) {
+          errMsg = `Task stopped before the heap limit: ${lastError?.message || 'memory safety limit'}`;
+          logger.error({ err: lastError }, errMsg);
+          if (this.currentWorkKey) this.workLedger.markFailed(this.currentWorkKey, errMsg, errMsg);
+          if (channel && msg.channelType !== 'internal') {
+            await channel.send(
+              `⚠ I stopped this task early — memory was growing toward the process limit (likely a very large analysis). `
+              + `Nothing was lost: completed tool work is checkpointed. Try narrowing the request to specific files/directories, or split it into smaller steps.`,
+              msg.channelId,
+            ).catch((e) => logger.warn({ e }, 'channel send failed'));
           }
-          await channel.send(errMsg, msg.channelId);
+          this.lifecycle.transition('idle');
+          return;
+        }
+        logger.error({ err: lastError }, errMsg);
+        if (this.currentWorkKey && (hasCompletedTool || hasStreamedOutput || requiresContinuationApproval)) {
+          const continuationAttempt = typeof msg.metadata?.continuationAttempt === 'number' ? msg.metadata.continuationAttempt : 0;
+          const needsApproval = needsContinuationApproval(continuationAttempt, requiresContinuationApproval);
+          if (needsApproval) {
+            this.markProgress('Waiting for your decision...');
+            this.pushLiveActivity('Waiting for your decision', 'continuation requires approval');
+            const reason = `Mercury has already made ${continuationAttempt} automatic continuation attempts without completing the task (the runaway backstop).`;
+            const shouldContinue = channel && msg.channelType !== 'internal'
+              ? await channel.askToContinue(
+                `${reason} Existing files and completed tool work have been preserved. Continue with another inspected attempt?`,
+                msg.channelId,
+              ).catch(() => false)
+              : false;
+            if (!shouldContinue) {
+              errMsg = `${reason} Work is paused with existing artifacts preserved. Send "continue" when you want Mercury to inspect the current state and resume.`;
+            } else {
+              const delayMs = this.scheduleDurableRetry(msg, this.currentWorkKey, lastError || errMsg, true);
+              await this.sendProgressNotice(
+                msg,
+                `Progress remains checkpointed. Mercury will inspect the existing artifacts and continue in ${Math.round(delayMs / 1000)} seconds.`,
+              ).catch((error) => logger.warn({ error }, 'Unable to send continuation notice'));
+              this.lifecycle.transition('idle');
+              return;
+            }
+          } else {
+            const delayMs = this.scheduleDurableRetry(msg, this.currentWorkKey, lastError || errMsg, true);
+            await this.sendProgressNotice(
+              msg,
+              `Progress was checkpointed. Mercury will inspect the existing artifacts and continue with a different approach in ${Math.round(delayMs / 1000)} seconds.`,
+            ).catch((error) => logger.warn({ error }, 'Unable to send continuation notice'));
+            this.lifecycle.transition('idle');
+            return;
+          }
+        }
+        if (this.currentWorkKey && !hasCompletedTool && !hasStreamedOutput && this.isRetryableProviderError(lastError)) {
+          const attempts = this.workLedger.get(this.currentWorkKey)?.attempts ?? 1;
+          const shouldContinue = !needsRetryApproval(attempts) || (
+            channel && msg.channelType !== 'internal'
+              ? await channel.askToContinue(
+                `All providers have failed ${attempts} attempts. No tool side effects were recorded. Retry again?`,
+                msg.channelId,
+              ).catch(() => false)
+              : false
+          );
+          if (shouldContinue) {
+            const delayMs = this.scheduleDurableRetry(msg, this.currentWorkKey, lastError);
+            await this.sendProgressNotice(
+              msg,
+              `All providers are temporarily unavailable. This request is safely queued and will retry in ${Math.round(delayMs / 1000)} seconds.`,
+            ).catch((error) => logger.warn({ error }, 'Unable to send durable retry notice'));
+            this.lifecycle.transition('idle');
+            return;
+          }
+          errMsg = `All providers failed ${attempts} attempts. Work is paused. Send "continue" when you want Mercury to try again.`;
+        }
+        if (this.currentWorkKey) this.workLedger.markFailed(this.currentWorkKey, errMsg, errMsg);
+        if (channel && msg.channelType !== 'internal') {
+          // Failure is a persistent message with the reason (TaskSurface.fail
+          // ends the task first so it is never a status-card notice).
+          const delivered = await surface.fail(`${errMsg}\n\n_/trace ${traceId}_`);
+          const awaitsCloudAck = msg.channelType === 'web'
+            && typeof msg.metadata?.externalConversationId === 'string'
+            && typeof msg.metadata?.requestId === 'string';
+          if (this.currentWorkKey && delivered && !awaitsCloudAck) this.workLedger.markDelivered(this.currentWorkKey);
+          if (this.currentWorkKey && !delivered) this.workLedger.markDeliveryError(this.currentWorkKey, 'Terminal error delivery was not accepted');
         }
         this.lifecycle.transition('idle');
         return;
       }
 
-      const finalText = (streamedText || result.text || '').trim() || '(no text response)';
+      const preGuardText = (result.text || '').trim() || '(no text response)';
       this.markProgress('Finalizing response...');
+      this.pushLiveActivity('Finalizing response');
+
+      // ── Delivery completion guard ──
+      // In Mercury Code execute mode, a narration-only turn ("Building X per
+      // its spec. Reading it first.") with zero mutating tool calls must NOT
+      // be celebrated as "Task complete".
+      //
+      // Execute mode ONLY. This guard used to run in plain chat as well, and
+      // IMPLEMENTATION_PATTERN is broad enough ("make", "add", "test",
+      // "continue", "do it") that ordinary requests — "make me a workout
+      // plan", "add that to my list" — were forced through up to ten
+      // tool-only rounds and then paused with "I couldn't get started on
+      // this one yet". In chat the model may use tools when it wants to;
+      // it is never forced to.
+      while (
+        !loopAbortController.signal.aborted
+        && this.programmingMode.isExecute()
+        && !this.capabilities.areToolsDisabled()
+        && executeGuardRounds < (narrationSecondWind ? MAX_EXECUTE_CONTINUATIONS * 2 : MAX_EXECUTE_CONTINUATIONS)
+        // A turn that ends by asking the user something in plain text is a
+        // legitimate pause — forcing rounds here looped the model forever
+        // (it re-searched and re-asked instead of waiting for the answer).
+        && !responseAsksUser(result.text || '')
+        && shouldForceExecuteContinuation({
+          taskText: msg.content,
+          hasApprovedPlan: this.programmingMode.getLastPlan() != null,
+          toolsUsed: executeTurnToolsUsed,
+          toolsSucceeded: executeToolSucceeded,
+        })
+      ) {
+        executeGuardRounds++;
+        logger.warn(
+          { rounds: executeGuardRounds, toolsUsed: [...executeTurnToolsUsed], task: msg.content.slice(0, 120) },
+          'Execute-mode guard: turn ended without any mutating tool call — forcing continuation',
+        );
+        this.markProgress('Work not started — continuing...');
+        this.pushLiveActivity('Resuming — no file changes yet', 'execute guard');
+        // Deduplicate consecutive guard warnings: back-to-back narration
+        // rounds stacked identical banners in the transcript (visual noise
+        // during exactly the moments the user is watching for action).
+        const cliChGuard = this.channels.get('cli');
+        const lastGuardMsg = cliChGuard instanceof CLIChannel
+          ? cliChGuard.getTuiState().chatMessages[cliChGuard.getTuiState().chatMessages.length - 1]
+          : undefined;
+        const isDuplicateWarning = lastGuardMsg?.role === 'agent'
+          && lastGuardMsg.content.startsWith('Getting started on the real build now');
+        if (channel && msg.channelType !== 'internal' && !isDuplicateWarning) {
+          await channel.send(
+            `Alright — getting started on the real build now (attempt ${executeGuardRounds} of ${MAX_EXECUTE_CONTINUATIONS})...`,
+            msg.channelId,
+          ).catch((e) => logger.warn({ e }, 'channel send failed'));
+        }
+        // Inject the narration + the guard nudge into the conversation, then
+        // run one more inline generation round with the full tool loop. This
+        // keeps work-ledger/session state intact and the live activity block
+        // alive instead of tearing the task down and re-queueing it.
+        const currentText = (result.text || '').trim();
+        if (currentText && currentText !== '(no text response)') messages.push({ role: 'assistant', content: currentText });
+        // Harness-level grounding on the FIRST forced round: the agent
+        // executes a deterministic directory listing itself (no LLM), so a
+        // narration-prone model cannot claim it lacks context for where the
+        // work goes.
+        if (executeGuardRounds === 1) {
+          try {
+            const cwd = this.capabilities.getCwd();
+            const entries = readdirSync(cwd, { withFileTypes: true })
+              .slice(0, 30)
+              .map((e: import('node:fs').Dirent) => `${e.isDirectory() ? 'dir' : 'file'}: ${e.name}`)
+              .join('\n');
+            messages.push({
+              role: 'user',
+              content: `[SYSTEM: GROUNDING — agent-executed, not model-generated] Current working directory: ${cwd}\nContents:\n${entries || '(empty)'}\nThis is real, current state. Use it: create/edit files HERE with your tools.`,
+            });
+          } catch { /* grounding is best-effort */ }
+        }
+        messages.push({ role: 'user', content: executeContinuationPrompt(msg.content) });
+        // Provider rotation across guard rounds: a model that repeatedly
+        // narrates without acting should not keep being handed the task —
+        // the agent moves to the next model in the chain. The agent makes
+        // things happen; it does not depend on one LLM's cooperation.
+        if (guardProviderCursor === undefined) guardProviderCursor = 0;
+        const guardProvider = providersForAttempt[guardProviderCursor % providersForAttempt.length];
+        guardProviderCursor++;
+        if (!guardProvider) break;
+        try {
+          this.markProgress(`Resuming with ${guardProvider.name}...`);
+          const guardDeadlineAt = Date.now() + MAX_PROVIDER_ATTEMPT_MS;
+          const guardStream = streamText({
+            model: guardProvider.getModelInstance(),
+            // Mercury builds this system message itself (trusted, not user input);
+            // opting in stops the SDK printing a warning on every call.
+            allowSystemInMessages: true,
+            messages: this.withCachedSystem(systemPrompt, messages, volatileSystem),
+            tools: this.capabilities.getTools(),
+            maxOutputTokens: effectiveMaxOutputTokens,
+            stopWhen: stepCountIs(effectiveMaxSteps),
+            // Mechanical enforcement, not a polite nudge: the first step of
+            // this round MUST contain a tool call. Text nudges alone let
+            // narration-only models loop for every round; a provider-enforced
+            // toolChoice converts "describing the work" into doing it.
+            prepareStep: ({ steps }) => (steps.length === 0 ? { toolChoice: 'required' as const, activeTools: FORCED_ACTION_TOOLS } : {}),
+            experimental_onToolCallStart: ({ toolCall }) => {
+              const tc = toolCall as any;
+              this.markProgress(formatToolStep(tc.toolName, tc.input as Record<string, any> || {}));
+              this.pushLiveToolEvent(tc.toolCallId ?? `${tc.toolName}:${Date.now()}`, tc.toolName, tc.input as Record<string, any> || {}, 'running');
+            },
+            experimental_onToolCallFinish: ({ toolCall, success, output, error, durationMs }) => {
+              const tc = toolCall as any;
+              this.pushLiveToolEvent(
+                tc.toolCallId ?? `${tc.toolName}:${Date.now()}`,
+                tc.toolName,
+                success ? output : error,
+                success ? 'done' : 'error',
+                durationMs,
+              );
+            },
+            abortSignal: loopAbortController.signal,
+            experimental_include: { requestBody: false },
+            onStepFinish: async ({ toolCalls, toolResults }) => {
+              this.completedStepCount++;
+              // Completion-contract tracking for the guard round.
+              lastRoundSteps++;
+              lastStepHadToolCalls = !!(toolCalls && toolCalls.length > 0);
+              const cliChGen = this.channels.get('cli');
+              if (cliChGen instanceof CLIChannel) cliChGen.bumpLiveActivitySteps();
+              if (toolCalls && toolResults && toolCalls.length > 0) {
+                hasCompletedTool = true;
+                noteToolSteps(toolCalls, toolResults);
+                for (let i = 0; i < toolCalls.length; i++) {
+                  const tc = toolCalls[i];
+                  executeTurnToolsUsed.add(tc.toolName);
+                  const guardToolResult = toolResultValue(toolResults[i]);
+                  recordExecuteToolResult(tc.toolName, guardToolResult);
+                  // Remember WHY the work did not land, so an honest pause
+                  // can tell the user what actually blocked it.
+                  const guardResultText = typeof guardToolResult === 'string' ? guardToolResult : JSON.stringify(guardToolResult ?? '');
+                  if (EXECUTE_MUTATING_TOOLS.has(tc.toolName) && isFailedToolResult(guardResultText || '')) {
+                    lastGuardToolFailure = `${tc.toolName}: ${guardResultText.slice(0, 120)}`;
+                  }
+                  this.maybeShowFileChange(channel, msg, tc.toolName, tc.input, guardToolResult);
+                  this.maybeRecordPlanProgress(channel, tc.toolName, tc.input);
+                  loopDetector.record(tc.toolName, tc.input as Record<string, any>, false);
+                }
+              }
+            },
+          });
+          const guardText = channel
+            ? await this.withProviderDeadline(
+              channel.stream(stepAwareTextStream(guardStream.fullStream), msg.channelId),
+              loopAbortController,
+              guardDeadlineAt,
+            )
+            : '';
+          const gFinish = await this.withProviderDeadline(
+            guardStream.finishReason,
+            loopAbortController,
+            guardDeadlineAt,
+          );
+          if (gFinish === 'error') throw new Error('Guard continuation stream ended with an error');
+          const gCompletion = classifyStreamCompletion({ finishReason: gFinish, hasText: guardText.length > 0 });
+          if (gCompletion === 'interrupted') {
+            throw new Error('Guard continuation stream was interrupted (no finish signal from provider)');
+          }
+          if (guardText.trim()) result = { text: guardText, usage: await guardStream.usage, reasoning: guardStream.reasoning, finishReason: await guardStream.finishReason };
+          cliResponseStreamed = channel instanceof CLIChannel;
+        } catch (guardErr: any) {
+          // The guard nudge is best-effort: never let it turn a delivered
+          // narration into a hard failure. Log and fall through with the
+          // original result so the user still gets a response.
+          logger.warn({ err: guardErr?.message || String(guardErr) }, 'Execute-mode guard continuation failed; keeping original response');
+          break;
+        }
+        // WAKE-UP CALL: the first full guard cycle failed to start the work.
+        // The agent does not give up — it resets the cycle with a blunt,
+        // maximally-constrained directive before reporting honestly.
+        if (
+          executeGuardRounds >= MAX_EXECUTE_CONTINUATIONS
+          && !narrationSecondWind
+          && !loopAbortController.signal.aborted
+          && shouldForceExecuteContinuation({
+            taskText: msg.content,
+            hasApprovedPlan: this.programmingMode.getLastPlan() != null,
+            toolsUsed: executeTurnToolsUsed,
+            toolsSucceeded: executeToolSucceeded,
+          })
+        ) {
+          narrationSecondWind = true;
+          logger.warn({ rounds: executeGuardRounds }, 'Narration guard: first cycle exhausted — issuing wake-up call');
+          this.pushLiveActivity('Trying a different approach', 'wake-up call');
+          if (channel && msg.channelType !== 'internal') {
+            await channel.send('Taking a completely different run at this — forcing the first move...', msg.channelId)
+              .catch((e) => logger.warn({ e }, 'channel send failed'));
+          }
+          messages.push({ role: 'user', content: wakeUpPrompt(msg.content) });
+          // Fresh grounding for the second cycle too.
+          try {
+            const cwd = this.capabilities.getCwd();
+            const entries2 = readdirSync(cwd, { withFileTypes: true })
+              .slice(0, 30)
+              .map((e: import('node:fs').Dirent) => `${e.isDirectory() ? 'dir' : 'file'}: ${e.name}`)
+              .join('\n');
+            messages.push({ role: 'user', content: `[SYSTEM: GROUNDING] Directory ${cwd}: ${entries2 || '(empty)'}. Your next response MUST begin with a create_file, write_file, edit_file, or run_command tool call.` });
+          } catch { /* best effort */ }
+        }
+      }
+
+      // ── Completion contract ──
+      // A turn that ends because the step budget ran out mid-tool-work is a
+      // PAUSE, not a completion. Bounded auto-continuation resumes it with a
+      // fresh budget; past the bound the user is asked — the task is never
+      // wrapped in a "Task complete" banner while work remains.
+      const turnEnd = (): LoopEndCause => classifyTurnEnd({
+        stepsUsed: lastRoundSteps,
+        maxSteps: effectiveMaxSteps,
+        lastStepHasToolCalls: lastStepHadToolCalls,
+        finishReason: (result as any)?.finishReason,
+        aborted: loopAbortController.signal.aborted,
+      });
+
+      while (
+        !loopAbortController.signal.aborted
+        && stepBudgetContinuations < MAX_AUTOMATIC_CONTINUATIONS
+        && turnEnd() === 'steps-exhausted'
+      ) {
+        stepBudgetContinuations++;
+        logger.warn(
+          { rounds: stepBudgetContinuations, steps: lastRoundSteps, budget: effectiveMaxSteps },
+          'Step budget exhausted mid-task — forcing continuation with a fresh budget',
+        );
+        this.markProgress('Step budget reached — continuing...');
+        this.pushLiveActivity('Resuming with a fresh step budget', 'step budget');
+        if (channel && msg.channelType !== 'internal') {
+          await channel.send(
+            `This one's a bigger build than a single pass — picking up right where I left off...`,
+            msg.channelId,
+          ).catch((e) => logger.warn({ e }, 'channel send failed'));
+        }
+        const resumeText = (result.text || '').trim();
+        if (resumeText && resumeText !== '(no text response)') messages.push({ role: 'assistant', content: resumeText });
+        messages.push({ role: 'user', content: stepsExhaustedPrompt(msg.content) });
+        const resumeProvider = usedProvider
+          ? (providersForAttempt.find((p) => p.name === usedProvider!.name && p.getModel() === usedProvider!.model) ?? providersForAttempt[0])
+          : providersForAttempt[0];
+        if (!resumeProvider) break;
+        lastRoundSteps = 0;
+        try {
+          const round = await this.runInlineContinuationRound({
+            messages,
+            systemPrompt,
+            volatileSystem,
+            provider: resumeProvider,
+            maxOutputTokens: effectiveMaxOutputTokens,
+            maxSteps: effectiveMaxSteps,
+            abortController: loopAbortController,
+            channel,
+            channelId: msg.channelId,
+            onStep: continuationStepHandler,
+          });
+          if (round.text.trim()) result = { text: round.text, usage: round.usage, reasoning: round.reasoning, finishReason: round.finishReason };
+          cliResponseStreamed = channel instanceof CLIChannel;
+        } catch (resumeErr: any) {
+          logger.warn({ err: resumeErr?.message || String(resumeErr) }, 'Step-budget continuation failed; falling through to honest pause');
+          break;
+        }
+      }
+
+      // ── Verification gate ──
+      // Implementation work happened, but nothing objectively verified it
+      // (no build/test/typecheck ran clean after the last edit). Force one
+      // bounded evidence round. Execute mode only: in plain chat "write my
+      // notes to notes.md" must not trigger "running the build/tests now".
+      if (
+        !loopAbortController.signal.aborted
+        && turnEnd() === 'text-stop'
+        && this.programmingMode.isExecute()
+        && !this.capabilities.areToolsDisabled()
+        && verificationContinuations < MAX_VERIFICATION_CONTINUATIONS
+        && shouldRequireVerification({
+          taskText: msg.content,
+          hasApprovedPlan: this.programmingMode.getLastPlan() != null,
+          commandsRun: executeCommandsRun,
+          toolsSucceeded: executeToolSucceeded,
+          verifiedOk: verifiedAfterLastMutation(),
+        })
+      ) {
+        verificationContinuations++;
+        logger.warn(
+          { commandsRun: executeCommandsRun.slice(-5) },
+          'Verification gate: changes landed but nothing verified them — forcing verification round',
+        );
+        this.markProgress('Verifying changes...');
+        this.pushLiveActivity('Verifying the work', 'verification gate');
+        if (channel && msg.channelType !== 'internal') {
+          await channel.send(
+            'Checking my work before I call it done — running the build/tests now...',
+            msg.channelId,
+          ).catch((e) => logger.warn({ e }, 'channel send failed'));
+        }
+        const verifyText = (result.text || '').trim();
+        if (verifyText && verifyText !== '(no text response)') messages.push({ role: 'assistant', content: verifyText });
+        messages.push({ role: 'user', content: verificationPrompt(msg.content) });
+        const verifyProvider = usedProvider
+          ? (providersForAttempt.find((p) => p.name === usedProvider!.name && p.getModel() === usedProvider!.model) ?? providersForAttempt[0])
+          : providersForAttempt[0];
+        if (verifyProvider) {
+          lastRoundSteps = 0;
+          try {
+            const round = await this.runInlineContinuationRound({
+              messages,
+              systemPrompt,
+              volatileSystem,
+              provider: verifyProvider,
+              maxOutputTokens: effectiveMaxOutputTokens,
+              maxSteps: effectiveMaxSteps,
+              abortController: loopAbortController,
+              channel,
+              channelId: msg.channelId,
+              // Verification must produce evidence, not prose about evidence.
+              forceFirstTool: true,
+              onStep: continuationStepHandler,
+            });
+            if (round.text.trim()) result = { text: round.text, usage: round.usage, reasoning: round.reasoning, finishReason: round.finishReason };
+            cliResponseStreamed = channel instanceof CLIChannel;
+          } catch (verifyErr: any) {
+            logger.warn({ err: verifyErr?.message || String(verifyErr) }, 'Verification continuation failed; keeping original response');
+          }
+        }
+      }
+
+      // ── Final verdict: a step-budget stop past the continuation bound is
+      // an honest pause, never a completion banner. ──
+      const pauseHonestly = async (banner: string, reason: string): Promise<void> => {
+        logger.warn({ banner, task: msg.content.slice(0, 120) }, 'Completion contract: pausing task honestly');
+        this.markProgress('Task paused');
+        this.pushLiveActivity('Paused', 'completion contract');
+        if (this.currentWorkKey) {
+          this.workLedger.markPaused(this.currentWorkKey, reason);
+        }
+        if (channel && msg.channelType !== 'internal') {
+          // Persistent banner, deferred text flushed first (see TaskSurface.pause).
+          await surface.pause(`${banner}\n\n_/trace ${traceId}_`);
+          if (this.currentWorkKey) this.workLedger.markDelivered(this.currentWorkKey);
+        }
+        this.lifecycle.transition('idle');
+      };
+
+      if (!loopAbortController.signal.aborted && turnEnd() === 'steps-exhausted') {
+        logger.warn({ steps: lastRoundSteps, budget: effectiveMaxSteps }, 'Step budget exhausted past continuation bound — pausing task honestly');
+        await pauseHonestly(
+          STEPS_PAUSED_BANNER,
+          'Step budget reached with work pending. Send "continue" to resume with a fresh budget.',
+        );
+        return;
+      }
+
+      // Narration-guard exhaustion: after all forced continuation rounds the
+      // turn STILL contains zero mutating work (rounds failed on flaky
+      // providers, or the model kept narrating). That must never read as
+      // "Task complete" — pause and let "continue" re-engage.
+      if (
+        !loopAbortController.signal.aborted
+        && this.programmingMode.isExecute()
+        && !this.capabilities.areToolsDisabled()
+        && !responseAsksUser(result.text || '')
+        && shouldForceExecuteContinuation({
+          taskText: msg.content,
+          hasApprovedPlan: this.programmingMode.getLastPlan() != null,
+          toolsUsed: executeTurnToolsUsed,
+          toolsSucceeded: executeToolSucceeded,
+        })
+      ) {
+        logger.warn({ task: msg.content.slice(0, 120), blocker: lastGuardToolFailure }, 'Narration guard exhausted (both cycles) — pausing instead of completing');
+        const blockerNote = lastGuardToolFailure
+          ? `\n\nWhat blocked it: ${lastGuardToolFailure}`
+          : '';
+        await pauseHonestly(
+          WORK_NOT_STARTED_BANNER + blockerNote,
+          `No implementation work was performed across two guard cycles.${lastGuardToolFailure ? ` Last blocker: ${lastGuardToolFailure}` : ''} Send "continue" to resume with tools.`,
+        );
+        return;
+      }
+
+      // Verification failed or is stale: in execute mode, a build/test/
+      // typecheck ran but did not pass, or passed and was then followed by
+      // more edits. Either way there is no evidence the work is correct —
+      // that is an honest pause, never a "Task complete" banner.
+      if (
+        !loopAbortController.signal.aborted
+        && this.programmingMode.isExecute()
+        && !this.capabilities.areToolsDisabled()
+        && lastVerification != null
+        && !verifiedAfterLastMutation()
+        && !responseAsksUser(result.text || '')
+      ) {
+        const stale = lastVerification.ok;
+        logger.warn({ verification: lastVerificationNote, stale }, 'Completion contract: verification failed or stale — pausing instead of completing');
+        await pauseHonestly(
+          `${VERIFICATION_FAILED_BANNER}\n\nLast check: ${lastVerificationNote}${stale ? ' (ran before the latest changes)' : ''}`,
+          `Verification ${stale ? 'is stale' : 'failed'}: ${lastVerificationNote}. Send "continue" to resume.`,
+        );
+        return;
+      }
+
+      // Recompute AFTER the guard: the continuation's output (not the
+      // original narration) must be what reaches the session store, the
+      // work ledger, and the final delivery.
+      const finalText = (result.text || '').trim() || '(no text response)';
 
       // Store plan output when in plan mode for later execution
-      if (this.programmingMode.isPlan() && finalText !== '(no text response)') {
-        this.programmingMode.storePlan(finalText);
-        logger.info({ planLength: finalText.length }, 'Plan captured from plan-mode response');
+      if (this.programmingMode.isPlan() && preGuardText !== '(no text response)') {
+        this.programmingMode.storePlan(preGuardText);
+        logger.info({ planLength: preGuardText.length }, 'Plan captured from plan-mode response');
       }
 
       this.tokenBudget.recordUsage({
-        provider: usedProvider!.name,
-        model: usedProvider!.model,
+        provider: usedProvider?.name ?? 'unknown',
+        model: usedProvider?.model ?? 'unknown',
         inputTokens: result.usage?.inputTokens ?? 0,
         outputTokens: result.usage?.outputTokens ?? 0,
         totalTokens: (result.usage?.inputTokens ?? 0) + (result.usage?.outputTokens ?? 0),
         channelType: msg.channelType,
+        agentId: this.config.cloud.agentId || undefined,
       });
+      logger.info({
+        provider: usedProvider?.name,
+        model: usedProvider?.model,
+        inputTokens: result.usage?.inputTokens ?? 0,
+        cachedInputTokens: result.usage?.cachedInputTokens ?? 0,
+        outputTokens: result.usage?.outputTokens ?? 0,
+        steps: this.completedStepCount,
+        toolCalls: turnToolTrace.length,
+        historyEntries: recentMemory.length,
+        activeTools: activeTools?.length ?? 'all',
+        elapsedMs: Date.now() - startTime,
+      }, 'Turn usage');
+      this.syncTokenInfoToCli();
 
-      this.shortTerm.add(msg.channelId, {
-        id: msg.id,
-        timestamp: msg.timestamp,
-        role: 'user',
-        content: msg.content,
-      });
+      // Estimate tokens saved by Saver Mode (cap headroom + history trim).
+      // Rough: (default_cap - actual_output) when capped, plus history-window delta.
+      if (saverWasActive) {
+        const actualOutput = result.usage?.outputTokens ?? 0;
+        const outputHeadroom = Math.max(0, MODEL_OUTPUT_TOKEN_LIMIT - effectiveMaxOutputTokens);
+        const outputSaved = Math.max(0, Math.min(outputHeadroom, MODEL_OUTPUT_TOKEN_LIMIT - actualOutput));
+        // Rough proxy: each trimmed history message ~120 tokens average.
+        const historyTrimMessages = Math.max(0, NORMAL_HISTORY_WINDOW - this.saverMode.adjustHistoryWindow(NORMAL_HISTORY_WINDOW));
+        const historySaved = historyTrimMessages * 120;
+        const estimated = outputSaved + historySaved;
+        if (estimated > 0) {
+          this.tokenBudget.recordSavings(estimated);
+          this.syncSaverToCli();
+        }
+      }
 
-      this.shortTerm.add(msg.channelId, {
-        id: Date.now().toString(36),
-        timestamp: Date.now(),
-        role: 'assistant',
-        content: finalText,
-        tokenCount: (result.usage?.inputTokens ?? 0) + (result.usage?.outputTokens ?? 0),
-        reasoning: result.reasoning || undefined,
-      });
+      if (canonicalSessionId) {
+        if (turnToolTrace.length > 0) {
+          this.sessions.appendMessage(canonicalSessionId, {
+            role: 'assistant',
+            kind: TOOL_TRACE_KIND,
+            content: formatToolTrace(turnToolTrace),
+            externalMessageId: `${msg.id}:tools`,
+            metadata: { channelType: msg.channelType, channelId: msg.channelId, toolCalls: turnToolTrace.length },
+          });
+        }
+        this.sessions.appendMessage(canonicalSessionId, {
+          role: 'assistant',
+          content: finalText,
+          externalMessageId: `${msg.id}:assistant`,
+          tokenCount: (result.usage?.inputTokens ?? 0) + (result.usage?.outputTokens ?? 0),
+          reasoning: typeof result.reasoning === 'string'
+            ? result.reasoning
+            : result.reasoning
+              ? JSON.stringify(result.reasoning)
+              : undefined,
+          metadata: {
+            channelType: msg.channelType,
+            channelId: msg.channelId,
+            ...(typeof msg.metadata?.requestId === 'string' ? { requestId: msg.metadata.requestId } : {}),
+            ...(usedProvider ? { provider: usedProvider.name, model: usedProvider.model } : {}),
+            // Per-turn trace, shown by /trace <id>.
+            traceId,
+            elapsedMs: Date.now() - startTime,
+            steps: this.completedStepCount,
+            inputTokens: result.usage?.inputTokens ?? 0,
+            cachedInputTokens: result.usage?.cachedInputTokens ?? 0,
+            outputTokens: result.usage?.outputTokens ?? 0,
+            ...(lastVerificationNote ? { verification: lastVerificationNote } : {}),
+          },
+        });
+        if (msg.channelType !== 'internal' && msg.senderId !== 'system' && usedProvider) {
+          this.scheduleSessionTitleGeneration(canonicalSessionId, usedProvider.name);
+        }
+      } else {
+        this.shortTerm.add(msg.channelId, { id: msg.id, timestamp: msg.timestamp, role: 'user', content: msg.content });
+        this.shortTerm.add(msg.channelId, {
+          id: Date.now().toString(36), timestamp: Date.now(), role: 'assistant', content: finalText,
+          tokenCount: (result.usage?.inputTokens ?? 0) + (result.usage?.outputTokens ?? 0), reasoning: result.reasoning || undefined,
+        });
+      }
 
       this.episodic.record({
         type: 'message',
@@ -1680,192 +4212,180 @@ export class Agent {
         channelType: msg.channelType,
       });
 
-      if (msg.channelType !== 'internal') {
-        this.extractMemory(msg.content, finalText).catch(err => {
+      // The learning loop runs fire-and-forget; a "☿ Noted" line, when one is
+      // due, waits for the reply to be delivered first so it never lands ahead of it.
+      let replyDelivered: () => void = () => {};
+      const delivered = new Promise<void>((resolve) => { replyDelivered = resolve; });
+      if (msg.channelType !== 'internal' && msg.metadata?.channelAccess !== 'general') {
+        this.extractMemory(msg.content, finalText, { msg, channel, sessionId: canonicalSessionId, toolTrace: turnToolTrace, delivered }).catch(err => {
           logger.warn({ err }, 'Memory extraction failed');
         });
+        this.scheduleStatusVerbRefresh(channel, msg.content);
       }
+
+      if (this.currentWorkKey) this.workLedger.markCompleted(this.currentWorkKey, finalText);
 
       if (channel && msg.channelType !== 'internal') {
         const elapsed = Date.now() - startTime;
         const stepCount = this.completedStepCount;
-
-        // Send completion banner only for substantial tasks (3+ steps AND >30s)
-        // Simple responses (greetings, quick answers) don't need a banner
-        const isSubstantialTask = stepCount >= 3 && elapsed >= 30_000;
-        if (isSubstantialTask && channel instanceof TelegramChannel) {
-          // For substantial Telegram tasks: sendCompletion handles endTask + deferred flush + cleanup
-          const completionMeta = {
-            provider: usedProvider?.name ?? 'unknown',
-            model: usedProvider?.model ?? 'unknown',
-            inputTokens: result.usage?.inputTokens ?? 0,
-            outputTokens: result.usage?.outputTokens ?? 0,
-            totalTokens: (result.usage?.inputTokens ?? 0) + (result.usage?.outputTokens ?? 0),
-            budgetUsed: this.tokenBudget.getDailyUsed(),
-            budgetTotal: this.tokenBudget.getBudget(),
-            budgetPercentage: this.tokenBudget.getUsagePercentage(),
-          };
-          // If there's a non-streamed response that wasn't deferred, defer it now
-          if (!streamedText && finalText && finalText.trim()) {
-            // send() during active task already deferred it — nothing to do
-          }
-          await (channel as TelegramChannel).sendCompletion(elapsed, stepCount, msg.channelId, completionMeta);
-        } else if (channel instanceof TelegramChannel) {
-          // For non-substantial Telegram tasks: end task, flush deferred, clean up
-          (channel as TelegramChannel).endTask(msg.channelId);
-          // Flush deferred response
-          const deferred = (channel as TelegramChannel).popDeferredResponse(msg.channelId);
-          const responseText = deferred || (!streamedText && finalText ? finalText : null);
-          if (responseText && responseText.trim()) {
-            await channel.send(responseText, msg.channelId, elapsed);
-          }
-          if (stepCount > 0) {
-            await (channel as TelegramChannel).cleanupEphemeralMessages(msg.channelId);
-            (channel as TelegramChannel).resetStepCounter(msg.channelId);
-          }
-          this.markProgress();
-        } else {
-          // CLI or other channels — original flow
-          if (streamedText && streamedText.trim()) {
-            logger.info({ channelType: msg.channelType, elapsed }, 'Streamed response completed');
-            // Web channel needs text_done after streaming to reset frontend state
-            if (channel instanceof WebChannel) {
-              await channel.send(streamedText, msg.channelId, elapsed);
-            }
-          } else {
-            logger.info({ channelType: msg.channelType, targetId: msg.channelId }, 'Sending response');
-            await channel.send(finalText, msg.channelId, elapsed);
-            this.markProgress();
-          }
-          if (isSubstantialTask && channel instanceof CLIChannel) {
-            const completionMeta = {
-              provider: usedProvider?.name ?? 'unknown',
-              model: usedProvider?.model ?? 'unknown',
-              inputTokens: result.usage?.inputTokens ?? 0,
-              outputTokens: result.usage?.outputTokens ?? 0,
-              totalTokens: (result.usage?.inputTokens ?? 0) + (result.usage?.outputTokens ?? 0),
-              budgetUsed: this.tokenBudget.getDailyUsed(),
-              budgetTotal: this.tokenBudget.getBudget(),
-              budgetPercentage: this.tokenBudget.getUsagePercentage(),
-            };
-            (channel as CLIChannel).sendCompletion(elapsed, stepCount, completionMeta);
-          }
-        }
+        const completionMeta = {
+          provider: usedProvider?.name ?? 'unknown',
+          model: usedProvider?.model ?? 'unknown',
+          inputTokens: result.usage?.inputTokens ?? 0,
+          outputTokens: result.usage?.outputTokens ?? 0,
+          totalTokens: (result.usage?.inputTokens ?? 0) + (result.usage?.outputTokens ?? 0),
+          budgetUsed: this.tokenBudget.getDailyUsed(),
+          budgetTotal: this.tokenBudget.getBudget(),
+          budgetPercentage: this.tokenBudget.getUsagePercentage(),
+        };
+        const isMercuryCodeExecution = channel instanceof CLIChannel
+          && channel.getTuiState().mode === 'mercury-code'
+          && (channel.getTuiState().programmingMode === 'execute' || channel.getTuiState().programmingMode === 'auto');
+        logger.info({ channelType: msg.channelType, targetId: msg.channelId, surface: surface.kind, traceId }, 'Delivering final response');
+        await surface.done({
+          finalText,
+          elapsedMs: elapsed,
+          stepCount,
+          meta: completionMeta,
+          verificationNote: lastVerificationNote || undefined,
+          traceId,
+          alreadyStreamed: !requiresFinalSend(msg.channelType, cliResponseStreamed),
+          forceBanner: isMercuryCodeExecution,
+        });
+        replyDelivered();
+        this.markProgress();
       } else {
+        replyDelivered();
         logger.debug('Internal prompt processed, no channel response needed');
       }
+
+
+      const awaitsCloudAck = msg.channelType === 'web'
+        && typeof msg.metadata?.externalConversationId === 'string'
+        && typeof msg.metadata?.requestId === 'string';
+      if (this.currentWorkKey && !awaitsCloudAck) this.workLedger.markDelivered(this.currentWorkKey);
 
       this.lifecycle.transition('idle');
     } catch (err) {
       logger.error({ err }, 'Error handling message');
+      const ledgerEntry = this.currentWorkKey ? this.workLedger.get(this.currentWorkKey) : undefined;
+      if (this.currentWorkKey) {
+        if (ledgerEntry?.status === 'completed') this.workLedger.markDeliveryError(this.currentWorkKey, err);
+        else if (ledgerEntry?.status !== 'failed') {
+          const errMsg = err instanceof Error ? err.message : String(err);
+          this.workLedger.markFailed(
+            this.currentWorkKey,
+            err,
+            `I encountered an unexpected error and couldn't finish: ${errMsg.slice(0, 200)}`,
+          );
+        }
+      }
+      if (ledgerEntry?.status === 'completed') {
+        logger.warn({ err, workKey: this.currentWorkKey }, 'Final response persisted but delivery did not complete; retaining for replay');
+        return;
+      }
+      // Always notify the user — they should never have to re-prompt
+      // to find out their task died.
+      const catchChannel = this.channels.getChannelForMessage(msg);
+      if (catchChannel && msg.channelType !== 'internal') {
+        const errMsg = err instanceof Error ? err.message : String(err);
+        try {
+          const finalError = `I encountered an unexpected error and couldn't finish: ${errMsg.slice(0, 200)}`;
+          const delivered = catchChannel instanceof WebChannel ? catchChannel.sendError(finalError, msg.channelId) : true;
+          if (!(catchChannel instanceof WebChannel)) await catchChannel.send(finalError, msg.channelId);
+          const awaitsCloudAck = msg.channelType === 'web'
+            && typeof msg.metadata?.externalConversationId === 'string'
+            && typeof msg.metadata?.requestId === 'string';
+          if (this.currentWorkKey && delivered && !awaitsCloudAck) this.workLedger.markDelivered(this.currentWorkKey);
+          if (this.currentWorkKey && !delivered) this.workLedger.markDeliveryError(this.currentWorkKey, 'Terminal error delivery was not accepted');
+        } catch (sendErr) {
+          if (this.currentWorkKey) this.workLedger.markDeliveryError(this.currentWorkKey, sendErr);
+          logger.warn({ sendErr }, 'Failed to notify user of handler error');
+        }
+      }
+      // Write crash flag so next startup also reports the failure.
+      try {
+        const { writeCrashFlag } = await import('./crash-flag.js');
+        writeCrashFlag({
+          reason: `Unhandled agent error: ${err instanceof Error ? err.message : String(err)}`.slice(0, 300),
+          timestamp: Date.now(),
+          activeTask: this.currentActivity || undefined,
+          channelId: msg.channelId || undefined,
+          channelType: msg.channelType || undefined,
+        });
+      } catch { /* best effort */ }
       this.lifecycle.transition('idle');
     } finally {
-      if (wallTimeout) clearTimeout(wallTimeout);
+      clearInterval(memoryGuard);
+      stallWatchdog.stop();
       stopHeartbeat();
+      this.finalizeChannelTask(msg);
+      this.capabilities.setToolsDisabled(false);
+      this.capabilities.permissions.setTurnPluginGrants([]);
       this.currentMessage = null;
       this.currentAbort = null;
+      this.currentAbortReason = null;
       this.currentActivity = '';
       this.completedStepCount = 0;
       this.stepNarrative = [];
-      if (isInternal || isScheduled) {
-        this.capabilities.permissions.setAutoApproveAll(false);
+      {
+        const ch = this.channels.get('cli');
+        if (ch instanceof CLIChannel) ch.clearLiveActivity();
+      }
+      if (isInternal) {
+        this.capabilities.permissions.endTurnGrant();
       }
       this.capabilities.permissions.clearElevation();
     }
   }
 
-  private buildSystemPrompt(): string {
-    let prompt = this.identity.getSystemPrompt(this.config.identity);
-    const skillContext = this.capabilities.getSkillContext();
-    if (skillContext) {
-      prompt += '\n\n' + skillContext;
-    }
-    const programmingSuffix = this.programmingMode.getSystemPromptSuffix();
-    if (programmingSuffix) {
-      prompt += programmingSuffix;
-    }
-    const budgetStatus = this.tokenBudget.getStatusText();
-    prompt += '\n\n' + budgetStatus;
-    if (this.tokenBudget.getUsagePercentage() > 70) {
-      prompt += '\nBe concise to conserve tokens.';
-    }
-
-    const now = new Date();
-    const dateStr = now.toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
-    const timeStr = now.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: true });
-    const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
-    prompt += `\n\nEnvironment:\n- Date: ${dateStr}, ${timeStr} (${timezone})\n- Platform: ${process.platform}\n- Working directory: ${this.capabilities.getCwd()}`;
-
-    prompt += `\n\n**Tool Usage Guidelines:**
-- Use write_file, create_file, and edit_file tools DIRECTLY to create and modify files. Do NOT create intermediary scripts (Python, bash, Node.js) whose sole purpose is to generate other files — you have native file tools for this.
-- Use run_command for: building, testing, installing dependencies, running the project, git operations, and other system tasks that require a shell.
-- Do NOT use run_command with echo/cat/tee/heredoc to write files. Use write_file or create_file instead.
-- Do NOT create one-time-use helper scripts. If the user asks you to create a file, create it directly with create_file or write_file.
-- When creating multiple files, call create_file or write_file for each one individually. Do not batch them into a script.`;
-
-    if (this.userMemory) {
-      const summary = this.userMemory.getSummary();
-      prompt += `\n\nSecond Brain (SQLite-backed long-term memory) is ENABLED. You have ${summary.total} persistent memories about this user.`;
-      prompt += `\nMemory types: identity, preference, goal, project, habit, decision, constraint, relationship, episode, reflection.`;
-      prompt += `\n\nCRITICAL — Memory storage rules:`;
-      prompt += `\n- ALL persistent user knowledge lives in the Second Brain SQLite database — this is the single source of truth.`;
-      prompt += `\n- NEVER use create_file, write_file, edit_file, or any file tool to store memories, notes, facts, preferences, or brain data. Files are for code and documents, not for knowledge storage.`;
-      prompt += `\n- New memories are extracted AUTOMATICALLY after each conversation turn. You do not need to ask the user if they want to save something.`;
-      prompt += `\n- When the user explicitly asks you to "save/remember/note/keep this," use the save_memory tool to store it directly — no follow-up questions needed.`;
-      prompt += `\n- When you need to actively recall something beyond auto-injected context (e.g. "do you remember...", "what do I know about..."), use the search_memory tool.`;
-      prompt += `\n- Relevant memories are auto-injected before each message. You can reference them naturally (e.g. "I remember you prefer TypeScript").`;
-      prompt += `\n- Users can manage memory with: /memory (overview, search, pause learning, clear).`;
-      if (summary.learningPaused) {
-        prompt += `\n\nLearning is currently PAUSED — no new memories will be extracted or saved until resumed.`;
-      }
-    } else {
-      prompt += '\n\nSecond Brain is DISABLED. Basic long-term memory (text search over facts) is still active.';
-    }
-
-    // Notification routing guidance for tweet-notifier skill
-    const skillNames = this.capabilities.getSkillContext();
-    if (skillNames.includes('tweet-notifier')) {
-      prompt += `\n\n**Tweet Notification System Available** — The tweet-notifier skill is installed.
-When you need to schedule tweets, manage approvals, or notify founders/supporters:
-1. Use the \`use_skill\` tool to invoke the \`tweet-notifier\` skill for detailed instructions
-2. The skill provides templates for scheduling tweets, notifying founders (via send_message), and alerting supporters (approved Telegram users)
-3. Key tools used by this system: schedule_task (for timing), send_message (for notifications to Telegram), save_memory (for tweet state tracking), search_memory (for checking existing tweets)
-4. Supporters are all approved Telegram users — send_message will reach them
-5. The founder (Optimus Prime) receives notifications via send_message (Telegram)`;
-    }
-
-    const toolNames = this.capabilities.getToolNames();
-    const githubTools = ['create_pr', 'review_pr', 'list_issues', 'create_issue', 'github_api'];
-    const hasGitHub = githubTools.some(t => toolNames.includes(t));
-    if (hasGitHub) {
-      let githubHint = '\n\nGitHub companion is active.';
-      const { defaultOwner, defaultRepo } = this.config.github;
-      if (defaultOwner && defaultRepo) {
-        githubHint += ` Default repo: ${defaultOwner}/${defaultRepo}. Use this when the user doesn't specify a repo.`;
-      }
-
-      githubHint += `
-
-Available GitHub tools and when to use them:
-- git_add, git_commit, git_push: LOCAL git operations (stage, commit, push to a remote you have SSH/auth access to). All commits include "Co-authored-by: Mercury <mercury@cosmicstack.org>".
-- create_pr: Create a pull request on GitHub. The head branch must already exist on the remote.
-- review_pr: Get PR details and optionally post a review comment.
-- list_issues, create_issue: Browse and file issues.
-- github_api: Raw GitHub API access. IMPORTANT USE CASES:
-  - Push files directly to GitHub via PUT /repos/{owner}/{repo}/contents/{path} when git push fails due to auth. The body must include "message" and "content" (base64-encoded file content). This creates a commit on GitHub with Mercury as co-author.
-  - Delete files via DELETE /repos/{owner}/{repo}/contents/{path} with a "message" and "sha" in the body.
-  - Any other GitHub API operation not covered by the other tools.
-
-When the user asks to "push to GitHub" or "upload files" and git push fails, use github_api with PUT /repos/{owner}/{repo}/contents/{path} to push content directly through the API. This bypasses local git entirely.
-
-Always specify owner and repo parameters on GitHub tools. The user's GitHub username is ${this.config.github.username || 'not set'}.'`;
-
-      prompt += githubHint;
-    }
-    return prompt;
+  /**
+   * Prompt caching: the system prompt is the large, stable prefix of every
+   * model call (identity, skills, bot roster, guidelines; with ~50 tool
+   * schemas it is roughly 10K tokens) and it is re-sent on every one of up
+   * to 75 steps. Sending it as a system *message* carrying an Anthropic
+   * cache_control marker lets Anthropic serve it from cache across steps
+   * and turns; providers that do not know the option ignore it, and the
+   * AI SDK treats a leading system message exactly like `system:`.
+   */
+  private withCachedSystem(systemPrompt: string, messages: unknown[], volatileSystem = ''): any[] {
+    return [
+      {
+        role: 'system',
+        content: systemPrompt,
+        providerOptions: { anthropic: { cacheControl: { type: 'ephemeral' } } },
+      },
+      // Per-turn context lives in its own block AFTER the cache marker so it
+      // never invalidates the stable prefix.
+      ...(volatileSystem ? [{ role: 'system', content: volatileSystem }] : []),
+      ...messages,
+    ];
   }
 
-  async processInternalPrompt(prompt: string, channelId?: string, channelType?: string): Promise<void> {
+  /** Stable system prompt; assembly lives in core/system-prompt.ts. */
+  private buildSystemPrompt(): string {
+    const summary = this.userMemory ? this.userMemory.getSummary() : null;
+    const ownerName = this.config.identity.owner || 'the owner';
+    return assembleSystemPrompt({
+      identityPrompt: this.identity.getSystemPrompt(this.config.identity),
+      ownerSections: this.userMemory ? this.ownerSections(this.userMemory.beliefs, ownerName) : null,
+      ownerName,
+      skillContext: this.capabilities.getSkillContext(),
+      botSection: this.botManager ? this.botManager.getSystemPromptSection() : '',
+      programmingSuffix: this.programmingMode.getSystemPromptSuffix(),
+      researchSuffix: this.researchMode.getSystemPromptSuffix(),
+      saverSuffix: this.saverMode.getSystemPromptSuffix(),
+      cwd: this.capabilities.getCwd(),
+      now: new Date(),
+      platform: process.platform,
+      timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+      memorySummary: summary ? { total: summary.total, learningPaused: summary.learningPaused } : null,
+      toolNames: this.capabilities.getToolNames(),
+      github: this.config.github,
+    });
+  }
+
+  async processInternalPrompt(prompt: string, channelId?: string, channelType?: string, opts: { allowTools?: string[]; scheduledTaskId?: string } = {}): Promise<void> {
     const syntheticMsg: ChannelMessage = {
       id: `internal-${Date.now().toString(36)}`,
       channelId: channelId || 'internal',
@@ -1873,11 +4393,34 @@ Always specify owner and repo parameters on GitHub tools. The user's GitHub user
       senderId: 'system',
       content: prompt,
       timestamp: Date.now(),
+      ...(opts.allowTools?.length || opts.scheduledTaskId
+        ? { metadata: { ...(opts.allowTools?.length ? { allowTools: opts.allowTools } : {}), ...(opts.scheduledTaskId ? { scheduledTaskId: opts.scheduledTaskId } : {}) } }
+        : {}),
     };
     this.enqueueMessage(syntheticMsg);
   }
 
   private async handleScheduledTask(manifest: ScheduledTaskManifest): Promise<void> {
+    // Bot routines run on the bot lane, never through the main agent loop
+    // (BOTS-ARCHITECTURE.md §2.3 — cron lane).
+    if (manifest.botId) {
+      if (!this.botManager) {
+        logger.warn({ task: manifest.id, botId: manifest.botId }, 'Bot routine fired but BotManager is not wired');
+        return;
+      }
+      logger.info({ task: manifest.id, botId: manifest.botId }, 'Bot routine firing');
+      const result = this.botManager.enqueue(manifest.botId, {
+        trigger: 'cron',
+        prompt: manifest.prompt || manifest.description,
+        routineId: manifest.id,
+      });
+      if (!result.accepted) {
+        // Gate skips (busy, too soon, paused) are the governor working, not faults.
+        const level = result.reasonCode === 'busy' || result.reasonCode === 'too_soon' || result.reasonCode === 'routine_paused' ? 'info' : 'warn';
+        logger[level]({ botId: manifest.botId, task: manifest.id, reasonCode: result.reasonCode }, 'Bot routine tick skipped');
+      }
+      return;
+    }
     logger.info({ task: manifest.id, channel: manifest.sourceChannelType }, 'Processing scheduled task');
     try {
       const channel = manifest.sourceChannelType
@@ -1889,7 +4432,7 @@ Always specify owner and repo parameters on GitHub tools. The user's GitHub user
         await channel.send(
           ` Scheduled task started${skillInfo}: ${manifest.description}\nAll actions auto-approved for this run.`,
           manifest.sourceChannelId,
-        ).catch(() => {});
+        ).catch((e) => logger.warn({ e }, 'channel send failed'));
       }
 
       let prompt = manifest.prompt || '';
@@ -1900,10 +4443,61 @@ Always specify owner and repo parameters on GitHub tools. The user's GitHub user
       if (!prompt) {
         prompt = `Execute scheduled task: ${manifest.description}`;
       }
-      await this.processInternalPrompt(prompt, manifest.sourceChannelId, manifest.sourceChannelType);
+      await this.processInternalPrompt(prompt, manifest.sourceChannelId, manifest.sourceChannelType, { allowTools: manifest.allowTools, scheduledTaskId: manifest.id });
     } catch (err) {
       logger.error({ err, task: manifest.id }, 'Scheduled task execution failed');
     }
+  }
+
+  /**
+   * Run the reflection pass now (heartbeat, and shutdown from index.ts). It
+   * only calls the model when at least one session has a new owner message
+   * since the last pass; concurrent calls share one run.
+   */
+  /**
+   * The provider the Owner Model learns on (ADR-026): `memory.learning.provider`
+   * when it names a usable provider, else the chat default. Resolved per call so
+   * a key added at runtime or a changed default is picked up.
+   */
+  private learningProviders(): { getDefault(): ReturnType<ProviderRegistry['getDefault']> } {
+    return {
+      getDefault: () => {
+        const requested = this.config.memory.learning?.provider?.trim();
+        if (requested) {
+          const getUsable = typeof this.providers.getUsable === 'function' ? this.providers.getUsable.bind(this.providers) : (name?: string) => (name ? this.providers.get(name) : undefined);
+          const provider = getUsable(requested);
+          if (provider) return provider;
+          if (!this.warnedLearningProvider) {
+            this.warnedLearningProvider = true;
+            logger.warn({ requested }, 'memory.learning.provider is not registered or not usable — learning on the default provider');
+          }
+        }
+        return this.providers.getDefault();
+      },
+    };
+  }
+  private warnedLearningProvider = false;
+
+  async reflectNow(): Promise<void> {
+    if (!this.userMemory) return;
+    if (this.reflectionInFlight) return this.reflectionInFlight;
+    const userMemory = this.userMemory;
+    const force = userMemory.beliefs.getMeta('reflection_force') === '1';
+    if (force) userMemory.beliefs.setMeta('reflection_force', '0');
+    this.reflectionInFlight = runReflection({
+      beliefs: userMemory.beliefs,
+      sessions: this.sessions,
+      providers: this.learningProviders(),
+      tokenBudget: this.tokenBudget,
+      learningPaused: () => userMemory.isLearningPaused(),
+      ownerName: this.config.identity.owner || 'the owner',
+      agentId: this.config.cloud.agentId || undefined,
+    }, { force }).then((result) => {
+      if (result.ran) this.syncTokenInfoToCli();
+    }).finally(() => {
+      this.reflectionInFlight = null;
+    });
+    return this.reflectionInFlight;
   }
 
   private async heartbeat(): Promise<void> {
@@ -1914,20 +4508,22 @@ Always specify owner and repo parameters on GitHub tools. The user's GitHub user
       logger.info({ pruned }, 'Episodic memory pruned');
     }
 
-    if (this.userMemory) {
+    if (this.skillLoader) {
+      // Self-made skills nobody used again go dormant (ADR-027); cheap, file-only.
       try {
-        const consolidation = this.userMemory.consolidate();
-        if (consolidation.profileUpdated || consolidation.reflectionCount > 0) {
-          logger.info({ consolidation }, 'Second brain consolidated');
-        }
-
-        const pruning = this.userMemory.prune();
-        if (pruning.movedToSubconscious > 0 || pruning.hardDeleted > 0 || pruning.promoted > 0) {
-          logger.info({ pruning }, 'Second brain pruned');
-        }
+        const { selfMadeHygiene } = await import('../skills/self-made.js');
+        const { dormant } = selfMadeHygiene(this.skillLoader.rootDir());
+        if (dormant.length > 0) this.skillLoader.discover();
       } catch (err) {
-        logger.warn({ err }, 'Second brain heartbeat error');
+        logger.debug({ err }, 'self-made skill hygiene failed');
       }
+    }
+
+    if (this.userMemory) {
+      // The reflection pass (ADR-026): one model call over the owner's turns
+      // since the last pass, then decay; a no-op when nothing new was said.
+      // It is the only maintenance the Second Brain gets — one source.
+      await this.reflectNow().catch((err) => logger.warn({ err }, 'Reflection pass failed'));
     }
 
     const notifications: string[] = [];
@@ -1962,123 +4558,208 @@ Always specify owner and repo parameters on GitHub tools. The user's GitHub user
     }
   }
 
-  private async extractMemory(userMessage: string, agentResponse: string): Promise<void> {
+  /** Learn from a conversation that didn't happen as chat turns (e.g. a voice call). */
+  learnFromConversation(ownerSaid: string, mercurySaid: string): void {
+    void this.extractMemory(ownerSaid, mercurySaid, {}).catch((err) => logger.warn({ err }, 'Learning from a call failed'));
+  }
+
+  /** Who Mercury is, for a voice that isn't the main model: identity, about, and the owner's profile. */
+  voiceBriefing(): string {
+    const parts = [this.identity.getSystemPrompt(this.config.identity)];
+    if (this.userMemory) {
+      try {
+        const ownerName = this.config.identity.owner || 'your owner';
+        const sections = this.ownerSections(this.userMemory.beliefs, ownerName);
+        const text = [sections?.about, sections?.howToWork].filter((s): s is string => Boolean(s && s.trim())).join('\n\n');
+        if (text) parts.push(`# What you know about ${ownerName} (from your Second Brain)\n${text.slice(0, 4000)}`);
+      } catch { /* memory unavailable: identity alone */ }
+    }
+    return parts.join('\n\n');
+  }
+
+  /**
+   * The per-turn learning loop (ADR-026, docs/owner-model.md §3.4): the
+   * turn's signals plus one small model call become belief operations
+   * applied to the belief store, and at most one "☿ Noted" line goes back
+   * on the channel after the reply. The legacy `memories` table is no
+   * longer written here; only the explicit save_memory tool writes it.
+   */
+  private async extractMemory(
+    userMessage: string,
+    agentResponse: string,
+    ctx: {
+      msg?: ChannelMessage;
+      channel?: { send(content: string, targetId?: string): Promise<void> };
+      sessionId?: string;
+      /** The turn's tool-trace lines (formatToolTraceLine). */
+      toolTrace?: readonly string[];
+      /** Resolves once the reply reached the channel; the note is sent after it. */
+      delivered?: Promise<void>;
+    } = {},
+  ): Promise<void> {
     if (!this.userMemory) return;
     if (this.userMemory.isLearningPaused()) return;
+    const beliefs = this.userMemory.beliefs;
+    const channelAccess = typeof ctx.msg?.metadata?.channelAccess === 'string' ? ctx.msg.metadata.channelAccess : undefined;
+    if (channelAccess === 'general') return;
 
-    const trivial = /^(hi|hello|hey|thanks|thank you|ok|okay|yes|no|bye|goodbye|good morning|good evening)\b/i;
-    if (trivial.test(userMessage.trim())) return;
+    // The session's earlier turns, role-labelled: context for the extractor
+    // and the source for "same request again" detection.
+    const history: ExtractTurn[] = [];
+    if (ctx.sessionId && ctx.msg) {
+      try {
+        const thisTurn = new Set([ctx.msg.id, `${ctx.msg.id}:assistant`, `${ctx.msg.id}:tools`]);
+        for (const m of this.sessions.get(ctx.sessionId).messages) {
+          if (m.kind !== 'message' || (m.role !== 'user' && m.role !== 'assistant')) continue;
+          if (m.externalMessageId && thisTurn.has(m.externalMessageId)) continue;
+          history.push({ role: m.role === 'user' ? 'owner' : 'mercury', content: m.content });
+        }
+      } catch (err) {
+        logger.debug({ err }, 'Session history unavailable for learning');
+      }
+    }
+    const signals = collectTurnSignals({
+      message: userMessage,
+      previousUserMessages: history.filter((t) => t.role === 'owner').map((t) => t.content),
+      toolTrace: parseToolTraceLines(ctx.toolTrace ?? []),
+      allowAllActive: this.capabilities.permissions.isAutoApproveAll(),
+      permissionAnswers: this.capabilities.permissions.drainAnswers(),
+      channelType: ctx.msg?.channelType,
+      sessionId: ctx.sessionId,
+      cwd: this.capabilities.getCwd(),
+    });
 
-    if (!this.tokenBudget.canAfford(800)) return;
+    // Validation loop (§3.1): the beliefs the previous turn acted on earn
+    // weak support once the owner's next message in the same session shows
+    // no correction. Then remember what this turn acted on.
+    const pending = this.pendingActedOn;
+    if (pending && pending.ids.length > 0 && pending.sessionId && pending.sessionId === ctx.sessionId && !signals.correction.detected) {
+      try { beliefs.actedOnOk(pending.ids, pending.sessionId); } catch (err) { logger.debug({ err }, 'actedOnOk failed'); }
+    }
+    this.pendingActedOn = ctx.sessionId ? { ids: [...(this.lastInjectedBeliefIds ?? [])], sessionId: ctx.sessionId } : null;
 
     try {
-      const provider = this.providers.getDefault();
-      const result = await generateText({
-        model: provider.getModelInstance(),
-        system: `You extract structured memory from conversations. Output a JSON array of 0-3 memory candidates.
-
-Each candidate: { type, summary (concise fact, 12-220 chars), detail (optional explanation), evidenceKind ("direct" if explicitly stated, "inferred" if deduced), confidence (0-1), importance (0-1), durability (0-1) }
-
-TYPE DEFINITIONS (pick the single most specific one):
-- identity: who the user IS — their name, role, job title, self-description
-- relationship: other people the user knows — MUST include the person's name in summary
-- preference: likes, dislikes, style choices, opinions
-- goal: aspirations, targets, things they want to achieve
-- project: specific ongoing work, initiatives, things being built
-- habit: routines, recurring behaviors, schedules
-- decision: choices made, commitments, selected approaches
-- constraint: limitations, rules they follow, things they avoid
-- episode: notable one-time events worth remembering
-
-RULES:
-- Each semantic fact must appear EXACTLY ONCE. Never store the same information under multiple types.
-- If a fact is about someone else's role/relationship to the user, use "relationship" (not "identity").
-- "identity" is ONLY for the user themselves.
-- For relationships, always name the person: "Salman is user's co-developer" not "User works with a co-developer".
-- Only extract specific, durable, user-specific information.
-- Do NOT extract trivial observations, greetings, or assistant behavior.
-- Output pure JSON array, no markdown fences.`,
-        messages: [
-          { role: 'user', content: `User: ${userMessage}\nAssistant: ${agentResponse}` },
-        ],
-        maxOutputTokens: 400,
+      const ops = await extractBeliefOperations({
+        providers: this.learningProviders(),
+        tokenBudget: this.tokenBudget,
+        beliefs,
+        learningPaused: () => this.userMemory?.isLearningPaused() ?? true,
+        agentId: this.config.cloud.agentId || undefined,
+      }, {
+        ownerMessage: userMessage,
+        mercuryReply: agentResponse,
+        recentTurns: history.slice(-6),
+        signals,
+        ownerName: this.config.identity.owner || 'the owner',
+        pendingQuestion: pendingQuestion(beliefs),
+        channelAccess,
+        sessionId: ctx.sessionId,
+        turnRef: ctx.msg?.id,
       });
+      this.syncTokenInfoToCli();
+      if (ops.length === 0) return;
 
-      this.tokenBudget.recordUsage({
-        provider: provider.name,
-        model: provider.getModel(),
-        inputTokens: result.usage?.inputTokens ?? 0,
-        outputTokens: result.usage?.outputTokens ?? 0,
-        totalTokens: (result.usage?.inputTokens ?? 0) + (result.usage?.outputTokens ?? 0),
-        channelType: 'internal',
-      });
-
-      const text = result.text.trim();
-      if (!text) return;
-
-      let candidates: Array<{
-        type: string;
-        summary: string;
-        detail?: string;
-        evidenceKind?: string;
-        confidence: number;
-        importance: number;
-        durability: number;
-      }>;
-
-      try {
-        const jsonStr = text.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '');
-        const parsed = JSON.parse(jsonStr);
-        // Handle both single object and array of objects
-        candidates = Array.isArray(parsed) ? parsed : [parsed];
-      } catch {
-        const facts = text
-          .split('\n')
-          .map(l => l.replace(/^-\s*/, '').trim())
-          // Skip JSON-like lines (key-value pairs, braces, brackets)
-          .filter(f => f.length > 10 && f.length < 200 && !/^["{\[\]}]|":\s*"/.test(f));
-        candidates = facts.slice(0, 3).map(f => ({
-          type: 'preference',
-          summary: f,
-          confidence: 0.75,
-          importance: 0.7,
-          durability: 0.7,
-          evidenceKind: 'inferred',
-        }));
-      }
-
-      const validTypes = ['identity', 'preference', 'goal', 'project', 'habit', 'decision', 'constraint', 'relationship', 'episode'];
-      const typed = candidates
-        .filter(c => c.summary && c.summary.length >= 12 && c.summary.length <= 220)
-        .filter(c => validTypes.includes(c.type))
-        .map(c => ({
-          type: c.type as any,
-          summary: c.summary,
-          detail: c.detail,
-          evidenceKind: (c.evidenceKind === 'direct' ? 'direct' : 'inferred') as 'direct' | 'inferred',
-          confidence: Math.min(1, Math.max(0, c.confidence ?? 0.7)),
-          importance: Math.min(1, Math.max(0, c.importance ?? 0.7)),
-          durability: Math.min(1, Math.max(0, c.durability ?? 0.7)),
-        }));
-
-      if (typed.length > 0) {
-        const remembered = this.userMemory.remember(typed, 'conversation');
-        if (remembered.length > 0) {
-          logger.info({ count: remembered.length, types: remembered.map(r => r.type) }, 'Second brain memories stored');
+      const results: ApplyResult[] = [];
+      for (const op of ops) {
+        try {
+          const r = beliefs.apply(op);
+          if (r) results.push(r);
+        } catch (err) {
+          logger.warn({ err, op: op.op }, 'Belief operation failed');
         }
       }
+      if (results.length > 0) logger.info({ changes: results.map((r) => `${r.change}:${r.belief.kind}`) }, 'Beliefs updated from turn');
+
+      const note = composeLearnedNote(results, { beliefs });
+      if (!note || !ctx.channel || !ctx.msg) return;
+      const notedAt = this.lastNotedAt.get(ctx.msg.channelId) ?? 0;
+      if (Date.now() - notedAt < NOTE_COOLDOWN_MS) return;
+      this.lastNotedAt.set(ctx.msg.channelId, Date.now());
+      // After the reply, never ahead of it (capped so a stuck delivery can't hold the note forever).
+      await Promise.race([
+        ctx.delivered ?? Promise.resolve(),
+        new Promise<void>((resolve) => { setTimeout(resolve, 20_000).unref(); }),
+      ]);
+      await ctx.channel.send(note, ctx.msg.channelId);
+      // "forget that" right after the note undoes exactly this belief.
+      const noted = results.find((r) => r.behaviorChanging)?.belief.id;
+      if (noted) this.lastNotedBeliefId.set(ctx.msg.channelId, noted);
     } catch (err) {
       logger.warn({ err }, 'Memory extraction error');
     }
   }
 
+  /**
+   * Mark all queued/running work as user-cancelled (terminal state).
+   * Used by deliberate-stop paths (TUI Ctrl+C, /exit, SIGTERM) so the
+   * next start does not auto-resume killed tasks. Crash recovery is
+   * unaffected — this is only invoked on intentional exits.
+   */
+  /**
+   * Stop only the work started from one place (e.g. a desktop voice session,
+   * "desktop:call:<id>"): the running turn if it's theirs, and anything
+   * queued for it. Other chats keep going. Returns whether anything stopped.
+   */
+  stopWorkFor(channelPrefix: string, reason = 'Stopped by the owner.'): boolean {
+    const before = this.messageQueue.length;
+    this.messageQueue = this.messageQueue.filter((i) => !i.message.channelId.startsWith(channelPrefix));
+    let stopped = this.messageQueue.length !== before;
+    if (this.currentMessage?.channelId.startsWith(channelPrefix) && this.currentAbort && !this.currentAbort.signal.aborted) {
+      this.currentAbortReason = 'stopped';
+      this.currentAbort.abort();
+      if (this.currentWorkKey) {
+        try { this.workLedger.markCancelled(this.currentWorkKey, reason); } catch { /* entry may not exist */ }
+      }
+      stopped = true;
+    }
+    if (stopped) logger.info({ channelPrefix }, 'Work stopped for one channel');
+    return stopped;
+  }
+
+  cancelActiveWork(reason = 'Cancelled by the user.'): number {
+    try {
+      return this.workLedger.cancelActive(reason);
+    } catch (error) {
+      logger.warn({ error }, 'Failed to cancel active work');
+      return 0;
+    }
+  }
+
   async shutdown(): Promise<void> {
+    // Deliberate shutdown: never resume this work on restart.
+    try { this.workLedger.cancelActive('Mercury was shut down.'); } catch { /* best effort */ }
     if (this.supervisor) {
       await this.supervisor.haltAll();
     }
     this.backgroundTasks.destroy();
+    this.providers.destroy();
     await this.sleep();
     logger.info('Mercury has shut down');
+  }
+
+  /**
+   * Notify all active channels with a message. Used before forced exits
+   * (SIGTERM, crash, watchdog kill) so the user is never left wondering
+   * what happened to their task.
+   */
+  async notifyAllChannels(message: string): Promise<void> {
+    const outcome = await this.alertGate.run(message, () => this.broadcastToChannels(message));
+    if (outcome !== 'sent') logger.warn({ outcome, message: message.slice(0, 120) }, 'Broadcast not sent');
+  }
+
+  /** Broadcasts never nest or repeat (see AlertGate). */
+  private alertGate = new AlertGate();
+
+  private async broadcastToChannels(message: string): Promise<void> {
+    const active = this.channels.getActiveChannels();
+    const sends = active.map((type) => {
+      const ch = this.channels.get(type);
+      if (!ch || ch.noBroadcast) return Promise.resolve();
+      return ch.send(message).catch((e) => {
+        logger.warn({ e, channel: type }, 'Failed to notify channel before exit');
+      });
+    });
+    await Promise.allSettled(sends);
   }
 
   /**
@@ -2161,53 +4842,29 @@ Is this productive iteration or a stuck loop?`,
       return isNaN(index) ? choices[0] : (choices[index] ?? choices[0]);
     }
 
-    if (channelType === 'telegram' && channel instanceof TelegramChannel) {
-      const { InlineKeyboard } = await import('grammy');
-      const kb = new InlineKeyboard();
-      for (let i = 0; i < choices.length; i++) {
-        const callbackData = `choice_${Date.now()}_${i}`;
-        kb.text(choices[i].slice(0, 60), callbackData);
-        if (i < choices.length - 1 && (i + 1) % 2 === 0) {
-          kb.row();
-        }
-      }
+    if (channelType === 'web' && channel instanceof WebChannel) {
+      const options = choices.map((label, i) => ({
+        value: String(i),
+        label,
+      }));
 
-      return new Promise<string>((resolve) => {
-        const timeout = setTimeout(() => {
-          (channel as any).pendingApprovals?.delete(`choice_timeout_${question}`);
-          resolve(choices[0]);
-        }, 120000);
-
-        channel.send(question, channelId).catch(() => {});
-
-        const tgBot = (channel as any).bot;
-        if (tgBot) {
-          const chatId = channelId.startsWith('telegram:')
-            ? Number(channelId.split(':')[1])
-            : Number(channelId);
-
-          tgBot.api.sendMessage(chatId, question, { reply_markup: kb }).catch(() => {});
-
-          const handler = async (ctx: any) => {
-            const data = ctx.callbackQuery?.data;
-            if (!data || !data.startsWith('choice_')) return;
-            const parts = data.split('_');
-            if (parts.length < 3) return;
-            const index = parseInt(parts[2], 10);
-            if (isNaN(index)) return;
-            clearTimeout(timeout);
-            try { await ctx.answerCallbackQuery(); } catch {}
-            resolve(choices[index]);
-          };
-
-          if ((channel as any).pendingCallbacks) {
-            (channel as any).pendingCallbacks.push(handler);
-          }
-        }
-      });
+      const selected = await channel.presentChoicePrompt(question, options, channelId);
+      const index = parseInt(selected, 10);
+      return isNaN(index) ? choices[0] : (choices[index] ?? choices[0]);
     }
 
-    await channel?.send(`${question}\n${choices.map((c, i) => `  ${i + 1}. ${c}`).join('\n')}`, channelId).catch(() => {});
+    if (channelType === 'telegram' && channel instanceof TelegramChannel) {
+      const options = choices.map((label, i) => ({
+        value: String(i),
+        label,
+      }));
+
+      const selected = await channel.presentChoicePrompt(question, options, channelId);
+      const index = parseInt(selected, 10);
+      return isNaN(index) ? choices[0] : (choices[index] ?? choices[0]);
+    }
+
+    await channel?.send(`${question}\n${choices.map((c, i) => `  ${i + 1}. ${c}`).join('\n')}`, channelId).catch((e) => logger.warn({ e }, 'channel send failed'));
     return choices[0];
   }
 
@@ -2231,6 +4888,7 @@ Is this productive iteration or a stuck loop?`,
       await channel.send('Budget override applied — your next request will proceed.', channelId);
     } else if (action === 'reset' || action === '2') {
       this.tokenBudget.resetUsage();
+      this.syncTokenInfoToCli();
       await channel.send(`Usage reset to zero. ${this.tokenBudget.getStatusText()}`, channelId);
     } else if (action === 'set' || action === '3') {
       const newBudget = parseInt(parts[1], 10);
@@ -2239,6 +4897,7 @@ Is this productive iteration or a stuck loop?`,
         return;
       }
       this.tokenBudget.setBudget(newBudget);
+      this.syncTokenInfoToCli();
       await channel.send(`Daily budget updated to ${newBudget.toLocaleString()} tokens. ${this.tokenBudget.getStatusText()}`, channelId);
     } else if (action === 'cancel' || action === '4') {
       await channel.send(`Cancelled. ${this.tokenBudget.getStatusText()}`, channelId);
@@ -2249,959 +4908,410 @@ Is this productive iteration or a stuck loop?`,
     }
   }
 
-  private async handleChatCommand(content: string, channelType: string, channelId: string): Promise<boolean> {
-    const trimmed = content.trim();
-    const cmd = trimmed.toLowerCase();
-    const channel = this.channels.get(channelType as any);
-    if (!channel) return false;
+  /**
+   * Handle the /saver slash command — Token Saver Mode controls.
+   * Subcommands: (empty)|status|on|off|toggle|threshold <n>|auto on|off|routing on|off|stats
+   */
+  async handleSaverCommand(subcommand: string, channelType: string, channelId: string): Promise<void> {
+    return handleSaverCommandImpl(this, subcommand, channelType, channelId);
+  }
 
-    const ctx = this.capabilities.getChatCommandContext();
-    if (!ctx) return false;
-
-    if (cmd === '/help') {
-      const helpText = channelType === 'telegram' ? getTelegramHelp() : ctx.manual();
-      await channel.send(helpText, channelId);
-      return true;
-    }
-
-    if (cmd.startsWith('/bg')) {
-      await this.handleBgCommand(trimmed, { content: trimmed, channelId, channelType: channelType as any, id: Date.now().toString(36), senderId: 'user', timestamp: Date.now() }, channel);
-      return true;
-    }
-
-    if (cmd === '/progress' || cmd === '/still') {
-      if (!this.processing || !this.currentMessage) {
-        await channel.send('No active foreground task.', channelId);
-        return true;
-      }
-      const elapsedSec = Math.round((Date.now() - this.currentMessage.timestamp) / 1000);
-      const stepInfo = this.completedStepCount > 0 ? ` · step ${this.completedStepCount}/${MAX_STEPS}` : '';
-      const narrative = formatNarrative(this.stepNarrative, this.currentActivity, 10);
-      const narrativeBlock = narrative ? `\n${narrative}` : '';
-      await channel.send(
-        `⏳ Task in progress (${elapsedSec}s${stepInfo})${narrativeBlock}\nUse /bg current to move it to background.`,
-        channelId,
+  /** Push the current saver state to the CLI status bar if present. */
+  syncSaverToCli(): void {
+    const ch = this.channels.get('cli');
+    if (ch && (ch as any).setSaverMode) {
+      (ch as any).setSaverMode(
+        this.saverMode.getState(),
+        this.tokenBudget.getSavedToday(),
+        this.tokenBudget.getSavedLifetime(),
       );
-      return true;
     }
+  }
 
-    if (cmd === '/exit' || cmd === '/quit') {
-      await channel.send('Goodbye! Shutting down Mercury...', channelId);
-      this.shutdown();
-      return true;
-    }
-
-    if (cmd === '/permissions') {
-      if (channelType === 'cli' && channel instanceof CLIChannel) {
-        const mode = await channel.askPermissionMode?.();
-        if (mode === 'allow-all') {
-          this.capabilities.permissions.setAutoApproveAll(true);
-          this.capabilities.permissions.addTempScope('/', true, true);
-          await channel.send('Allow All mode active for this session. All scopes, commands, and loops auto-approved. Resets on restart.', channelId);
-        } else {
-          this.capabilities.permissions.setAutoApproveAll(false);
-          await channel.send('Ask Me mode active. Risky actions will prompt for confirmation.', channelId);
-        }
-        return true;
-      }
-      await channel.send('Use /permissions in CLI to switch permission mode. On Telegram, use the /permissions button or command.', channelId);
-      return true;
-    }
-
-    if (cmd === '/status') {
-      const config = ctx.config();
-      const budget = ctx.tokenBudget();
-      const lines = [
-        `**${config.identity.name}** — Status`,
-        `Owner: ${config.identity.owner || '(not set)'}`,
-        `Provider: ${config.providers.default}`,
-        `Telegram: ${config.channels.telegram.enabled ? 'enabled' : 'disabled'}`,
-        `Telegram access: ${getTelegramAccessSummary(config)}`,
-        `Budget: ${budget.getStatusText()}`,
-        `Skills: ${ctx.skillNames().length > 0 ? ctx.skillNames().join(', ') : 'none'}`,
-      ];
-      await channel.send(lines.join('\n'), channelId);
-      return true;
-    }
-
-    if (cmd === '/models' || cmd === '/model' || cmd.startsWith('/models ') || cmd.startsWith('/model ')) {
-      const base = cmd.startsWith('/model ') || cmd === '/model' ? '/model' : '/models';
-      const rawArgs = trimmed.slice(base.length).trim();
-      const activeProviders = getActiveProviders(this.config);
-      const current = this.providers.getDefault();
-
-      if (!rawArgs) {
-        const lines = [
-          '**Session Models**',
-          '',
-          ...activeProviders.map((p) => {
-            const marker = p.name === current.name ? ' ← current' : '';
-            return `• ${p.name} · ${p.model}${marker}`;
-          }),
-          '',
-          'Use `/models use <provider>` to switch for this session.',
-          'Use `mercury doctor` to add/configure models.',
-        ];
-        await channel.send(lines.join('\n'), channelId);
-
-        if (channelType === 'cli' && channel instanceof CLIChannel && activeProviders.length > 1) {
-          const choices = [
-            ...activeProviders.map((p) => `${p.name} · ${p.model}${p.name === current.name ? ' (current)' : ''}`),
-            'Open doctor instructions',
-            'Keep current model',
-          ];
-          const picked = await this.presentChoice('Switch session model?', choices, channelId, channelType);
-          if (picked === 'Open doctor instructions') {
-            await channel.send('Run `mercury doctor` and update provider/model settings. Then restart Mercury to persist defaults.', channelId);
-            return true;
-          }
-          if (picked === 'Keep current model') return true;
-          const providerName = picked.split(' · ')[0].trim();
-          if (providerName && providerName !== current.name) {
-            const switched = await this.switchSessionProvider(providerName);
-            await channel.send(switched.message, channelId);
-          }
-        }
-        return true;
-      }
-
-      if (rawArgs === 'doctor' || rawArgs === 'add') {
-        await channel.send('Use `mercury doctor` to add/configure models. Then use `/models` to switch active session model.', channelId);
-        return true;
-      }
-
-      const target = rawArgs.replace(/^use\s+/i, '').trim();
-      if (!target) {
-        await channel.send('Usage: `/models` or `/models use <provider>`', channelId);
-        return true;
-      }
-
-      const switched = await this.switchSessionProvider(target);
-      await channel.send(switched.message, channelId);
-      return true;
-    }
-
-    if (cmd === '/memory') {
-      if (!this.userMemory) {
-        const cfg = ctx.config();
-        if (cfg.memory.secondBrain?.enabled === false) {
-          await channel.send('Second brain is disabled in configuration.', channelId);
-        } else {
-          await channel.send('Second brain dependency issue: SQLite backend (better-sqlite3) is not available.', channelId);
-        }
-        return true;
-      }
-
-      if (channelType === 'cli' && channel instanceof CLIChannel) {
-        await this.openCliMemoryMenu(channel, channelId);
-        return true;
-      }
-
-      await this.sendMemoryOverview(channel, channelId);
-      return true;
-    }
-
-    if (cmd.startsWith('/telegram')) {
-      if (channelType !== 'cli') {
-        await channel.send('`/telegram` is only available from the Mercury CLI chat.', channelId);
-        return true;
-      }
-
-      const config = ctx.config();
-      const rawSubcommand = trimmed.slice('/telegram'.length).trim();
-      if (!rawSubcommand && channel instanceof CLIChannel) {
-        await channel.withMenu(async (select) => {
-          await this.openCliTelegramMenu(channel, channelId, select);
-        });
-        return true;
-      }
-
-      const parts = rawSubcommand.split(/\s+/).filter(Boolean);
-      const action = parts[0]?.toLowerCase() || 'help';
-      const formatTelegramUser = (user: {
-        userId: number;
-        username?: string;
-        firstName?: string;
-        pairingCode?: string;
-      }) => {
-        const username = user.username ? ` (@${user.username})` : '';
-        const firstName = user.firstName ? ` ${user.firstName}` : '';
-        const pairingCode = user.pairingCode ? ` [code: ${user.pairingCode}]` : '';
-        return `${user.userId}${username}${firstName}${pairingCode}`;
-      };
-
-      const sendTelegramOverview = async () => {
-        const lines = [
-          '**Telegram Management**',
-          '',
-          `Access: ${getTelegramAccessSummary(config)}`,
-          `Admins: ${config.channels.telegram.admins.length > 0 ? config.channels.telegram.admins.map(formatTelegramUser).join(', ') : 'none'}`,
-          `Members: ${config.channels.telegram.members.length > 0 ? config.channels.telegram.members.map(formatTelegramUser).join(', ') : 'none'}`,
-          `Pending: ${config.channels.telegram.pending.length > 0 ? config.channels.telegram.pending.map(formatTelegramUser).join(', ') : 'none'}`,
-          '',
-          'Commands:',
-          '• `/telegram pending`',
-          '• `/telegram users`',
-          '• `/telegram approve <pairing-code|user-id>`',
-          '• `/telegram reject <user-id>`',
-          '• `/telegram remove <user-id>`',
-          '• `/telegram promote <user-id>`',
-          '• `/telegram demote <user-id>`',
-          '• `/telegram reset`',
-        ];
-        await channel.send(lines.join('\n'), channelId);
-      };
-
-      if (action === 'help' || action === 'status') {
-        await sendTelegramOverview();
-        return true;
-      }
-
-      if (action === 'pending') {
-        const pending = getTelegramPendingRequests(config);
-        const lines = [
-          '**Telegram Pending Requests**',
-          '',
-          pending.length > 0 ? pending.map(formatTelegramUser).join('\n') : 'No pending Telegram requests.',
-        ];
-        await channel.send(lines.join('\n'), channelId);
-        return true;
-      }
-
-      if (action === 'users') {
-        const approved = getTelegramApprovedUsers(config);
-        const lines = [
-          '**Telegram Approved Users**',
-          '',
-          `Admins: ${config.channels.telegram.admins.length > 0 ? config.channels.telegram.admins.map(formatTelegramUser).join(', ') : 'none'}`,
-          `Members: ${config.channels.telegram.members.length > 0 ? config.channels.telegram.members.map(formatTelegramUser).join(', ') : 'none'}`,
-          '',
-          `Total approved: ${approved.length}`,
-        ];
-        await channel.send(lines.join('\n'), channelId);
-        return true;
-      }
-
-      if (action === 'approve') {
-        const value = parts[1];
-        if (!value) {
-          await channel.send('Usage: `/telegram approve <pairing-code|user-id>`', channelId);
-          return true;
-        }
-
-        let approved = approveTelegramPendingRequestByPairingCode(config, value);
-        let resultLabel = value;
-
-        if (!approved) {
-          const userId = Number(value);
-          if (!isNaN(userId)) {
-            approved = approveTelegramPendingRequest(config, userId, 'member');
-            resultLabel = userId.toString();
-          }
-        }
-
-        if (!approved) {
-          await channel.send(`No pending Telegram request found for \`${resultLabel}\`.`, channelId);
-          return true;
-        }
-
-        saveConfig(config);
-        await channel.send(`Approved Telegram user ${formatTelegramUser(approved)}.`, channelId);
-        return true;
-      }
-
-      if (action === 'reject') {
-        const value = Number(parts[1]);
-        if (isNaN(value)) {
-          await channel.send('Usage: `/telegram reject <user-id>`', channelId);
-          return true;
-        }
-
-        const rejected = rejectTelegramPendingRequest(config, value);
-        if (!rejected) {
-          await channel.send(`No pending Telegram request found for \`${value}\`.`, channelId);
-          return true;
-        }
-
-        saveConfig(config);
-        await channel.send(`Rejected Telegram request for ${formatTelegramUser(rejected)}.`, channelId);
-        return true;
-      }
-
-      if (action === 'remove') {
-        const value = Number(parts[1]);
-        if (isNaN(value)) {
-          await channel.send('Usage: `/telegram remove <user-id>`', channelId);
-          return true;
-        }
-
-        const removed = removeTelegramUser(config, value);
-        if (!removed) {
-          await channel.send(`No approved Telegram user found for \`${value}\`.`, channelId);
-          return true;
-        }
-
-        saveConfig(config);
-        await channel.send(`Removed Telegram access for ${formatTelegramUser(removed)}.`, channelId);
-        return true;
-      }
-
-      if (action === 'promote') {
-        const value = Number(parts[1]);
-        if (isNaN(value)) {
-          await channel.send('Usage: `/telegram promote <user-id>`', channelId);
-          return true;
-        }
-
-        const promoted = promoteTelegramUserToAdmin(config, value);
-        if (!promoted) {
-          await channel.send(`No Telegram member found for \`${value}\`.`, channelId);
-          return true;
-        }
-
-        saveConfig(config);
-        await channel.send(`Promoted ${formatTelegramUser(promoted)} to Telegram admin.`, channelId);
-        return true;
-      }
-
-      if (action === 'demote') {
-        const value = Number(parts[1]);
-        if (isNaN(value)) {
-          await channel.send('Usage: `/telegram demote <user-id>`', channelId);
-          return true;
-        }
-
-        const demoted = demoteTelegramAdmin(config, value);
-        if (!demoted) {
-          await channel.send('Could not demote that Telegram admin. Mercury must keep at least one admin.', channelId);
-          return true;
-        }
-
-        saveConfig(config);
-        await channel.send(`Demoted ${formatTelegramUser(demoted)} to Telegram member.`, channelId);
-        return true;
-      }
-
-      if (action === 'reset' || action === 'unpair') {
-        config.channels.telegram.admins = [];
-        config.channels.telegram.members = [];
-        config.channels.telegram.pending = [];
-        saveConfig(config);
-        await channel.send('Telegram access reset. New users can send /start to begin pairing again.', channelId);
-        return true;
-      }
-
-      await channel.send(
-      `Unknown Telegram command "${action}". Try \`/telegram\`, \`/telegram pending\`, or \`/telegram users\`.`,
-        channelId,
+  private syncTokenInfoToCli(): void {
+    const ch = this.channels.get('cli');
+    if (ch && (ch as any).setTokenInfo) {
+      (ch as any).setTokenInfo(
+        this.tokenBudget.getDailyUsed(),
+        this.tokenBudget.getBudget(),
+        Math.round(this.tokenBudget.getUsagePercentage()),
       );
-      return true;
     }
+  }
 
-    if ((cmd === '/' || cmd === '/menu') && channelType === 'cli' && channel instanceof CLIChannel) {
-      await this.openCliCommandMenu(channel, channelId);
-      return true;
-    }
+  async handleSkillsSlashCommand(
+    trimmed: string,
+    channel: any,
+    channelId: string,
+    ctx: { skillNames: () => string[] },
+  ): Promise<void> {
+    const parts = trimmed.split(/\s+/).slice(1);
+    const sub = (parts[0] || 'list').toLowerCase();
+    const args = parts.slice(1);
+    const arg = args.join(' ').trim();
 
-    if (cmd === '/tools') {
-      const tools = ctx.toolNames();
-      const grouped = [
-        `**${tools.length} tools loaded:**`,
-        '',
-        ...tools.sort().map(t => `• \`${t}\``),
-      ];
-      await channel.send(grouped.join('\n'), channelId);
-      return true;
-    }
+    const { RegistryClient, isValidSkillId, searchFeed } = await import('../skills/registry.js');
+    const { SkillStore } = await import('../skills/store.js');
+    const registry = new RegistryClient();
+    const store = new SkillStore({ registry });
 
-    if (cmd === '/skills') {
-      const names = ctx.skillNames();
-      if (names.length === 0) {
-        await channel.send('No skills installed. Ask me to "install skill from <url>" to add one.', channelId);
-      } else {
-        const lines = [
-          `**${names.length} skill${names.length > 1 ? 's' : ''} installed:**`,
-          '',
-          ...names.map(n => `• ${n}`),
-        ];
-        await channel.send(lines.join('\n'), channelId);
-      }
-      return true;
-    }
-
-    if (cmd.startsWith('/code')) {
-      const rawArgs = trimmed.slice('/code'.length).trim().toLowerCase();
-      const cliChannel = channelType === 'cli' && channel instanceof CLIChannel ? channel : null;
-
-      if (!rawArgs) {
-        if (cliChannel) {
-          const choice = await this.presentChoice(
-            'Code mode: open workspace IDE now?',
-            ['Yes, open current workspace', 'No, keep classic coding mode'],
-            channelId,
-            channelType,
-          );
-          if (choice.toLowerCase().startsWith('yes')) {
-            const current = this.capabilities.getCwd();
-            const opened = cliChannel.openWorkspace(current);
-            if (opened.ok) {
-              this.capabilities.permissions.addTempScope(current, true, true);
-              this.programmingMode.setExecute();
-              this.programmingMode.setProjectContext(current);
-              cliChannel.setProgrammingStatus(this.programmingMode.getState(), this.programmingMode.getProjectContext());
-              await channel.send(`${opened.message}\nWorkspace IDE mode enabled.`, channelId);
-              return true;
-            }
-            await channel.send(opened.message, channelId);
-            return true;
-          }
-        }
-        await channel.send(this.programmingMode.getStatusText(), channelId);
-        return true;
-      }
-
-      if (rawArgs === 'status') {
-        await channel.send(this.programmingMode.getStatusText(), channelId);
-        return true;
-      }
-
-      if (rawArgs === 'workspace' || rawArgs === 'ws') {
-        if (!cliChannel) {
-          await channel.send('Workspace IDE mode is currently available in CLI only.', channelId);
-          return true;
-        }
-        const current = this.capabilities.getCwd();
-        const opened = cliChannel.openWorkspace(current);
-        if (opened.ok) {
-          this.programmingMode.setExecute();
-          cliChannel.setProgrammingStatus(this.programmingMode.getState(), this.programmingMode.getProjectContext());
-          await channel.send(`${opened.message}\nWorkspace IDE mode enabled.`, channelId);
-        } else {
-          await channel.send(opened.message, channelId);
-        }
-        return true;
-      }
-
-      if (rawArgs === 'plan') {
-        this.programmingMode.setPlan();
-        if (cliChannel) cliChannel.setProgrammingStatus(this.programmingMode.getState(), this.programmingMode.getProjectContext());
-        await channel.send('Programming mode: **Plan**\nI will explore, analyze, and present a plan before writing any code. Use `/code execute` to switch to execution.', channelId);
-        return true;
-      }
-
-      if (rawArgs === 'execute' || rawArgs === 'exec') {
-        this.programmingMode.setExecute();
-        if (cliChannel) cliChannel.setProgrammingStatus(this.programmingMode.getState(), this.programmingMode.getProjectContext());
-        await channel.send('Programming mode: **Execute**\nI will implement the plan step by step, verifying with builds/tests. Use `/code off` to exit.', channelId);
-        return true;
-      }
-
-      if (rawArgs === 'build') {
-        this.programmingMode.setExecute();
-        if (cliChannel) cliChannel.setProgrammingStatus(this.programmingMode.getState(), this.programmingMode.getProjectContext());
-        await channel.send('Programming mode: **Build**\nExecution mode is active for implementation/build tasks.', channelId);
-        return true;
-      }
-
-      if (rawArgs.startsWith('agent ') || rawArgs.startsWith('delegate ')) {
-        if (!this.supervisor) {
-          await channel.send('Sub-agents are not enabled in this environment.', channelId);
-          return true;
-        }
-        const taskDescription = rawArgs.replace(/^(agent|delegate)\s+/, '').trim();
-        if (!taskDescription) {
-          await channel.send('Usage: `/code agent <task>`', channelId);
-          return true;
-        }
-        const cwd = this.capabilities.getCwd();
-        const agentId = await this.supervisor.spawn({
-          task: taskDescription,
-          sourceChannelId: channelId,
-          sourceChannelType: channelType as any,
-          workingDirectory: cwd,
-        });
-        const bgId = this.backgroundTasks.spawnAgent(taskDescription, cwd, agentId);
-        this.syncBgTasksToTui();
-        await channel.send(`Started coding sub-agent ${agentId} in background task ${bgId}. Use /bg ${bgId} for progress.`, channelId);
-        return true;
-      }
-
-      if (rawArgs === 'off' || rawArgs === 'exit') {
-        this.programmingMode.setOff();
-        if (cliChannel) cliChannel.setProgrammingStatus(this.programmingMode.getState(), this.programmingMode.getProjectContext());
-        await channel.send('Programming mode: **Off**\nBack to normal conversation mode.', channelId);
-        return true;
-      }
-
-      if (rawArgs === 'toggle') {
-        const newState = this.programmingMode.toggle();
-        const labels: Record<string, string> = { off: 'Off', plan: 'Plan', execute: 'Execute' };
-        if (cliChannel) cliChannel.setProgrammingStatus(this.programmingMode.getState(), this.programmingMode.getProjectContext());
-        await channel.send(`Programming mode: **${labels[newState]}**`, channelId);
-        return true;
-      }
-
-      await channel.send('Unknown /code command. Available: /code, /code plan, /code execute, /code build, /code workspace, /code agent <task>, /code off, /code toggle', channelId);
-      return true;
-    }
-
-    if (cmd.startsWith('/ws') || cmd.startsWith('/workspace')) {
-      const cliChannel = channelType === 'cli' && channel instanceof CLIChannel ? channel : null;
-      if (!cliChannel) {
-        await channel.send('Workspace IDE mode is currently available in CLI only.', channelId);
-        return true;
-      }
-
-      const base = cmd.startsWith('/workspace') ? '/workspace' : '/ws';
-      const rawArgs = trimmed.slice(base.length).trim();
-      const rawLower = rawArgs.toLowerCase();
-
-      if (!rawArgs || rawLower === 'status') {
-        const ws = cliChannel.getWorkspace();
-        await channel.send(ws?.active ? `Workspace active: ${ws.rootPath}` : 'No active workspace. Use `/ws open <path>`.', channelId);
-        return true;
-      }
-
-      if (rawLower.startsWith('open ')) {
-        const target = rawArgs.slice(5).trim();
-        const opened = cliChannel.openWorkspace(target);
-        if (opened.ok) {
-          this.capabilities.setCwd(path.resolve(target.replace(/^~(?=$|\/)/, process.env.HOME || '~')));
-          this.capabilities.permissions.addTempScope(this.capabilities.getCwd(), true, true);
-          this.programmingMode.setExecute();
-          this.programmingMode.setProjectContext(this.capabilities.getCwd());
-          cliChannel.setProgrammingStatus(this.programmingMode.getState(), this.programmingMode.getProjectContext());
-          await channel.send(`${opened.message}\nWorkspace IDE is ready.`, channelId);
-        } else {
-          await channel.send(opened.message, channelId);
-        }
-        return true;
-      }
-
-      if (rawLower === 'refresh') {
-        cliChannel.refreshWorkspace();
-        await channel.send('Workspace refreshed.', channelId);
-        return true;
-      }
-
-      if (rawLower.startsWith('stage ')) {
-        const fileArg = rawArgs.slice(6).trim();
-        const result = cliChannel.stageWorkspaceFile(fileArg || 'all');
-        await channel.send(result.message, channelId);
-        return true;
-      }
-
-      if (rawLower.startsWith('commit ')) {
-        const message = rawArgs.slice(7).trim();
-        const result = cliChannel.commitWorkspace(message);
-        await channel.send(result.message, channelId);
-        return true;
-      }
-
-      if (rawLower.startsWith('undo ')) {
-        const fileArg = rawArgs.slice(5).trim();
-        const result = cliChannel.undoWorkspaceFile(fileArg);
-        await channel.send(result.message, channelId);
-        return true;
-      }
-
-      if (rawLower === 'help') {
-        await channel.send('Workspace commands:\n`/ws open <path>`\n`/ws refresh`\n`/ws stage <file|all>`\n`/ws commit <message>`\n`/ws undo <file>`\n`/ws status`', channelId);
-        return true;
-      }
-
-      await channel.send('Unknown workspace command. Use `/ws help`.', channelId);
-      return true;
-    }
-
-    if (cmd.startsWith('/spotify')) {
-      if (!this.spotifyClient) {
-        await channel.send('Spotify is not connected. Set SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET in your config, then run /spotify auth.', channelId);
-        return true;
-      }
-      const rawArgs = trimmed.slice('/spotify'.length).trim().toLowerCase();
-
-      if (!rawArgs || rawArgs === 'status') {
-        const auth = this.spotifyClient.isAuthenticated() ? 'Connected' : 'Not connected';
-        const device = this.spotifyClient.getDeviceId() || 'none';
-
-        let accountName = this.spotifyClient.getAccountName();
-        let accountId = this.spotifyClient.getAccountId();
-        let product = this.spotifyClient.getProduct();
-        let accountError = '';
-
-        if (!accountName) {
-          try {
-            await this.spotifyClient.saveAccountInfo();
-            accountName = this.spotifyClient.getAccountName();
-            accountId = this.spotifyClient.getAccountId();
-            product = this.spotifyClient.getProduct();
-          } catch (err: any) {
-            accountError = err.message;
-            logger.warn({ err: err.message }, 'Failed to fetch Spotify account info');
-          }
-        }
-
-        let premium = this.spotifyClient.getPremiumStatus();
-        if (premium === null) {
-          premium = await this.spotifyClient.checkPremium();
-        }
-
-        let status = `Spotify: **${auth}**`;
-        if (accountName) status += `\nAccount: **${accountName}**`;
-        if (accountId) status += `\nUser ID: ${accountId}`;
-        if (product) status += `\nPlan: ${product}`;
-        if (premium === true) {
-          status += ' — all features available';
-        } else if (premium === false) {
-          status += ' — playback control requires Premium';
-        }
-        if (accountError) status += `\n⚠ Could not verify account: ${accountError}`;
-        status += `\nDevice: ${device !== 'none' ? device : 'none selected'}`;
-        await channel.send(status, channelId);
-        return true;
-      }
-
-      if (rawArgs === 'auth') {
-        if (channelType === 'cli' && channel instanceof CLIChannel) {
-          try {
-            const choice = await channel.withMenu(async (select) => {
-              return select('Spotify Authorization', [
-                { value: 'browser', label: 'Open browser (recommended)' },
-                { value: 'manual', label: 'Paste authorization code manually' },
-                { value: 'cancel', label: 'Cancel' },
-              ]);
-            });
-            if (!choice || choice === 'cancel') {
-              await channel.send('Spotify auth cancelled.', channelId);
-              return true;
-            }
-            if (choice === 'manual') {
-              const authUrl = this.spotifyClient.getAuthUrl();
-              await channel.send('1. Open this URL in your browser:\n' + authUrl + '\n\n2. After authorizing, you will be redirected to localhost — it may show an error page, that is OK.\n3. Copy the `code` parameter from the URL in your browser address bar.\n4. Paste it below:', channelId);
-              const code = await channel.prompt('Authorization code: ');
-              if (!code || !code.trim()) {
-                await channel.send('No code provided. Auth cancelled.', channelId);
-                return true;
-              }
-              await this.spotifyClient.authenticateWithCode(code.trim());
-              await channel.send('Spotify connected successfully! Try: play some music', channelId);
-            } else {
-              await channel.send('Opening browser for Spotify authorization...', channelId);
-              await this.spotifyClient.authenticate();
-              await channel.send('Spotify connected successfully! Try: play some music', channelId);
-            }
-          } catch (err: any) {
-            await channel.send(`Spotify auth failed: ${err.message}`, channelId);
-          }
-        } else {
-          const authUrl = this.spotifyClient.getAuthUrl();
+    try {
+      switch (sub) {
+        case 'help':
+        case '-h':
+        case '--help': {
           await channel.send(
-            '**Connect Spotify**\n\n1. Open this URL on any device with a browser:\n' + authUrl + '\n\n2. After authorizing, you will be redirected to localhost — that page may show an error, that is OK.\n3. Copy the `code` from the URL, then type:\n`/spotify code <paste-code-here>`',
-            channelId
+            [
+              '**Mercury Skills — in-chat commands**',
+              '',
+              '`/skills` — list installed skills',
+              '`/skills search <query>` — search the registry',
+              '`/skills view <id>` — show details + registry URL',
+              '`/skills install <id>` — install from the registry',
+              '`/skills install <url>` — install raw SKILL.md from a URL',
+              '`/skills remove <id>` — uninstall',
+              '`/skills self-made` — the skills Mercury wrote for itself, with use counts',
+              '`/skills self-made enable|disable|remove <name>`',
+              '',
+              'Browse the full catalog at https://skills.mercuryagent.sh',
+            ].join('\n'),
+            channelId,
           );
+          return;
         }
-        return true;
-      }
 
-      if (rawArgs.startsWith('code ')) {
-        const code = rawArgs.slice('code '.length).trim();
-        if (!code) {
-          await channel.send('Usage: /spotify code <authorization-code>', channelId);
-          return true;
-        }
-        try {
-          await this.spotifyClient.authenticateWithCode(code);
-          await channel.send('Spotify connected successfully! Try: play some music', channelId);
-        } catch (err: any) {
-          await channel.send(`Spotify auth failed: ${err.message}`, channelId);
-        }
-        return true;
-      }
-
-      if (rawArgs === 'devices') {
-        try {
-          const data = await this.spotifyClient.getDevices();
-          if (!data?.devices?.length) { await channel.send('No active devices. Open Spotify on a device first.', channelId); return true; }
-          const lines = ['**Spotify Devices:**\n'];
-          for (const d of data.devices) {
-            lines.push(`${d.is_active ? '▶' : '○'} **${d.name}** (${d.type}) — \`${d.id}\`${d.is_active ? ' [active]' : ''}`);
+        case 'list': {
+          const names = ctx.skillNames();
+          if (names.length === 0) {
+            await channel.send(
+              'No skills installed. Try `/skills search <query>` to browse https://skills.mercuryagent.sh.',
+              channelId,
+            );
+            return;
           }
+          const lines = [
+            `**${names.length} skill${names.length > 1 ? 's' : ''} installed:**`,
+            '',
+            ...names.map((n) => `• ${n}`),
+            '',
+            '_Run `/skills search <query>` to find more on the registry._',
+          ];
           await channel.send(lines.join('\n'), channelId);
-        } catch (err: any) { await channel.send(`Failed: ${err.message}`, channelId); }
-        return true;
-      }
+          return;
+        }
 
-      if (rawArgs.startsWith('device ')) {
-        const id = rawArgs.slice('device '.length).trim();
-        this.spotifyClient.setDevice(id);
-        await channel.send(`Active device set to: ${id}`, channelId);
-        return true;
-      }
-
-      if (rawArgs === 'player' && channelType === 'cli' && channel instanceof CLIChannel) {
-        await channel.withMenu(async (select) => {
-          while (true) {
-            try {
-              const np = await this.spotifyClient!.getCurrentlyPlaying();
-              if (np) {
-                await channel.send(formatNowPlaying(np), channelId);
-              }
-            } catch {}
-            const action = await select('Spotify Player', PLAYER_CONTROLS);
-            if (action === 'exit' || !action) return;
-            if (action === 'search') {
-              const query = await channel.prompt('Search: ');
-              if (!query) continue;
-              try {
-                const results = await this.spotifyClient!.search(query, 'track', 5);
-                const tracks = results?.tracks?.items || [];
-                if (tracks.length === 0) { await channel.send('No results found.', channelId); continue; }
-                const trackOptions = tracks.map((t: any, i: number) => ({
-                  value: t.uri,
-                  label: `${t.artists?.map((a: any) => a.name).join(', ')} — ${t.name}`,
-                }));
-                const picked = await select('Play which track?', [...trackOptions, { value: 'back', label: 'Back' }]);
-                if (picked && picked !== 'back') {
-                  await this.spotifyClient!.play([picked]);
-                }
-              } catch (err: any) { await channel.send(`Search failed: ${err.message}`, channelId); }
-              continue;
-            }
-            if (action === 'volume') {
-              const vol = await channel.prompt('Volume (0-100): ');
-              const n = parseInt(vol, 10);
-              if (!isNaN(n) && n >= 0 && n <= 100) {
-                await this.spotifyClient!.setVolume(n);
-                await channel.send(`Volume: ${n}%`, channelId);
-              }
-              continue;
-            }
-            if (action === 'queue') {
-              const query = await channel.prompt('Search track to queue: ');
-              if (!query) continue;
-              try {
-                const results = await this.spotifyClient!.search(query, 'track', 5);
-                const tracks = results?.tracks?.items || [];
-                if (tracks.length === 0) { await channel.send('No results.', channelId); continue; }
-                const trackOptions = tracks.map((t: any) => ({
-                  value: t.uri,
-                  label: `${t.artists?.map((a: any) => a.name).join(', ')} — ${t.name}`,
-                }));
-                const picked = await select('Queue which track?', [...trackOptions, { value: 'back', label: 'Back' }]);
-                if (picked && picked !== 'back') {
-                  await this.spotifyClient!.addToQueue(picked);
-                  await channel.send('Added to queue.', channelId);
-                }
-              } catch (err: any) { await channel.send(`Failed: ${err.message}`, channelId); }
-              continue;
-            }
-            try {
-              const result = await handlePlayerAction(action, this.spotifyClient!);
-              await channel.send(result, channelId);
-            } catch (err: any) {
-              await channel.send(`Failed: ${err.message}`, channelId);
-            }
+        case 'self-made':
+        case 'self':
+        case 'mine': {
+          const { listSelfMade } = await import('../skills/self-made.js');
+          const root = this.skillLoader?.rootDir();
+          if (!root) { await channel.send('Skills are not available in this session.', channelId); return; }
+          const action = (args[0] || '').toLowerCase();
+          const target = args.slice(1).join(' ').trim();
+          if ((action === 'enable' || action === 'disable' || action === 'remove') && target) {
+            const entry = listSelfMade(root).find((s) => s.name === target);
+            if (!entry) { await channel.send(`No self-made skill named "${target}".`, channelId); return; }
+            if (action === 'remove') { this.skillLoader!.deleteSkill(target); await channel.send(`Removed self-made skill "${target}".`, channelId); return; }
+            this.skillLoader!.setSkillActive(target, action === 'enable');
+            await channel.send(`${action === 'enable' ? 'Enabled' : 'Disabled'} self-made skill "${target}".`, channelId);
+            return;
           }
-        });
-        return true;
-      }
-
-      if (rawArgs === 'now' || rawArgs === 'playing' || rawArgs === 'np') {
-        try {
-          const text = await this.spotifyClient.getNowPlayingText();
-          await channel.send(text, channelId);
-        } catch (err: any) { await channel.send(`Failed: ${err.message}`, channelId); }
-        return true;
-      }
-
-      if (rawArgs === 'logout') {
-        this.spotifyClient.logout();
-        await channel.send('Spotify disconnected. Run `/spotify auth` to reconnect.', channelId);
-        return true;
-      }
-
-      await channel.send('Unknown /spotify command. Available: /spotify, /spotify auth, /spotify code <code>, /spotify logout, /spotify player, /spotify devices, /spotify device <id>, /spotify now', channelId);
-      return true;
-    }
-
-    if (cmd === '/stream on') {
-      this.telegramStreaming = true;
-      await channel.send('Telegram streaming enabled. Responses will appear progressively.', channelId);
-      return true;
-    }
-
-    if (cmd === '/stream off') {
-      this.telegramStreaming = false;
-      await channel.send('Telegram streaming disabled. Responses will arrive as a single message.', channelId);
-      return true;
-    }
-
-    if (cmd === '/stream') {
-      this.telegramStreaming = !this.telegramStreaming;
-      await channel.send(
-        this.telegramStreaming
-          ? 'Telegram streaming enabled. Responses will appear progressively.'
-          : 'Telegram streaming disabled. Responses will arrive as a single message.',
-        channelId,
-      );
-      return true;
-    }
-    if (cmd === '/stream off') {
-      this.telegramStreaming = false;
-      await channel.send('Telegram streaming disabled. Responses will arrive as a single message.', channelId);
-      return true;
-    }
-
-    if (cmd.startsWith('/agents')) {
-      if (!this.supervisor) {
-        await channel.send('Sub-agents are not available.', channelId);
-        return true;
-      }
-      const rawArgs = trimmed.slice('/agents'.length).trim();
-
-      if (!rawArgs) {
-        const agents = this.supervisor.getActiveAgents();
-        const resourceInfo = this.supervisor.getResourceUsage();
-        if (agents.length === 0) {
-          await channel.send(`No active sub-agents.\nMax concurrent: ${resourceInfo.maxConcurrentAgents} (auto) | CPU: ${resourceInfo.cpuCores} cores`, channelId);
-          return true;
+          const entries = listSelfMade(root);
+          if (entries.length === 0) {
+            await channel.send('No self-made skills yet. After a long task works, Mercury saves the procedure here (create_skill) so the next time is one step.', channelId);
+            return;
+          }
+          const fmt = (ms: number | null) => (ms ? new Date(ms).toISOString().slice(0, 10) : 'never');
+          const lines = [`**${entries.length} self-made skill${entries.length > 1 ? 's' : ''}** (Mercury wrote these; unverified until used again):`, ''];
+          for (const s of entries) {
+            lines.push(`${s.active ? '•' : '◦'} **${s.name}** — ${s.description}`);
+            lines.push(`   made ${fmt(s.made)} · used ${s.uses}× · last ${fmt(s.lastUsed)}${s.active ? '' : ' · dormant'}`);
+          }
+          lines.push('', '_`/skills self-made enable|disable|remove <name>`. Unused ones go dormant after 30 days; nothing is deleted on its own._');
+          await channel.send(lines.join('\n'), channelId);
+          return;
         }
-        const statusIcons: Record<string, string> = { pending: '🔵', running: '🟢', paused: '🟡', completed: '✅', failed: '❌', halted: '⛔' };
-        const lines = [`**Sub-Agents** (${agents.length})`, ''];
-        for (const agent of agents) {
-          const icon = statusIcons[agent.status] || '❓';
-          const taskPreview = agent.task.length > 40 ? agent.task.slice(0, 40) + '...' : agent.task;
-          lines.push(`${icon} **${agent.id}**  ${taskPreview}`);
-          if (agent.progress) lines.push(`   ${agent.progress}`);
+
+        case 'search':
+        case 'find': {
+          if (!arg) {
+            await channel.send('Usage: `/skills search <query>`', channelId);
+            return;
+          }
+          await channel.send(`🔍 Searching the registry for "${arg}"…`, channelId);
+          const feed = await registry.getFeed();
+          const scored = searchFeed(feed, arg, 5);
+          if (scored.length === 0) {
+            await channel.send(`No matches for "${arg}".`, channelId);
+            return;
+          }
+          const lines = scored.map(({ skill }) =>
+            [
+              `• \`${skill.id}\` (v${skill.version})`,
+              `  ${skill.description}`,
+              `  ${registry.webUrl(skill.id)}`,
+            ].join('\n'),
+          );
+          await channel.send(
+            [
+              `**Top ${scored.length} matches for "${arg}":**`,
+              '',
+              lines.join('\n\n'),
+              '',
+              'Inspect one with `/skills view <id>`, install with `/skills install <id>`.',
+            ].join('\n'),
+            channelId,
+          );
+          return;
         }
-        lines.push('');
-        lines.push(`Max concurrent: ${resourceInfo.maxConcurrentAgents} (auto) | CPU: ${resourceInfo.cpuCores} cores`);
-        lines.push(`Active: ${resourceInfo.activeAgents} | Queued: ${resourceInfo.queuedAgents}`);
-        await channel.send(lines.join('\n'), channelId);
-        return true;
+
+        case 'view':
+        case 'show':
+        case 'info': {
+          if (!arg) {
+            await channel.send('Usage: `/skills view <category/slug>`', channelId);
+            return;
+          }
+          if (!isValidSkillId(arg)) {
+            await channel.send('Invalid skill id. Expected `<category>/<slug>`.', channelId);
+            return;
+          }
+          const detail = await registry.getSkill(arg);
+          const author = detail.author ? `\n**Author:** ${detail.author}` : '';
+          const tags = detail.tags?.length ? `\n**Tags:** ${detail.tags.join(', ')}` : '';
+          await channel.send(
+            [
+              `**${detail.title}** (\`${detail.id}\`)`,
+              `**Version:** ${detail.version}`,
+              `**Category:** ${detail.category}${author}${tags}`,
+              '',
+              detail.description,
+              '',
+              `🔗 ${registry.webUrl(detail.id)}`,
+              '',
+              `Install with \`/skills install ${detail.id}\``,
+            ].join('\n'),
+            channelId,
+          );
+          return;
+        }
+
+        case 'install':
+        case 'add': {
+          if (!arg) {
+            await channel.send('Usage: `/skills install <category/slug>` or `/skills install <url>`', channelId);
+            return;
+          }
+          // URL install → delegate to the existing capability path
+          if (/^https?:\/\//i.test(arg)) {
+            const { SkillLoader } = await import('../skills/loader.js');
+            const loader = new SkillLoader();
+            await channel.send(`📦 Installing from \`${arg}\`…`, channelId);
+            const installed = await loader.installFromUrl(arg);
+            await channel.send(
+              `✅ Installed \`${installed.name}\` from URL.\n${installed.skillDir}`,
+              channelId,
+            );
+            return;
+          }
+          if (!isValidSkillId(arg)) {
+            await channel.send('Invalid skill id. Expected `<category>/<slug>` or a `https://` URL.', channelId);
+            return;
+          }
+          await channel.send(`📦 Installing \`${arg}\` from the registry…`, channelId);
+          const result = await store.install(arg);
+          const verb =
+            result.status === 'already-installed'
+              ? 'Already installed'
+              : result.status === 'updated'
+                ? 'Updated'
+                : result.status === 'reinstalled'
+                  ? 'Reinstalled'
+                  : 'Installed';
+          await channel.send(
+            `✅ ${verb} \`${result.id}\` (v${result.version})\n🔗 ${registry.webUrl(result.id)}`,
+            channelId,
+          );
+          return;
+        }
+
+        case 'remove':
+        case 'rm':
+        case 'delete':
+        case 'uninstall': {
+          if (!arg) {
+            await channel.send('Usage: `/skills remove <category/slug>`', channelId);
+            return;
+          }
+          if (!isValidSkillId(arg)) {
+            await channel.send('Invalid skill id. Expected `<category>/<slug>`.', channelId);
+            return;
+          }
+          const removed = store.remove(arg);
+          await channel.send(
+            removed ? `🗑 Removed \`${arg}\`.` : `Skill \`${arg}\` is not installed.`,
+            channelId,
+          );
+          return;
+        }
+
+        default:
+          await channel.send(
+            `Unknown subcommand \`${sub}\`. Try \`/skills help\`.`,
+            channelId,
+          );
       }
+    } catch (err: any) {
+      const msg = err?.message || 'Skill registry request failed';
+      await channel.send(`⚠️ ${msg}`, channelId);
+    }
+  }
 
-      const parts = rawArgs.split(/\s+/);
-      const action = parts[0]?.toLowerCase();
+  async handleChatCommand(content: string, channelType: string, channelId: string): Promise<boolean> {
+    return handleChatCommandImpl(this, content, channelType, channelId);
+  }
 
-      if (action === 'stop') {
-        const target = parts[1]?.toLowerCase();
-        if (!target) {
-          await channel.send('Usage: /agents stop <id> or /agents stop all', channelId);
-          return true;
-        }
-        if (target === 'all') {
-          await this.supervisor.haltAll();
-          await channel.send('All sub-agents halted. They will finish their current tool step before stopping.', channelId);
-        } else {
-          const halted = await this.supervisor.halt(target);
-          if (!halted) {
-            await channel.send(`No active agent found with ID "${target}".`, channelId);
-          } else {
-            await channel.send(`Agent ${target} halt signal sent. It will finish its current step then stop.`, channelId);
+  /** Render the trace for a turn in this chat's session (latest when no id). */
+  renderTrace(channelType: ChannelType, channelId: string, idArg = ''): string {
+    const bindingId = channelType === 'cli' ? 'current' : channelId;
+    const session = this.sessions.getByBinding(channelType, bindingId);
+    if (!session) return 'No session is bound to this chat yet.';
+    const turns = session.messages.filter((m) => m.role === 'assistant' && m.kind === 'message');
+    const wanted = idArg.toLowerCase();
+    const target = wanted
+      ? [...turns].reverse().find((m) => String((m.metadata as Record<string, unknown> | undefined)?.traceId ?? '').toLowerCase().startsWith(wanted))
+      : turns.at(-1);
+    if (!target) return wanted ? `No turn found for trace "${idArg}".` : 'No turns in this session yet.';
+    const meta = (target.metadata ?? {}) as Record<string, unknown>;
+    const baseId = (target.externalMessageId ?? '').replace(/:assistant$/, '');
+    const toolEntry = baseId
+      ? session.messages.find((m) => m.kind === TOOL_TRACE_KIND && m.externalMessageId === `${baseId}:tools`)
+      : undefined;
+    const num = (v: unknown) => (typeof v === 'number' ? v : undefined);
+    const elapsed = num(meta.elapsedMs);
+    return [
+      `Trace ${String(meta.traceId ?? target.id.slice(0, 8))} · ${new Date(target.timestamp).toISOString()}`,
+      `Provider: ${String(meta.provider ?? 'unknown')} / ${String(meta.model ?? 'unknown')}`,
+      `Tokens: ${num(meta.inputTokens) ?? '?'} in (${num(meta.cachedInputTokens) ?? 0} cached) · ${num(meta.outputTokens) ?? '?'} out`,
+      `Steps: ${num(meta.steps) ?? '?'} · Elapsed: ${elapsed != null ? `${(elapsed / 1000).toFixed(1)}s` : '?'}`,
+      `Verification: ${typeof meta.verification === 'string' ? meta.verification : 'none'}`,
+      '',
+      toolEntry ? toolEntry.content : 'No tool calls in this turn.',
+    ].join('\n');
+  }
+
+  async handleSessionCommand(content: string, channelType: ChannelType, channelId: string): Promise<void> {
+    return handleSessionCommandImpl(this, content, channelType, channelId);
+  }
+
+  private scheduleSessionTitleGeneration(sessionId: string, providerName: string): void {
+    if (!this.generateTitle || this.titleGenerationInFlight.has(sessionId)) return;
+    const session = this.sessions.get(sessionId);
+    const exchange = session.messages.filter((message) => message.kind === 'message' && (message.role === 'user' || message.role === 'assistant'));
+    if (session.titleSource !== 'fallback' || exchange.length !== 2 || exchange[0].role !== 'user' || exchange[1].role !== 'assistant') return;
+    this.titleGenerationInFlight.add(sessionId);
+    const timer = setTimeout(() => {
+      void this.generateSessionTitle(sessionId, exchange[0].content, exchange[1].content, providerName).finally(() => {
+        this.titleGenerationInFlight.delete(sessionId);
+      });
+    }, 0);
+    timer.unref?.();
+  }
+
+  private async generateSessionTitle(sessionId: string, userMessage: string, assistantMessage: string, providerName: string): Promise<void> {
+    try {
+      const rawTitle = await this.generateTitle!({ userMessage, assistantMessage, providerName });
+      const title = normalizeGeneratedSessionTitle(rawTitle);
+      if (!title) {
+        logger.debug({ sessionId }, 'Session title generator returned an unusable title');
+        return;
+      }
+      if (this.sessions.get(sessionId).titleSource !== 'fallback') return;
+      const session = this.sessions.updateTitle(sessionId, title, 'generated');
+      const currentCliSession = this.sessions.getByBinding('cli', 'current');
+      const cliChannel = this.channels.get('cli');
+      if (currentCliSession?.id === session.id && cliChannel instanceof CLIChannel) cliChannel.setCurrentSession(session);
+      logger.info({ sessionId, title }, 'Generated canonical session title');
+    } catch (error) {
+      logger.debug({ sessionId, err: error instanceof Error ? error.message : String(error) }, 'Background session title generation failed');
+    }
+  }
+
+  /**
+   * Mercury Code only: at turn end, maybe fire the one-shot LLM status-verb
+   * refresh (cadence in core/status-verbs.ts). Fire-and-forget and unref'd —
+   * the turn is already done; a slow call must never stall anything. Non-code
+   * surfaces are skipped entirely: chat keeps its plain static labels.
+   */
+  private scheduleStatusVerbRefresh(channel: import('../channels/base.js').Channel | null | undefined, userText: string): void {
+    const cliChannel = channel instanceof CLIChannel ? channel : null;
+    if (!cliChannel || cliChannel.getTuiState().mode !== 'mercury-code') return;
+    this.statusVerbTurnCount += 1;
+    const gate = shouldRefreshStatusVerbs({
+      turnCount: this.statusVerbTurnCount,
+      inFlight: this.statusVerbsInFlight,
+      disabled: this.statusVerbsDisabled,
+    });
+    if (!gate.refresh) return;
+    this.statusVerbsInFlight = true;
+    const timer = setTimeout(() => {
+      void this.refreshStatusVerbs(cliChannel, userText).finally(() => {
+        this.statusVerbsInFlight = false;
+      });
+    }, 0);
+    timer.unref?.();
+  }
+
+  private async refreshStatusVerbs(cliChannel: CLIChannel, userText: string): Promise<void> {
+    try {
+      if (this.tokenBudget.canAfford(500)) {
+        const provider = this.providers.getDefault();
+        if (provider && provider.isAvailable()) {
+          const tui = cliChannel.getTuiState();
+          const requests = tui.chatMessages
+            .filter((m) => m.role === 'user' && m.content.trim())
+            .slice(-4)
+            .map((m) => m.content);
+          const { system, prompt } = buildStatusVerbPrompt({
+            userRequests: requests.length > 0 ? requests : [userText],
+            projectName: path.basename(tui.projectContext ?? '') || 'this project',
+            recentActivity: tui.lastStepLog?.map((s) => s.label),
+          });
+          const result = await generateText({
+            model: provider.getModelInstance(),
+            system,
+            messages: [{ role: 'user', content: prompt }],
+            maxOutputTokens: 400,
+          });
+          this.tokenBudget.recordUsage({
+            provider: provider.name,
+            model: provider.getModel(),
+            inputTokens: result.usage?.inputTokens ?? 0,
+            outputTokens: result.usage?.outputTokens ?? 0,
+            totalTokens: (result.usage?.inputTokens ?? 0) + (result.usage?.outputTokens ?? 0),
+            channelType: 'internal',
+            agentId: this.config.cloud.agentId || undefined,
+          });
+          const verbs = parseStatusVerbs(result.text ?? '');
+          if (verbs) {
+            cliChannel.setStatusVerbs(verbs);
+            return;
           }
         }
-        return true;
       }
-
-      if (action === 'pause') {
-        const target = parts[1]?.toLowerCase();
-        if (!target) {
-          await channel.send('Usage: /agents pause <id>', channelId);
-          return true;
-        }
-        const paused = await this.supervisor.pause(target);
-        await channel.send(paused ? `Agent ${target} paused. Use /agents resume ${target} to continue.` : `No running agent found with ID "${target}".`, channelId);
-        return true;
-      }
-
-      if (action === 'resume') {
-        const target = parts[1]?.toLowerCase();
-        if (!target) {
-          await channel.send('Usage: /agents resume <id>', channelId);
-          return true;
-        }
-        const resumed = await this.supervisor.resume(target);
-        await channel.send(resumed ? `Agent ${target} resumed.` : `No paused agent found with ID "${target}".`, channelId);
-        return true;
-      }
-
-      if (action === 'config') {
-        const info = this.supervisor.getResourceUsage();
-        const lines = [
-          '**Sub-Agent Configuration**',
-          `CPU cores: ${info.cpuCores}`,
-          `System RAM: ${info.systemMemoryMB}MB`,
-          `Available RAM: ${info.availableMemoryMB}MB`,
-          `Max concurrent: ${info.maxConcurrentAgents}`,
-          `Active agents: ${info.activeAgents}`,
-          `Queued agents: ${info.queuedAgents}`,
-          `Token budget remaining: ${info.tokenBudgetRemaining.toLocaleString()}`,
-        ];
-        await channel.send(lines.join('\n'), channelId);
-        return true;
-      }
-
-      if (action === 'set' && parts[1]?.toLowerCase() === 'max') {
-        const n = parseInt(parts[2], 10);
-        if (isNaN(n) || n < 1) {
-          await channel.send('Usage: /agents set max <number>', channelId);
-          return true;
-        }
-        this.supervisor.setMaxConcurrent(n);
-        await channel.send(`Max concurrent sub-agents set to ${n}.`, channelId);
-        return true;
-      }
-
-      await channel.send(`Unknown /agents command "${action}". Available: /agents, /agents stop <id|all>, /agents pause <id>, /agents resume <id>, /agents config, /agents set max <n>`, channelId);
-      return true;
+      this.failStatusVerbRefresh(cliChannel, userText);
+    } catch (err) {
+      logger.debug({ err }, 'Status-verb refresh failed');
+      this.failStatusVerbRefresh(cliChannel, userText);
     }
+  }
 
-    if (cmd === '/halt') {
-      if (!this.supervisor) {
-        await channel.send('Sub-agents are not available.', channelId);
-        return true;
-      }
-      await this.supervisor.haltAll();
-      await channel.send('All sub-agents halted and queue cleared.', channelId);
-      return true;
-    }
-
-    if (cmd === '/stop') {
-      if (!this.supervisor) {
-        await channel.send('Sub-agents are not available.', channelId);
-        return true;
-      }
-      await this.supervisor.haltAll();
-      this.supervisor.clearTaskBoard();
-      this.lifecycle.transition('idle');
-      await channel.send('All sub-agents stopped, queue cleared, locks released, task board cleared. Short-term memory preserved.', channelId);
-      return true;
-    }
-
-    if (cmd === '/reset') {
-      if (channelType === 'cli' && channel instanceof CLIChannel) {
-        const confirmed = await channel.askToContinue(
-          '⚠ /reset will halt ALL agents, clear queues, release locks, clear task board, and wipe conversation context. Continue? (y/n)',
-          channelId,
-        ).catch(() => false);
-        if (!confirmed) {
-          await channel.send('Reset cancelled.', channelId);
-          return true;
-        }
-      }
-      if (this.supervisor) {
-        await this.supervisor.haltAll();
-        this.supervisor.clearTaskBoard();
-      }
-      this.shortTerm.clearAll();
-      this.lifecycle.transition('idle');
-      await channel.send('Mercury reset. All agents stopped, all state cleared. Long-term memory preserved. Ready for a fresh start.', channelId);
-      return true;
-    }
-
-    return false;
+  /** Push the keyword-engine pool once, then the LLM layer is off this session. */
+  private failStatusVerbRefresh(cliChannel: CLIChannel, userText: string): void {
+    this.statusVerbsDisabled = true;
+    // Never downgrade an LLM pool that already landed.
+    if (cliChannel.getTuiState().statusVerbs) return;
+    cliChannel.setStatusVerbs(verbPoolFor(userText));
   }
 
   private async handleWorkspaceNaturalLanguage(content: string, channelType: string, channelId: string): Promise<boolean> {
@@ -3230,88 +5340,20 @@ Is this productive iteration or a stuck loop?`,
     return true;
   }
 
-  private async openCliCommandMenu(channel: CLIChannel, channelId: string): Promise<void> {
-    const ctx = this.capabilities.getChatCommandContext();
-    if (!ctx) return;
-
-    await channel.withMenu(async (select) => {
-      while (true) {
-        const streamLabel = this.telegramStreaming ? 'Disable Telegram Streaming' : 'Enable Telegram Streaming';
-        const permLabel = this.capabilities.permissions.isAutoApproveAll() ? 'Switch to Ask Me' : 'Switch to Allow All';
-        const action = await select('Mercury Commands', [
-          { value: 'status', label: 'Status' },
-          { value: 'memory', label: 'Memory' },
-          { value: 'permissions', label: permLabel },
-          { value: 'telegram', label: 'Telegram' },
-          { value: 'tools', label: 'Tools' },
-          { value: 'skills', label: 'Skills' },
-          { value: 'stream', label: streamLabel },
-          { value: 'help', label: 'Help' },
-          { value: 'exit', label: 'Exit' },
-        ]);
-
-        if (action === 'exit') {
-          return;
-        }
-
-        if (action === 'status') {
-          await this.handleChatCommand('/status', 'cli', channelId);
-          continue;
-        }
-
-        if (action === 'memory') {
-          if (this.userMemory) {
-            await this.openCliMemoryMenu(channel, channelId, select);
-          } else {
-            const cfg = ctx.config();
-            if (cfg.memory.secondBrain?.enabled === false) {
-              await channel.send('Second brain is disabled in configuration.', channelId);
-            } else {
-              await channel.send('Second brain dependency issue: SQLite backend (better-sqlite3) is not available.', channelId);
-            }
-          }
-          continue;
-        }
-
-        if (action === 'permissions') {
-          await this.handleChatCommand('/permissions', 'cli', channelId);
-          continue;
-        }
-
-        if (action === 'telegram') {
-          await this.openCliTelegramMenu(channel, channelId, select);
-          continue;
-        }
-
-        if (action === 'tools') {
-          await this.handleChatCommand('/tools', 'cli', channelId);
-          continue;
-        }
-
-        if (action === 'skills') {
-          await this.handleChatCommand('/skills', 'cli', channelId);
-          continue;
-        }
-
-        if (action === 'stream') {
-          await this.handleChatCommand('/stream', 'cli', channelId);
-          continue;
-        }
-
-        if (action === 'help') {
-          await channel.send(ctx.manual(), channelId);
-        }
-      }
-    });
+  async openCliCommandMenu(channel: CLIChannel, channelId: string): Promise<void> {
+    return openCliCommandMenuImpl(this, channel, channelId);
   }
 
-  private async sendMemoryOverview(channel: any, channelId: string): Promise<void> {
+  async sendMemoryOverview(channel: any, channelId: string): Promise<void> {
     if (!this.userMemory) return;
     const summary = this.userMemory.getSummary();
+    const shareableCount = this.userMemory.countShareable();
+    const shareLearning = this.userMemory.isShareLearning();
     const lines = [
       `**Memory Overview**`,
       `Total memories: ${summary.total}`,
       `Learning: ${summary.learningPaused ? 'PAUSED' : 'ACTIVE'}`,
+      `Shared learning: ${shareLearning ? 'ON' : 'OFF'} (${shareableCount} shareable)`,
     ];
     if (summary.profileSummary) {
       lines.push(`Profile: ${summary.profileSummary}`);
@@ -3327,95 +5369,33 @@ Is this productive iteration or a stuck loop?`,
         lines.push(`  ${type}: ${count}`);
       }
     }
+    // Owner Model (ADR-026): the honest numbers and the last few things learned.
+    try {
+      const beliefs = this.userMemory.beliefs;
+      const now = Date.now();
+      lines.push('', formatCounts(beliefs.counts()));
+      const recent = beliefs.recentlyLearned(now - 30 * 86_400_000, 3);
+      if (recent.length > 0) {
+        lines.push('Recently learned:');
+        recent.forEach((b, i) => lines.push(`  ${formatLearnedLine(beliefs, i + 1, b, now)}`));
+        this.lastBeliefListing.set(channelId, recent.map((b) => b.id));
+      }
+      lines.push('More: /memory learned, /memory beliefs, /memory contested; /memory confirm|forget|correct <n>.');
+    } catch (err) {
+      logger.debug({ err }, 'belief overview unavailable');
+    }
     await channel.send(lines.join('\n'), channelId);
   }
 
-  private async openCliMemoryMenu(channel: CLIChannel, channelId: string, select?: (title: string, options: ArrowSelectOption[]) => Promise<string>): Promise<void> {
-    if (!this.userMemory) return;
-
-    const runMenu = async (sel: (title: string, options: ArrowSelectOption[]) => Promise<string>) => {
-      while (true) {
-        const learningLabel = this.userMemory!.isLearningPaused() ? 'Resume Learning' : 'Pause Learning';
-        const action = await sel('Memory', [
-          { value: 'overview', label: 'Overview' },
-          { value: 'recent', label: 'Recent Memories' },
-          { value: 'search', label: 'Search' },
-          { value: 'toggle', label: learningLabel },
-          { value: 'clear', label: 'Clear All Memories' },
-          { value: 'back', label: 'Back' },
-        ]);
-
-        if (action === 'back') return;
-
-        if (action === 'overview') {
-          await this.sendMemoryOverview(channel, channelId);
-          continue;
-        }
-
-        if (action === 'recent') {
-          const recent = this.userMemory!.getRecent(10);
-          if (recent.length === 0) {
-            await channel.send('No memories yet.', channelId);
-            continue;
-          }
-          const lines = ['**Recent Memories:**', ''];
-          for (const r of recent) {
-            const scope = r.scope === 'active' ? '⏳' : '📌';
-            const kind = r.evidenceKind === 'direct' ? 'direct' : r.evidenceKind === 'inferred' ? 'inferred' : r.evidenceKind;
-            lines.push(`${scope} [${r.type}] ${r.summary}`);
-            lines.push(`   Confidence: ${r.confidence.toFixed(2)} | Evidence: ${kind} | Seen: ${r.evidenceCount}x`);
-          }
-          await channel.send(lines.join('\n'), channelId);
-          continue;
-        }
-
-        if (action === 'search') {
-          const query = await channel.prompt('Search memories: ');
-          if (!query) continue;
-          const results = this.userMemory!.search(query, 10);
-          if (results.length === 0) {
-            await channel.send(`No memories found matching "${query}".`, channelId);
-            continue;
-          }
-          const lines = [`**Search results for "${query}":**`, ''];
-          for (const r of results) {
-            const scope = r.scope === 'active' ? '⏳' : '📌';
-            lines.push(`${scope} [${r.type}] ${r.summary}`);
-            lines.push(`   Confidence: ${r.confidence.toFixed(2)} | Evidence: ${r.evidenceKind} | Seen: ${r.evidenceCount}x`);
-          }
-          await channel.send(lines.join('\n'), channelId);
-          continue;
-        }
-
-        if (action === 'toggle') {
-          const currentlyPaused = this.userMemory!.isLearningPaused();
-          this.userMemory!.setLearningPaused(!currentlyPaused);
-          await channel.send(currentlyPaused ? 'Learning resumed. Mercury will remember new things from conversations.' : 'Learning paused. Mercury will not store new memories until resumed.', channelId);
-          continue;
-        }
-
-        if (action === 'clear') {
-          const confirm = await sel('Clear all memories?', [
-            { value: 'cancel', label: 'Cancel' },
-            { value: 'confirm', label: 'Clear everything' },
-          ]);
-          if (confirm === 'confirm') {
-            const cleared = this.userMemory!.clear();
-            await channel.send(`Cleared ${cleared} memories.`, channelId);
-          }
-          continue;
-        }
-      }
-    };
-
-    if (select) {
-      await runMenu(select);
-    } else {
-      await channel.withMenu(runMenu);
-    }
+  async openCliMemoryMenu(channel: CLIChannel, channelId: string, select?: (title: string, options: ArrowSelectOption[]) => Promise<string>): Promise<void> {
+    return openCliMemoryMenuImpl(this, channel, channelId, select);
   }
 
-  private async openCliTelegramMenu(
+  async openMemoryChoiceMenu(channel: any, channelId: string): Promise<void> {
+    return openMemoryChoiceMenuImpl(this, channel, channelId);
+  }
+
+  async openCliTelegramMenu(
     channel: CLIChannel,
     channelId: string,
     select: (title: string, options: ArrowSelectOption[]) => Promise<string>,
@@ -3615,3 +5595,4 @@ Is this productive iteration or a stuck loop?`,
     }
   }
 }
+

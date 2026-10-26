@@ -1,0 +1,76 @@
+{
+	"name": "ink",
+	"version": "8.0.0",
+	"description": "React for CLI",
+	"license": "MIT",
+	"repository": "vadimdemedes/ink",
+	"author": "Vadim Demedes <vadimdemedes@hey.com> (https://github.com/vadimdemedes)",
+	"type": "module",
+	"exports": {
+		"types": "./build/index.d.ts",
+		"default": "./build/index.js"
+	},
+	"sideEffects": true,
+	"engines": {
+		"node": ">=22"
+	},
+	"keywords": [
+		"react",
+		"cli",
+		"jsx",
+		"stdout",
+		"components",
+		"command-line",
+		"preact",
+		"redux",
+		"print",
+		"render",
+		"colors",
+		"text"
+	],
+	"dependencies": {
+		"@alcalzone/ansi-tokenize": "^0.3.1",
+		"ansi-escapes": "^7.3.0",
+		"ansi-styles": "^7.0.0",
+		"auto-bind": "^5.0.1",
+		"chalk": "^6.0.1",
+		"cli-boxes": "^4.0.1",
+		"cli-cursor": "^4.0.0",
+		"cli-truncate": "^6.0.0",
+		"code-excerpt": "^4.0.0",
+		"es-toolkit": "^1.52.0",
+		"indent-string": "^5.0.0",
+		"is-in-ci": "^2.0.0",
+		"patch-console": "^2.0.0",
+		"quick-lru": "^7.3.0",
+		"react-reconciler": "^0.34.0",
+		"signal-exit": "^3.0.7",
+		"stack-utils": "^2.0.6",
+		"string-width": "^8.3.0",
+		"terminal-size": "^4.0.1",
+		"type-fest": "^5.10.0",
+		"widest-line": "^6.0.0",
+		"wrap-ansi": "^10.0.2",
+		"yoga-layout": "~3.2.1"
+	},
+	"peerDependencies": {
+		"@types/react": ">=19.3.0",
+		"react": ">=19.3.0",
+		"react-devtools-core": ">=6.1.2"
+	},
+	"peerDependenciesMeta": {
+		"@types/react": {
+			"optional": true
+		},
+		"react-devtools-core": {
+			"optional": true
+		}
+	},
+	"_mercury": {
+		"source": "ink@8.0.0",
+		"integrity": "sha512-M2aFwZOqmkFxCwedy6xrP4E+DGoK57iahAFnfTqNyOyJ54O7DZzu027z/NI8EGy44Sw9O9BcbTF4QEUS2GHAtg==",
+		"patched": true,
+		"generator": "scripts/vendor-ink.cjs",
+		"note": "Generated file set: stock tarball + scripts/apply-ink-patch.cjs. Do not hand-edit; see docs/ink-patch.md."
+	}
+}

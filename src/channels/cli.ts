@@ -1,20 +1,426 @@
 import React from 'react';
+import { EventEmitter } from 'node:events';
 import { render } from 'ink';
 import fs from 'node:fs';
+import { inspect } from 'node:util';
 import path from 'node:path';
-import { execSync } from 'node:child_process';
+import { homedir } from 'node:os';
+import { execSync, execFile, execFileSync } from 'node:child_process';
 import type { ChannelMessage } from '../types/channel.js';
 import { BaseChannel, type PermissionMode } from './base.js';
+import { STEPS_PAUSED_BANNER, NO_CHANGES_BANNER } from '../core/completion-verdict.js';
 import { logger } from '../utils/logger.js';
 import { formatToolStep, formatToolResult } from '../utils/tool-label.js';
-import type { ChatMessage, CompletionMeta, ToolStep, PermissionPromptState, SidebarSection, SkillInfo, SubAgentInfo, ProviderInfo, TokenInfo, AppMode, WorkspaceState, WorkspaceTreeNode, WorkspaceGitFile, BackgroundTaskInfo } from '../ui/types.js';
+import { FILE_CHANGE_TOOLS } from '../utils/file-preview.js';
+import { buildToolBlockDetail, isTranscriptTool, type ToolBlock } from '../ui/tool-block.js';
+import type { ChatMessage, CompletionMeta, FileChangeSummary, ToolStep, PermissionPromptState, CurrentSessionInfo, SidebarSection, SkillInfo, SubAgentInfo, ProviderInfo, TokenInfo, SaverInfo, AppMode, WorkspaceState, WorkspaceTreeNode, WorkspaceGitFile, BackgroundTaskInfo, MercuryCodeGitState, MercuryCodeState, LiveActivityState, PlanStep } from '../ui/types.js';
+import { TASK_SUMMARY_FILE_LIMIT } from '../ui/types.js';
 import { TuiApp } from '../ui/App.js';
+import { nextTip } from '../ui/tips.js';
+import { ResilientTuiOutput } from '../ui/resilient-output.js';
+import { PASTE_SENTINEL, FORWARD_DELETE_KEY } from '../ui/input-composer.js';
+import { detectInkPatch, inkPatchWarning } from '../ui/ink-patch-check.js';
+import { configureHardwareCursor } from '../ui/cursor-anchor.js';
+
+/**
+ * Strip mouse-report escape sequences from terminal input before Ink sees
+ * them. Terminals emit SGR mouse sequences (ESC [ < b ; c ; r M/m) or legacy
+ * X10 ones (ESC [ M ...); scrolling a trackpad emits a flood of these, and
+ * Ink's keypress parser only partially consumes them, leaking fragments
+ * ("<0;34;12M") into the input box as garbage text.
+ */
+const MOUSE_SEQ_RE = /\x1b\[<\d+;\d+;\d+[Mm]|\x1b\[M[\x20-\x2f]*[\x40-\x6f]|\x1b\[\?100[0-7][hl]/g;
+
+/**
+ * Markdown summary appended to the Mercury Code completion banner: what was
+ * done (a few bullets), how many files changed (paths capped at
+ * TASK_SUMMARY_FILE_LIMIT — the full list lives in git), and the next steps
+ * the developer might need to take. Short by design: the agent's full
+ * narration is already in the response above the banner.
+ */
+export function buildTaskSummary(opts: {
+  fileChanges: FileChangeSummary[];
+  doneSteps: string[];
+  verified: boolean;
+  uncommitted: boolean;
+}): string {
+  const lines: string[] = [];
+
+  // Files first — the developer's top question is "what changed?".
+  if (opts.fileChanges.length > 0) {
+    const n = opts.fileChanges.length;
+    lines.push(`**Changes** · ${n} file${n !== 1 ? 's' : ''}${n > TASK_SUMMARY_FILE_LIMIT ? ` (showing ${TASK_SUMMARY_FILE_LIMIT})` : ''}`);
+    for (const f of opts.fileChanges.slice(0, TASK_SUMMARY_FILE_LIMIT)) {
+      const stats = f.added == null || f.removed == null ? 'new' : `+${f.added} −${f.removed}`;
+      lines.push(`  ↳ ${f.path} · ${stats}`);
+    }
+    if (opts.fileChanges.length > TASK_SUMMARY_FILE_LIMIT) {
+      lines.push(`  ↳ … ${opts.fileChanges.length - TASK_SUMMARY_FILE_LIMIT} more`);
+    }
+  }
+
+  const steps = opts.doneSteps.filter((label) => label.trim().length > 0).slice(0, 5);
+  if (steps.length > 0) {
+    lines.push('**What was done**');
+    for (const label of steps) lines.push(`• ${label}`);
+  }
+
+  const next: string[] = [];
+  if (opts.fileChanges.length > 0) {
+    if (!opts.verified) next.push('Run your test suite — these changes are not verified yet');
+    if (opts.uncommitted) next.push('Review the diff (`git diff`), then commit when ready');
+  }
+  if (next.length > 0) {
+    lines.push('**Next steps**');
+    for (const step of next) lines.push(`• ${step}`);
+  }
+
+  return lines.join('\n');
+}
+
+/**
+ * Parsed mouse event from an SGR/X10 sequence.
+ * click: press (or release of a press) without motion and without wheel.
+ */
+export interface MouseEvent {
+  button: number;      // 0 left, 1 middle, 2 right, 64/65 wheel up/down
+  col: number;         // 0-based
+  row: number;         // 0-based
+  wheel: 'up' | 'down' | null;
+  click: boolean;
+  release: boolean;
+  motion: boolean;
+}
+
+/** Parse a single SGR or X10 mouse sequence into a MouseEvent. */
+export function parseMouseSequence(seq: string): MouseEvent | null {
+  // SGR: ESC [ < b ; c ; r M/m
+  const sgr = /^\x1b\[<(\d+);(\d+);(\d+)([Mm])$/.exec(seq);
+  if (sgr) {
+    const rawButton = parseInt(sgr[1], 10);
+    const col = parseInt(sgr[2], 10) - 1;
+    const row = parseInt(sgr[3], 10) - 1;
+    const isRelease = sgr[4] === 'm';
+    const motion = (rawButton & 32) !== 0;
+    const wheelBits = (rawButton & 64) !== 0;
+    const wheel: 'up' | 'down' | null = wheelBits ? ((rawButton & 1) === 0 ? 'up' : 'down') : null;
+    return {
+      button: rawButton & 3,
+      col,
+      row,
+      wheel,
+      click: !isRelease && !wheel && !motion,
+      release: isRelease,
+      motion,
+    };
+  }
+  // X10: ESC [ M cb+32 cx+32 cy+32
+  const x10 = /^\x1b\[M([\x20-\x2f])([\x20-\xff])([\x20-\xff])$/.exec(seq);
+  if (x10) {
+    const rawButton = x10[1].charCodeAt(0) - 32;
+    const col = x10[2].charCodeAt(0) - 33;
+    const row = x10[3].charCodeAt(0) - 33;
+    const wheelBits = (rawButton & 64) !== 0;
+    const motion = (rawButton & 32) !== 0;
+    const wheel: 'up' | 'down' | null = wheelBits ? ((rawButton & 1) === 0 ? 'up' : 'down') : null;
+    return {
+      button: rawButton & 3,
+      col,
+      row,
+      wheel,
+      click: !wheel && !motion,
+      release: false,
+      motion,
+    };
+  }
+  return null;
+}
+
+/** DECSET sequences to start (enable=true) or stop mouse reporting. */
+export function mouseTrackingSequences(enable: boolean): string {
+  return enable
+    ? '\x1b[?1000h\x1b[?1002h\x1b[?1006h'
+    : '\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l';
+}
+
+/**
+ * Stateful mouse-sequence filter for the terminal input stream.
+ *
+ * Feeds complete mouse sequences (SGR/X10) to `onEvent`, passes every
+ * other byte through `write`, and HOLDS BACK partial escape prefixes so a
+ * sequence split across two stdin chunks is joined — never dropped,
+ * never leaked as keystrokes. A bounded holdback prevents a corrupt
+ * stream from growing memory without limit.
+ */
+/**
+ * Ink-facing stdin: forwards the Ink-required stream surface (setRawMode,
+ * ref/unref, setEncoding, readable/read) to the real terminal stream while
+ * feeding every chunk through the MouseSequenceFilter first. Ink never sees
+ * raw mouse sequences; wheel events become transcript scrolling in Mercury
+ * Code. Non-mouse bytes pass through byte-identical.
+ */
+class TtyStdinProxy extends EventEmitter {
+  private buffer = '';
+  private readonly real: NodeJS.ReadStream;
+  private readonly filter: MouseSequenceFilter;
+
+  readonly isTTY = true;
+
+  constructor(real: NodeJS.ReadStream, filter: MouseSequenceFilter) {
+    super();
+    this.real = real;
+    this.filter = filter;
+    this.real.on('data', (chunk: Buffer | string) => {
+      const text = typeof chunk === 'string' ? chunk : chunk.toString('utf8');
+      this.filter.push(text);
+    });
+    this.real.on('end', () => this.emit('end'));
+    this.real.on('close', () => this.emit('close'));
+  }
+
+  /** Filter output lands here (called by the MouseSequenceFilter). */
+  write(s: string): void {
+    if (s.length === 0) return;
+    this.buffer += s;
+    this.emit('readable');
+  }
+
+  read(): string | null {
+    if (this.buffer.length === 0) return null;
+    const out = this.buffer;
+    this.buffer = '';
+    return out;
+  }
+
+  setEncoding(enc: BufferEncoding): this {
+    this.real.setEncoding(enc);
+    return this;
+  }
+
+  setRawMode(mode: boolean): this {
+    this.real.setRawMode(mode);
+    return this;
+  }
+
+  ref(): this { this.real.ref(); return this; }
+  unref(): this { this.real.unref(); return this; }
+  resume(): this { this.real.resume(); return this; }
+  pause(): this { this.real.pause(); return this; }
+}
+
+export class MouseSequenceFilter {
+  private buf = '';
+  /** Inside a bracketed paste (`ESC[200~` seen, `ESC[201~` not yet). */
+  private inPaste = false;
+  private flushTimer: ReturnType<typeof setTimeout> | null = null;
+  private static readonly SGR = /^\x1b\[<\d+;\d+;\d+[Mm]/;
+  private static readonly X10 = /^\x1b\[M[\x20-\x2f][\x20-\xff][\x20-\xff]/;
+  private static readonly DEC = /^\x1b\[\?100[0-7][hl]/;
+  private static readonly CSI_COMPLETE = /^\x1b\[[\d;<]*[A-Za-z]/;
+  private static readonly PASTE_START = /^\x1b\[200~/;
+  private static readonly PASTE_END = /^\x1b\[201~/;
+  /** Partial `ESC[201~` at the end of a paste chunk — wait for the rest. */
+  private static readonly PASTE_END_PARTIAL = /^\x1b(\[(2(0(1)?)?)?)?$/;
+  /** Any ANSI escape inside pasted text (never meaningful as input). */
+  private static readonly PASTE_ANSI = /\x1b(\[[0-9;?<>=]*[ -\/]*[@-~]|\][^\x07\x1b]*(\x07|\x1b\\)|[@-Z\\-_])?/g;
+  private static readonly MAX_HOLDBACK = 64;
+  /**
+   * A held-back prefix that is not completed within this window is a real
+   * keypress (a lone Esc, Alt+key) and is released as-is. Terminals deliver
+   * a complete sequence in one read or within a millisecond or two; 35 ms
+   * is the conventional ESC-disambiguation delay (vim's ttimeoutlen scale).
+   */
+  static readonly HOLDBACK_FLUSH_MS = 35;
+  /**
+   * Keys Ink either cannot parse or cannot tell apart, rewritten to
+   * sequences the shared composer understands (see input-composer.tsx):
+   *   Shift+Enter / Ctrl+Enter in every common encoding → Ctrl+N (newline)
+   *   the real Delete key (ESC[3~) → FORWARD_DELETE_KEY (Ink folds it into
+   *   `key.delete` together with \x7f, which is Backspace on macOS/Linux)
+   */
+  private static readonly KEY_REWRITES: ReadonlyArray<readonly [RegExp, string]> = [
+    [/^\x1b\[13;[25]u/, '\x0e'],       // kitty keyboard protocol
+    [/^\x1b\[27;[25];13~/, '\x0e'],    // xterm modifyOtherKeys
+    [/^\x1b\r/, '\x0e'],               // ESC CR (iTerm2 / Alt+Enter)
+    [/^\x1b\[3~/, FORWARD_DELETE_KEY],
+    // Home / End: Ink names them but hands the composer an empty `input`
+    // with no `key.home`/`key.end` flag, so they were dead keys. Readline
+    // Ctrl+A / Ctrl+E are what the composer binds to line start / end.
+    [/^\x1b(\[(1~|H)|OH)/, '\x01'],
+    [/^\x1b(\[(4~|F)|OF)/, '\x05'],
+  ];
+
+  constructor(
+    private onEvent: (ev: MouseEvent) => void,
+    private write: (s: string) => void,
+  ) {}
+
+  /** Feed a raw chunk from the terminal; returns nothing, side-effects only. */
+  push(chunk: Buffer | string): void {
+    this.buf += typeof chunk === 'string' ? chunk : chunk.toString('utf8');
+    this.drain();
+  }
+
+  private drain(): void {
+    let out = '';
+    let paste = '';
+    let i = 0;
+    const flushOut = () => { if (out) { this.write(out); out = ''; } };
+    const flushPaste = () => {
+      if (paste) {
+        this.write(PASTE_SENTINEL + paste.replace(MouseSequenceFilter.PASTE_ANSI, ''));
+        paste = '';
+      }
+    };
+    while (i < this.buf.length) {
+      const rest = this.buf.slice(i);
+      if (this.inPaste) {
+        if (rest[0] !== '\x1b') {
+          const esc = rest.indexOf('\x1b');
+          const text = esc < 0 ? rest : rest.slice(0, esc);
+          paste += text;
+          i += text.length;
+          continue;
+        }
+        const end = MouseSequenceFilter.PASTE_END.exec(rest)?.[0];
+        if (end) {
+          this.inPaste = false;
+          flushPaste();
+          i += end.length;
+          continue;
+        }
+        if (MouseSequenceFilter.PASTE_END_PARTIAL.test(rest)) break;
+        // An escape inside the paste: keep it in the payload (stripped
+        // from the text later) and move on.
+        paste += rest[0];
+        i += 1;
+        continue;
+      }
+      if (rest[0] !== '\x1b') {
+        out += rest[0];
+        i += 1;
+        continue;
+      }
+      const seq = MouseSequenceFilter.SGR.exec(rest)?.[0]
+        ?? MouseSequenceFilter.X10.exec(rest)?.[0]
+        ?? MouseSequenceFilter.DEC.exec(rest)?.[0];
+      if (seq) {
+        const ev = parseMouseSequence(seq);
+        if (ev) {
+          try { this.onEvent(ev); } catch { /* handler must never crash input */ }
+        }
+        i += seq.length;
+        continue;
+      }
+      const pasteStart = MouseSequenceFilter.PASTE_START.exec(rest)?.[0];
+      if (pasteStart) {
+        // Keystrokes typed before the paste must reach Ink before the
+        // paste payload, as their own chunk.
+        flushOut();
+        this.inPaste = true;
+        i += pasteStart.length;
+        continue;
+      }
+      let rewritten = false;
+      for (const [pattern, replacement] of MouseSequenceFilter.KEY_REWRITES) {
+        const m = pattern.exec(rest)?.[0];
+        if (m) {
+          // A rewritten key is a keystroke of its own: Ink parses a chunk
+          // as ONE key, so it must not be glued to surrounding text.
+          flushOut();
+          this.write(replacement);
+          i += m.length;
+          rewritten = true;
+          break;
+        }
+      }
+      if (rewritten) continue;
+      // X10 mouse in flight (ESC [ M + 0-2 pending payload bytes) — MUST be
+      // tested before the generic CSI pass-through, because 'M' is a valid
+      // CSI final byte and would otherwise leak the prefix downstream.
+      if (/^\x1b\[M[\x20-\xff]{0,2}$/.test(rest)) {
+        break;
+      }
+      // Complete non-mouse CSI (arrow keys etc.) — pass through untouched.
+      const csi = MouseSequenceFilter.CSI_COMPLETE.exec(rest)?.[0];
+      if (csi) {
+        out += csi;
+        i += csi.length;
+        continue;
+      }
+      // Incomplete escape sequence — hold it back and wait for the rest.
+      // Covers CSI starts (ESC [ 3 2 ...) and SGR mouse starts (ESC [ < 6 4 ;).
+      if (/^\x1b(\[[\d;<\?<>]*)?$/.test(rest)) {
+        break;
+      }
+      // Unknown escape byte — pass it through so Ink's parser sees it.
+      out += rest[0];
+      i += 1;
+    }
+    this.buf = i >= this.buf.length ? '' : this.buf.slice(i);
+    // Overflow guard: an unterminated garbage prefix must not grow forever.
+    // Flush it, stripping ESC bytes so terminal/Ink never sees raw ones.
+    if (this.buf.length > MouseSequenceFilter.MAX_HOLDBACK) {
+      this.buf = '';
+    }
+    if (this.inPaste) flushPaste();
+    flushOut();
+    this.armHoldbackFlush();
+  }
+
+  /**
+   * A held-back prefix is either the head of a sequence still in flight or
+   * a real key (a lone Esc, Alt+letter). Release it after a short delay so
+   * Esc reaches Ink on its own instead of fusing with the NEXT keystroke.
+   */
+  private armHoldbackFlush(): void {
+    if (this.flushTimer) {
+      clearTimeout(this.flushTimer);
+      this.flushTimer = null;
+    }
+    if (this.buf.length === 0 || this.inPaste) return;
+    this.flushTimer = setTimeout(() => {
+      this.flushTimer = null;
+      if (this.buf.length === 0 || this.inPaste) return;
+      const held = this.buf;
+      this.buf = '';
+      // A bare ESC is the Escape key; anything longer is an unknown
+      // sequence whose bytes Ink can still interpret (Alt+key etc.).
+      this.write(held);
+    }, MouseSequenceFilter.HOLDBACK_FLUSH_MS);
+    (this.flushTimer as { unref?: () => void }).unref?.();
+  }
+
+  /** Drop timers (tests / teardown). */
+  dispose(): void {
+    if (this.flushTimer) clearTimeout(this.flushTimer);
+    this.flushTimer = null;
+  }
+}
+
+/** DECSET: bracketed paste on/off. On, the terminal wraps pasted text in
+ * `ESC[200~ … ESC[201~` so the filter can insert it literally. */
+export function bracketedPasteSequences(enable: boolean): string {
+  return enable ? '\x1b[?2004h' : '\x1b[?2004l';
+}
+
+/** Status-bar hint shown while the TUI is frozen (Ctrl+S scroll lock). The
+ * substring '⏸ frozen' is also the ink freeze-gate marker (the armed window
+ * lets through only the frame that carries it) — keep them in sync. */
+export const TUI_FROZEN_HINT_MARKER = '⏸ frozen';
+
+/** One-line transcript marker written when Esc interrupts a running turn. */
+export const INTERRUPTED_MARKER = '⏹ Interrupted';
 
 export interface TuiState {
   mode: AppMode;
   viewMode: 'balanced' | 'detailed';
   chatMessages: ChatMessage[];
   toolSteps: ToolStep[];
+  /** Live plan checklist maintained by the agent via the update_plan tool. */
+  planProgress: PlanStep[] | null;
+  /** Live reasoning preview while the model thinks before speaking. */
+  thinkingPreview: string | null;
   isThinking: boolean;
   permissionPrompt: PermissionPromptState | null;
   agentName: string;
@@ -30,6 +436,43 @@ export interface TuiState {
   workspace: WorkspaceState | null;
   backgroundTasks: BackgroundTaskInfo[];
   web: { enabled: boolean; port: number } | null;
+  saverInfo: SaverInfo | null;
+  /** Last completed step log, preserved after completion wipes toolSteps. Ctrl+D dumps this. */
+  lastStepLog: ToolStep[] | null;
+  /** Elapsed ms for the last completed task. */
+  lastStepLogElapsed: number | null;
+  currentSession: CurrentSessionInfo | null;
+  /** Mercury Code (full-screen `/code`) state — null unless active. */
+  mercuryCode: MercuryCodeState | null;
+  /** Double-Esc detection for Mercury Code exit. */
+  exitEscArmed: boolean;
+  /** Real-time activity phase (what the agent is doing right now), or null when idle. */
+  liveActivity: LiveActivityState | null;
+  /**
+   * Mercury Code status-verb pool for the live status row. null until the
+   * agent's one-shot LLM refinement lands (session start shows the plain
+   * static label); populated with LLM verbs (or the keyword fallback after a
+   * failed generation) and cleared on exitMercuryCode.
+   */
+  statusVerbs: string[] | null;
+  /** TUI frame freeze (scroll lock): all frame writes stop so the user can
+   * scroll/copy freely while the chat continues underneath. Ctrl+S toggles. */
+  tuiFrozen: boolean;
+  /** A newer Mercury version the background check found — shown as a tiny
+   * bottom-bar indicator (⬆ vX) in Mercury Code until ignored. */
+  updateAvailable: string | null;
+  /** What a desktop plugin (Optimus) is doing right now, e.g. "🎙 Optimus listening"; null when idle. */
+  desktopActivity: string | null;
+  /** Active Mercury Bot chat — transcript is swapped to the bot's thread. */
+  botChat: { botId: string; botName: string } | null;
+  /** Per-bot real-time activity (what each bot is doing RIGHT NOW) — rendered
+   * as a live region in an open bot thread, keyed by bot id. */
+  botLiveActivity: Record<string, LiveActivityState>;
+  /** Per-bot streaming tails (what each bot is THINKING / replying right now,
+   * from the bot turn's reasoning/text deltas) — rendered live in its thread. */
+  botStreamTails: Record<string, { reasoning: string; text: string }>;
+  /** Live bot roster (drives `/bots` argument autocomplete and badges). */
+  botRoster: Array<{ id: string; name: string; state: string; needsYou: boolean; fleetRole?: 'lead' | 'crew'; parent?: string }>;
 }
 
 const defaultState: TuiState = {
@@ -37,6 +480,8 @@ const defaultState: TuiState = {
   viewMode: 'balanced',
   chatMessages: [],
   toolSteps: [],
+  planProgress: null,
+  thinkingPreview: null,
   isThinking: false,
   permissionPrompt: null,
   agentName: 'Mercury',
@@ -52,22 +497,120 @@ const defaultState: TuiState = {
   workspace: null,
   backgroundTasks: [],
   web: null,
+  saverInfo: null,
+  lastStepLog: null,
+  lastStepLogElapsed: null,
+  currentSession: null,
+  mercuryCode: null,
+  exitEscArmed: false,
+  liveActivity: null,
+  statusVerbs: null,
+  tuiFrozen: false,
+  updateAvailable: null,
+  desktopActivity: null,
+  botChat: null,
+  botLiveActivity: {},
+  botStreamTails: {},
+  botRoster: [],
 };
+
+function shallowEqualSubAgents(a: SubAgentInfo[], b: SubAgentInfo[]): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i].id !== b[i].id || a[i].status !== b[i].status || a[i].progress !== b[i].progress) return false;
+  }
+  return true;
+}
+
+function shallowEqualBgTasks(a: BackgroundTaskInfo[], b: BackgroundTaskInfo[]): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i].id !== b[i].id || a[i].status !== b[i].status || a[i].runningMs !== b[i].runningMs) return false;
+  }
+  return true;
+}
 
 export class CLIChannel extends BaseChannel {
   readonly type = 'cli' as const;
   private agentName: string;
   private inkInstance: ReturnType<typeof render> | null = null;
+  private restoreConsole: (() => void) | null = null;
   private inputHandler: ((text: string) => void) | null = null;
   private exitHandler: (() => void) | null = null;
-  private permissionResolver: ((value: string | boolean) => void) | null = null;
+  /** Esc-during-a-turn: installed by the boot path with the agent's stop
+   * routine (the same one `/stop` calls). Null until set. */
+  private interruptHandler: (() => unknown) | null = null;
+  /**
+   * Pending interactive prompts, keyed by prompt id. Several callers can
+   * prompt concurrently (the foreground turn, sub-agents, bots): a single
+   * resolver slot was overwritten by the newest prompt and the earlier
+   * promises never settled. Every prompt now keeps its own resolver; the
+   * TUI shows them in arrival order — `state.permissionPrompt` is the one
+   * on screen, `promptQueue` holds the rest.
+   */
+  private promptResolvers = new Map<string, (value: string | boolean) => void>();
+  private promptQueue: PermissionPromptState[] = [];
+  private promptSeq = 0;
   private menuDepth = 0;
   private menuAbortController: AbortController | null = null;
+  private heartbeatMsgId: string | null = null;
+  // Mercury Bot chat (mode-scoped transcript swap, §3.3): the bot's thread
+  // replaces the transcript on screen; main-agent traffic parks in
+  // mainTranscript until /chat restores it.
+  private activeBotId: string | null = null;
+  private mainTranscript: ChatMessage[] | null = null;
+  private botTranscripts = new Map<string, ChatMessage[]>();
+  /** Set while the input handler dispatches a bot-chat message downstream. */
+  private pendingBotChatTarget: string | null = null;
+
+  // Per-turn file-change attribution: file-tool calls (write/create/edit/
+  // delete) with their args path. Committed entries surface in the completion
+  // banner; a general chat turn that touches no files stays clean.
+  private pendingTurnFiles = new Map<string, string>();
+  private committedTurnFiles = new Set<string>();
+
+  // Mercury Code tool transcript: args of running steps (by step id), kept
+  // until completion builds the step's transcript block.
+  private toolArgs = new Map<string, Record<string, any>>();
+  // The agent message currently being streamed. A tool call starting
+  // mid-stream closes it (cutStreamSegment) so the tool's block lands after
+  // the text that preceded it, and later text opens a fresh message.
+  private streamSegment: { id: string; text: string; started: boolean; lastRender: number } | null = null;
+  // Full excerpts of collapsed tool blocks, newest last, for ctrl+o. Bounded:
+  // only the most recent blocks are expandable.
+  private expandableTools: Array<{ block: ToolBlock; full: { lang: string; lines: string[] } }> = [];
+  private static readonly MAX_EXPANDABLE_TOOLS = 20;
+
+  /** update-notice helpers, imported lazily (a static import would pull
+   * cli/daemon.js into an import cycle through channels/cli.ts). */
+  private updateNoticeApiPromise: Promise<any> | null = null;
+
+  private updateNoticeApi() {
+    if (!this.updateNoticeApiPromise) {
+      this.updateNoticeApiPromise = import('../cli/update-notice.js');
+    }
+    return this.updateNoticeApiPromise;
+  }
   private stepCount = 0;
   private stepStartTime = 0;
   private state: TuiState = { ...defaultState };
   private spotifyClient: any = null;
-  private rawModeWatchdog: NodeJS.Timeout | null = null;
+  private statusPoller: NodeJS.Timeout | null = null;
+  private statusPollerBusy = false;
+  private mouseEnabled = false;
+  private mouseHandler: ((ev: MouseEvent) => void) | null = null;
+  private tuiOutput: ResilientTuiOutput | null = null;
+  private stateListeners = new Set<() => void>();
+  private rerenderMicrotaskQueued = false;
+  private tuiExitImmediate: NodeJS.Immediate | null = null;
+  private exitEscArmed = false;
+  private statusProviders: {
+    tokens?: () => { used: number; budget: number; percentage: number };
+    saver?: () => { state: import('../core/saver-mode.js').SaverModeState; savedToday: number; savedLifetime: number };
+    subAgents?: () => SubAgentInfo[];
+    bgTasks?: () => BackgroundTaskInfo[];
+    botRoster?: () => Array<{ id: string; name: string; state: string; needsYou: boolean }>;
+  } = {};
 
   constructor(agentName: string = 'Mercury') {
     super();
@@ -86,23 +629,48 @@ export class CLIChannel extends BaseChannel {
   }
 
   async stop(): Promise<void> {
-    this.stopRawModeWatchdog();
-    this.inkInstance?.unmount();
-    this.inkInstance = null;
-    this.releaseRawMode();
+    this.stopStatusPoller();
+    this.setMouseEnabled(false);
+    if (this.tuiExitImmediate) {
+      clearImmediate(this.tuiExitImmediate);
+      this.tuiExitImmediate = null;
+    }
+    this.teardownTui();
     this.ready = false;
   }
 
-  private ensureRawMode(): void {
-    if (!process.stdin.isTTY) return;
-    const stdin = process.stdin as NodeJS.ReadStream;
-    if (typeof stdin.setRawMode !== 'function') return;
-    try {
-      stdin.setRawMode(true);
-      stdin.resume();
-    } catch {
-      // Ignore transient raw mode failures.
-    }
+  private teardownTui(): void {
+    // The gate must never survive teardown: ink's final unmount writes
+    // (log.done(), cursor restore) have to reach the terminal.
+    this.writeGateFrozen = false;
+    this.frozenHintPending = false;
+    this.tuiFrozen = false;
+    this.frameGateSet({ armed: false, frozen: false, marker: '' });
+    const inkInstance = this.inkInstance;
+    this.inkInstance = null;
+    // Unmount may throw on a corrupted Yoga heap; shutdown must still
+    // release the output wrapper and restore the terminal.
+    try { inkInstance?.unmount(); } catch { /* best effort teardown */ }
+    this.restoreConsole?.();
+    this.restoreConsole = null;
+    this.stateListeners.clear();
+    this.tuiOutput?.dispose();
+    this.tuiOutput = null;
+    this.releaseRawMode();
+    this.restoreTerminal();
+  }
+
+  private scheduleTuiExit(): void {
+    if (this.tuiExitImmediate) return;
+    this.setMouseEnabled(false);
+    // useInput runs inside React's batchedUpdates. Calling Ink.unmount()
+    // there re-enters the reconciler and can invalidate Yoga nodes while
+    // they are still being laid out. Leave React's callback stack first.
+    this.tuiExitImmediate = setImmediate(() => {
+      this.tuiExitImmediate = null;
+      this.teardownTui();
+      this.exitHandler?.();
+    });
   }
 
   private releaseRawMode(): void {
@@ -116,67 +684,426 @@ export class CLIChannel extends BaseChannel {
     }
   }
 
-  private startRawModeWatchdog(): void {
-    this.stopRawModeWatchdog();
-    this.ensureRawMode();
-    this.rawModeWatchdog = setInterval(() => {
-      if (!this.inkInstance) return;
-      this.ensureRawMode();
-    }, 250);
-  }
-
-  private stopRawModeWatchdog(): void {
-    if (this.rawModeWatchdog) {
-      clearInterval(this.rawModeWatchdog);
-      this.rawModeWatchdog = null;
+  private restoreRawModeAfterMenu(): void {
+    if (!process.stdin.isTTY) return;
+    const stdin = process.stdin as NodeJS.ReadStream;
+    if (stdin.isRaw === true || typeof stdin.setRawMode !== 'function') return;
+    try {
+      // Arrow menus temporarily own stdin and disable raw mode on exit.
+      // Do not call resume(): Ink consumes stdin through a readable listener.
+      stdin.setRawMode(true);
+    } catch {
+      // Ink will surface input failures if the TTY is no longer available.
     }
   }
 
+  /** Scroll-lock (freeze) bookkeeping. `tuiFrozen` is the user-facing state;
+   * `writeGateFrozen` is the actual frame gate (opens after the hint frame);
+   * `frozenHintPending` lets the one hint frame through the gate. */
+  private tuiFrozen = false;
+  private writeGateFrozen = false;
+  private frozenHintPending = false;
+
   private update(partial: Partial<TuiState>): void {
+    // Blocking interactions must never be invisible: auto-resume BEFORE the
+    // update so the frame that carries the prompt goes out — and the
+    // tuiFrozen flag must clear in the SAME state merge, otherwise the
+    // resumed frame still renders the frozen status bar.
+    if (this.writeGateFrozen && (partial.permissionPrompt || partial.mercuryCode?.exitConfirm)) {
+      this.unfreezeForInteraction();
+      partial = { ...partial, tuiFrozen: false };
+    }
     this.state = { ...this.state, ...partial };
     this.rerender();
   }
 
-  private rerender(): void {
-    if (!this.inkInstance) return;
-    this.inkInstance.rerender(
-      React.createElement(TuiApp, {
-        state: this.state,
-        onInput: (text: string) => { this.inputHandler?.(text); },
-        onPermissionResolve: (value: string | boolean) => {
-          if (this.permissionResolver) {
-            this.permissionResolver(value);
-            this.permissionResolver = null;
-          }
-          this.update({ permissionPrompt: null });
-        },
-        onExit: () => {
-          this.stopRawModeWatchdog();
-          this.inkInstance?.unmount();
-          this.inkInstance = null;
-          this.releaseRawMode();
-          this.exitHandler?.();
-        },
-        spotifyClient: this.spotifyClient,
-      }),
-    );
+  /**
+   * Freeze/unfreeze the TUI frame stream (scroll lock, Ctrl+S). While frozen
+   * the agent keeps streaming — state keeps merging in this.update — but
+   * rerender() stops notifying React, so ink writes nothing and the user's
+   * terminal is untouched: they can scroll, read, and drag-select freely in
+   * native scrollback while the chat is in progress. Resume emits one fresh
+   * frame (the ink diff-render rewrites only rows that changed since the
+   * freeze frame).
+   *
+   * Freezing shows the status hint FIRST (one frame), then closes the write
+   * gate after ink's 32ms onRender throttle has had its chance — so the user
+   * always sees what happened. Auto-resume on permission prompts / exit
+   * confirms: they own the keyboard and must never be invisible.
+   */
+  setTuiFrozen(frozen: boolean): void {
+    if (frozen === this.tuiFrozen) return;
+    this.tuiFrozen = frozen;
+    if (frozen) {
+      this.frozenHintPending = true;
+      // Pass 1: write the hint frame (gate still open, hint marker armed).
+      this.frameGateSet({ armed: true, frozen: false, marker: TUI_FROZEN_HINT_MARKER });
+      this.update({ tuiFrozen: true });
+      // ink's onRender is throttled to 32ms; 90ms safely covers the flush.
+      const timer = setTimeout(() => {
+        this.frozenHintPending = false;
+        this.writeGateFrozen = true;
+        this.frameGateSet({ armed: false, frozen: true, marker: '' });
+      }, 90);
+      timer.unref?.();
+    } else {
+      this.writeGateFrozen = false;
+      this.frozenHintPending = false;
+      this.frameGateSet({ armed: false, frozen: false, marker: '' });
+      this.update({ tuiFrozen: false });
+    }
   }
 
-  mountTUI(onInput: (text: string) => void, spotifyClient?: any, onExit?: () => void): void {
+  /** The ink patch's freeze gate (undefined when ink is unpatched — e.g. a
+   * dev checkout where the patch applier hasn't run). */
+  private get frameGate(): { frozen: boolean; armed: boolean; marker: string } | undefined {
+    return (globalThis as any).__mercuryFrameGate;
+  }
+
+  private frameGateSet(gate: { frozen: boolean; armed: boolean; marker: string }): void {
+    const g = this.frameGate;
+    if (g) Object.assign(g, gate);
+  }
+
+  /** Resume rendering: a blocking interaction (prompt/confirm) or explicit
+   * unfreeze arrived. Opens the write gate before the state update so the
+   * frame that carries the interaction is not dropped. Called from inside
+   * update() — the partial itself must carry tuiFrozen: false so the frame
+   * renders the resumed state. */
+  private unfreezeForInteraction(): void {
+    if (!this.tuiFrozen && !this.writeGateFrozen) return;
+    this.writeGateFrozen = false;
+    this.frozenHintPending = false;
+    this.tuiFrozen = false;
+    this.frameGateSet({ armed: false, frozen: false, marker: '' });
+  }
+
+  /** useSyncExternalStore contract: read the latest immutable state snapshot. */
+  // ---- Mercury Bot chat (per-bot transcripts) ------------------------------
+
+  /** Open a bot's chat: swap the on-screen transcript to the bot's thread.
+   * `history` hydrates a thread with no in-memory transcript (journal tail). */
+  enterBotChat(botId: string, botName: string, history?: Array<{ content: string; timestamp: number }>): void {
+    if (this.activeBotId === botId) return;
+    if (this.activeBotId) {
+      this.botTranscripts.set(this.activeBotId, [...this.state.chatMessages]);
+    } else {
+      this.mainTranscript = [...this.state.chatMessages];
+    }
+    this.activeBotId = botId;
+    // In-memory transcript wins (live session continuity); otherwise hydrate
+    // from the durable journal history the caller provides, so a thread
+    // opened after a restart (or after the bot worked unattended) shows what
+    // happened instead of an empty room. Bounded: caller passes ≤10 records.
+    const seed: ChatMessage[] = (this.botTranscripts.get(botId) ?? [
+      {
+        id: `bot-open-${Date.now().toString(36)}`,
+        role: 'system',
+        content: `🤖 **${botName}** bot chat — everything you type here goes to the bot (runs outside the main conversation). \`/chat\` returns to the main transcript.`,
+        timestamp: Date.now(),
+      },
+      ...(history ?? []).map((h, i) => ({
+        id: `bot-hist-${botId}-${i}-${h.timestamp.toString(36)}`,
+        role: 'system' as const,
+        content: `📜 ${h.content}`,
+        timestamp: h.timestamp,
+      })),
+    ]);
+    this.botTranscripts.set(botId, seed);
+    this.trimAndSetMessages(seed, { botChat: { botId, botName }, isThinking: false, liveActivity: null });
+  }
+
+  /** Leave the bot chat and restore the main transcript. */
+  exitBotChat(): void {
+    if (!this.activeBotId) return;
+    this.botTranscripts.set(this.activeBotId, [...this.state.chatMessages]);
+    const main = this.mainTranscript ?? [];
+    this.activeBotId = null;
+    this.mainTranscript = null;
+    this.trimAndSetMessages(main, { botChat: null, isThinking: false, liveActivity: null });
+  }
+
+  getActiveBotChat(): { botId: string; botName: string } | null {
+    return this.activeBotId ? this.state.botChat : null;
+  }
+
+  /** Agent-side marker: the in-flight input was dispatched from a bot chat. */
+  consumePendingBotChatTarget(): string | null {
+    const target = this.pendingBotChatTarget;
+    this.pendingBotChatTarget = null;
+    return target;
+  }
+
+  private appendBotMessage(botId: string, msg: ChatMessage): void {
+    const existing = this.botTranscripts.get(botId) ?? [];
+    const updated = [...existing.slice(-CLIChannel.MAX_CHAT_MESSAGES + 1), msg];
+    this.botTranscripts.set(botId, updated);
+    if (this.activeBotId === botId) {
+      this.trimAndSetMessages(updated, { isThinking: false, liveActivity: null });
+    }
+  }
+
+  getTuiStateSnapshot = (): TuiState => {
+    return this.state;
+  };
+
+  /** useSyncExternalStore contract: subscribe to state changes. */
+  subscribeToTuiState = (listener: () => void): (() => void) => {
+    this.stateListeners.add(listener);
+    return () => {
+      this.stateListeners.delete(listener);
+    };
+  };
+
+  /** Update an existing chat message's content in place (by ID). */
+  private updateMessage(id: string, content: string, extra?: Partial<ChatMessage>): void {
+    this.update({
+      chatMessages: this.state.chatMessages.map((m) =>
+        m.id === id ? { ...m, content: content.slice(0, CLIChannel.MAX_MESSAGE_CHARS), timestamp: Date.now(), ...extra } : m,
+      ),
+    });
+  }
+
+  private rerender(): void {
+    // Freeze gate: state has already merged (this.update) — only the frame
+    // is suppressed. React never re-renders while frozen, so <Static> never
+    // commits new items (committing without printing would lose finalized
+    // messages — Static marks keys committed at the React level). The one
+    // exception is the armed hint window: the freeze hint frame must go out
+    // so the user sees the frozen state.
+    if (this.writeGateFrozen && !this.frozenHintPending) return;
+    // Notify React subscribers instead of calling inkInstance.rerender().
+    // Imperative re-rendering enters the reconciler synchronously from
+    // arbitrary call sites and races React's own renders (spinner/size
+    // timers) — the resulting re-entrant commit corrupted Yoga's WASM heap
+    // ("memory access out of bounds").
+    //
+    // Notifications are deferred to the event loop's check phase and
+    // coalesced: update() is sometimes called from inside React's own
+    // commit phase (e.g. the scroll-clamp effect calls back into channel
+    // state). A synchronous listener call there would re-enter the
+    // reconciler mid-work — React's "Should not already be working." error.
+    // setImmediate (not queueMicrotask) is deliberate: microtasks drain
+    // before timers, so under streaming render pressure a memory-guard
+    // interval could never fire and a runaway task reached a fatal V8 OOM.
+    // The check phase lets pending timers run between render batches.
+    if (this.rerenderMicrotaskQueued) return;
+    this.rerenderMicrotaskQueued = true;
+    setImmediate(() => {
+      this.rerenderMicrotaskQueued = false;
+      this.stateListeners.forEach((listener) => listener());
+    });
+  }
+
+  /**
+   * Restore the terminal to a sane, non-mouse state. Called on every exit
+   * path (graceful stop, TUI exit, crash handlers) so a crashed Mercury
+   * never leaves the shell spewing mouse-report garbage.
+   */
+  restoreTerminal(): void {
+    try {
+      process.stdout.write(mouseTrackingSequences(false) + bracketedPasteSequences(false) + '\x1b[?25h');
+    } catch { /* not a TTY */ }
+  }
+
+  /**
+   * Install the routine Esc calls to interrupt the running turn. The boot
+   * path wires it to the agent's `stopAllWork('stopped')` — exactly what
+   * typing `/stop` does — so the channel never reaches into the agent.
+   */
+  setInterruptHandler(handler: (() => unknown) | null): void {
+    this.interruptHandler = handler;
+  }
+
+  /** True while the agent is mid-turn (thinking, running a tool, or reporting a live phase). */
+  isTurnRunning(): boolean {
+    return this.state.isThinking
+      || this.state.toolSteps.some((s) => s.status === 'running')
+      || this.state.liveActivity !== null;
+  }
+
+  /**
+   * Interrupt the running turn (Esc). Writes a one-line "Interrupted"
+   * marker into the transcript and invokes the stop routine. Returns false
+   * (and does nothing) when no turn is running or no handler is installed.
+   */
+  interruptTurn(): boolean {
+    if (!this.interruptHandler || !this.isTurnRunning()) return false;
+    const marker: ChatMessage = {
+      id: `interrupt-${Date.now().toString(36)}`,
+      role: 'system',
+      content: INTERRUPTED_MARKER,
+      timestamp: Date.now(),
+    };
+    this.trimAndSetMessages([...this.state.chatMessages, marker], { liveActivity: null, thinkingPreview: null });
+    try {
+      const result = this.interruptHandler();
+      if (result && typeof (result as Promise<unknown>).catch === 'function') {
+        (result as Promise<unknown>).catch((err) => logger.warn({ err }, 'interrupt handler failed'));
+      }
+    } catch (err) {
+      logger.warn({ err }, 'interrupt handler failed');
+    }
+    return true;
+  }
+
+  mountTUI(onInput: (text: string) => void, spotifyClient?: any, onExit?: any): void {
     this.spotifyClient = spotifyClient ?? null;
     this.exitHandler = onExit ?? null;
+    if (this.tuiExitImmediate) {
+      clearImmediate(this.tuiExitImmediate);
+      this.tuiExitImmediate = null;
+    }
+    // Ink reads through the filtered proxy: mouse sequences never reach the
+    // input box, and wheel events drive Mercury Code scrolling.
+    this.installStdinProxy();
 
     this.inputHandler = (text: string) => {
       const trimmed = text.trim();
+      // Bot chat: /chat exits back to the main transcript; plain text goes
+      // to the bot as `/bot <id> <text>` (durable enqueue, reply lands here).
+      if (this.activeBotId) {
+        if (trimmed === '/chat' || trimmed === '/c') {
+          this.exitBotChat();
+          this.update({ mode: 'chat' });
+          return;
+        }
+        if (trimmed && !trimmed.startsWith('/')) {
+          const wrapped = `/bot ${this.activeBotId} ${trimmed}`;
+          this.pendingBotChatTarget = this.activeBotId;
+          try {
+            onInput(wrapped);
+          } finally {
+            this.pendingBotChatTarget = null;
+          }
+          return;
+        }
+        // /skip during persona capture routes INTO the bot thread so the
+        // agent's capture state machine sees it — a bare slash here would
+        // exit the chat and strand the pending persona (the onboarding
+        // prompt explicitly tells the user to send /skip).
+        if (trimmed === '/skip') {
+          const wrapped = `/bot ${this.activeBotId} /skip`;
+          this.pendingBotChatTarget = this.activeBotId;
+          try {
+            onInput(wrapped);
+          } finally {
+            this.pendingBotChatTarget = null;
+          }
+          return;
+        }
+        // /persona inside a bot chat rewrites to the explicit setter so the
+        // persona flow works without leaving the bot thread. Bare /persona
+        // arms the capture (next message becomes the persona) — it must NOT
+        // degrade to the /bots roster.
+        if (trimmed.startsWith('/persona')) {
+          const personaText = trimmed.slice('/persona'.length).trim();
+          onInput(personaText
+            ? `/bots persona ${this.activeBotId} ${personaText}`
+            : `/bots persona ${this.activeBotId}`);
+          return;
+        }
+        // /bots control commands STAY inside the bot thread: the agent routes
+        // their replies into this transcript via the pending bot-chat target
+        // (same mechanism as /bot dispatch) — the roster, journal, inbox etc.
+        // all render here. `/bots open <other-id>` naturally swaps threads.
+        if (trimmed.startsWith('/bots')) {
+          this.pendingBotChatTarget = this.activeBotId;
+          try {
+            onInput(trimmed);
+          } finally {
+            this.pendingBotChatTarget = null;
+          }
+          return;
+        }
+        // Any other slash command exits the bot chat first (review D2):
+        // command replies route to the main transcript and would otherwise
+        // be invisible from inside the bot thread.
+        if (trimmed.startsWith('/')) {
+          this.exitBotChat();
+        }
+      }
       if (trimmed === '/chat' || trimmed === '/c') {
-        this.update({ mode: 'chat' });
+        // Returning from Mercury Code must tear down its state (mouse mode,
+        // scroll offset, programming mode) — not just flip the view. A bare
+        // mode switch left mercuryCode set and programmingMode dangling.
+        if (this.state.mode === 'mercury-code') this.exitMercuryCode();
+        else this.update({ mode: 'chat' });
+        return;
+      }
+      // View-only: handled here, never sent to the agent.
+      if (trimmed === '/code expand') {
+        this.expandLastToolOutput();
+        return;
+      }
+      // Instant switch back to regular chat — no exit-confirm dance. The
+      // confirm exists to guard the Esc-Esc path against accidental exits
+      // mid-task; an explicit command is deliberate by definition.
+      if (trimmed === '/code chat' || trimmed === '/code back') {
+        if (this.state.mercuryCode) this.exitMercuryCode();
+        return;
+      }
+      // `/code` flows to the agent so core ProgrammingMode + view stay in
+      // sync (agent calls back into enterMercuryCode).
+      // Internal Mercury Code view commands (issued by the TUI itself).
+      if (trimmed.startsWith('/mc ')) {
+        const sub = trimmed.slice(4).trim();
+        // scroll-set MUST be matched before the generic scroll- prefix — the
+        // generic branch parses 'scroll-set N' as delta 'set N' (NaN) and
+        // returns, which silently killed the scroll-clamp loop: after a
+        // history trim the stored offset could exceed the shrunken
+        // transcript forever, leaving the viewport stuck on the last rows
+        // ("can't scroll, only see the code").
+        if (sub.startsWith('scroll-set ')) {
+          const distance = parseInt(sub.slice(11), 10);
+          if (Number.isFinite(distance)) {
+            const mcRef = this.state.mercuryCode;
+            if (mcRef && distance !== mcRef.scrollOffset) {
+              this.update({ mercuryCode: { ...mcRef, scrollOffset: distance } });
+            }
+          }
+          return;
+        }
+        if (sub === 'scroll' || sub.startsWith('scroll ') || sub.startsWith('scroll-')) {
+          const arg = sub.startsWith('scroll-') ? sub.slice(7) : sub.slice(6).trim();
+          const delta = arg.startsWith('-') ? -parseInt(arg.slice(1), 10) : parseInt(arg, 10);
+          if (Number.isFinite(delta)) this.scrollMercuryCode(delta);
+          return;
+        }
+        if (sub === 'live') { this.scrollMercuryCodeToLive(); return; }
+        // Scroll lock (freeze): stop all frame writes so the user can scroll
+        // and copy freely in native scrollback while the chat streams on.
+        if (sub === 'freeze' || sub === 'resume' || sub === 'unfreeze') { this.setTuiFrozen(sub === 'freeze'); return; }
+        if (sub === 'freeze-toggle') { this.setTuiFrozen(!this.state.tuiFrozen); return; }
+        if (sub === 'expand') { this.expandLastToolOutput(); return; }
+        if (sub === 'esc-arm') {
+          this.exitEscArmed = true;
+          // Auto-disarm after 1.5s so Esc-Esc window is bounded.
+          setTimeout(() => { if (this.exitEscArmed) { this.exitEscArmed = false; this.update({ exitEscArmed: false }); } }, 1500);
+          this.update({ exitEscArmed: true });
+          return;
+        }
+        if (sub === 'exit-arm') { this.exitEscArmed = false; this.update({ exitEscArmed: false }); this.setMercuryCodeExitConfirm(true); return; }
+        if (sub === 'exit-cancel') { this.exitEscArmed = false; this.update({ exitEscArmed: false }); this.setMercuryCodeExitConfirm(false); return; }
+        if (sub === 'exit-confirm' || sub === 'exit-force') {
+          this.exitEscArmed = false;
+          this.update({ exitEscArmed: false });
+          this.exitMercuryCode();
+          return;
+        }
+        if (sub === 'git-refresh') { void this.refreshMercuryCodeGit(); return; }
+        return;
+      }
+      if (trimmed === '/mc') {
+        this.update({ exitEscArmed: false });
         return;
       }
       if (trimmed === '/coding') {
-        this.update({ mode: 'coding' });
+        this.update({ mode: this.state.mode === 'mercury-code' ? 'mercury-code' : 'coding' });
         return;
       }
       if (trimmed === '/workspace' || trimmed === '/ws') {
+        if (this.state.mode === 'mercury-code') return;
         this.update({ mode: this.state.workspace?.active ? 'workspace' : 'coding' });
         return;
       }
@@ -193,6 +1120,7 @@ export class CLIChannel extends BaseChannel {
         return;
       }
       if (trimmed === '/ws exit' || trimmed === '/workspace exit' || trimmed === '/general') {
+        if (this.state.mode === 'mercury-code') return;
         this.exitWorkspaceToChat();
         return;
       }
@@ -209,8 +1137,19 @@ export class CLIChannel extends BaseChannel {
         return;
       }
       if (trimmed.startsWith('/ws scroll ')) {
-        const delta = parseInt(trimmed.slice(11), 10);
-        if (!isNaN(delta)) this.scrollWorkspaceCode(delta);
+        const [deltaRaw, viewportRaw] = trimmed.slice(11).trim().split(/\s+/);
+        const delta = parseInt(deltaRaw, 10);
+        const viewportLines = parseInt(viewportRaw, 10);
+        if (!isNaN(delta)) this.scrollWorkspaceCode(delta, Number.isFinite(viewportLines) ? viewportLines : 1);
+        return;
+      }
+      if (trimmed === '/ws scroll-home') {
+        this.scrollWorkspaceCodeToBoundary('top');
+        return;
+      }
+      if (trimmed.startsWith('/ws scroll-end ')) {
+        const viewportLines = parseInt(trimmed.slice(15), 10);
+        this.scrollWorkspaceCodeToBoundary('bottom', Number.isFinite(viewportLines) ? viewportLines : 1);
         return;
       }
       if (trimmed.startsWith('/ws focus ')) {
@@ -227,15 +1166,31 @@ export class CLIChannel extends BaseChannel {
         if (!isNaN(delta)) this.scrollWorkspaceChat(delta);
         return;
       }
+      if (trimmed.startsWith('/ws chat-set ')) {
+        const distance = parseInt(trimmed.slice(13), 10);
+        if (Number.isFinite(distance)) this.setWorkspaceChatDistance(distance);
+        return;
+      }
+      if (trimmed === '/ws chat-home') {
+        this.setWorkspaceChatBoundary('top');
+        return;
+      }
+      if (trimmed === '/ws chat-end') {
+        this.setWorkspaceChatBoundary('bottom');
+        return;
+      }
       if (trimmed === '/menu' || trimmed === '/m') {
+        if (this.state.mode === 'mercury-code') return;
         this.update({ mode: 'menu' });
         return;
       }
       if (trimmed === '/spotify' || trimmed === '/s') {
+        if (this.state.mode === 'mercury-code') return;
         this.update({ mode: 'spotify' });
         return;
       }
       if (trimmed === '/splash') {
+        if (this.state.mode === 'mercury-code') return;
         this.update({ mode: 'splash' });
         return;
       }
@@ -251,49 +1206,478 @@ export class CLIChannel extends BaseChannel {
         this.update({ viewMode: this.state.viewMode === 'balanced' ? 'detailed' : 'balanced' });
         return;
       }
+      // Show last task's full step log (triggered by Ctrl+D or /log)
+      if (trimmed === '/log') {
+        const steps = this.state.toolSteps.length > 0 ? this.state.toolSteps : (this.state.lastStepLog ?? []);
+        if (steps.length > 0) {
+          const elapsed = this.state.lastStepLogElapsed;
+          const suffix = this.state.toolSteps.length > 0 ? ' (active)' : '';
+          const elapsedSec = elapsed != null ? ` · ${Math.round(elapsed / 1000)}s` : '';
+          const lines = steps.map((s) => {
+            const icon = s.status === 'done' ? '✓' : s.status === 'error' ? '✗' : '→';
+            const time = s.elapsed != null ? ` (${s.elapsed.toFixed(1)}s)` : '';
+            const result = s.result ? ` · ${s.result}` : '';
+            return `${icon} ${s.label}${time}${result}`;
+          });
+          const header = `── Step log (${steps.filter((s) => s.status === 'done').length}/${steps.length} done${elapsedSec}${suffix}) ──`;
+          const msg: ChatMessage = {
+            id: `log-${Date.now().toString(36)}`,
+            role: 'system',
+            content: `${header}\n${lines.join('\n')}`,
+            timestamp: Date.now(),
+          };
+          this.trimAndSetMessages([...this.state.chatMessages, msg]);
+        } else {
+          const msg: ChatMessage = {
+            id: `log-${Date.now().toString(36)}`,
+            role: 'system',
+            content: 'No step history available yet. Run a task first, then press Ctrl+D.',
+            timestamp: Date.now(),
+          };
+          this.trimAndSetMessages([...this.state.chatMessages, msg]);
+        }
+        return;
+      }
+      // Clear stale tool steps from the previous task so the activity
+      // panel starts fresh for each new user message.
+      if (this.state.toolSteps.length > 0) {
+        this.update({ toolSteps: [] });
+        this.stepCount = 0;
+      }
       onInput(trimmed);
     };
 
+    // Reset mouse-report modes in case a previous run left the terminal
+    // stuck emitting mouse sequences (1000/1002/1003 + SGR 1006), and turn
+    // on bracketed paste so multi-line pastes arrive as one literal chunk
+    // (the stdin filter strips the ESC[200~/201~ markers; see
+    // MouseSequenceFilter). Turned off again by restoreTerminal() and the
+    // output wrapper's dispose().
+    try {
+      process.stdout.write(mouseTrackingSequences(false) + bracketedPasteSequences(true));
+    } catch {
+      // Not a TTY or write failed — nothing to reset.
+    }
+
+    this.tuiOutput?.dispose();
+    this.tuiOutput = new ResilientTuiOutput(process.stdout, process.stderr);
+    // Real terminal cursor on the input cell for IME (#41, #66); the
+    // vendored ink parks it after every frame. MERCURY_HW_CURSOR=0 opts out.
+    configureHardwareCursor();
+    this.warnIfInkUnpatched();
+    // Single mount. Every later UI update flows through useSyncExternalStore
+    // notifications — never inkInstance.rerender(), whose synchronous
+    // reconciler entry caused re-entrant commits and Yoga WASM corruption.
+    this.captureConsole();
     this.inkInstance = render(
       React.createElement(TuiApp, {
-        state: this.state,
+        channel: this,
         onInput: (text: string) => { this.inputHandler?.(text); },
         onPermissionResolve: (value: string | boolean) => {
-          if (this.permissionResolver) {
-            this.permissionResolver(value);
-            this.permissionResolver = null;
-          }
-          this.update({ permissionPrompt: null });
+          const shown = this.state.permissionPrompt;
+          if (shown?.id && this.resolvePrompt(shown.id, value)) return;
+          // No live resolver for what is on screen (stale state): clear it
+          // and surface whatever is queued next.
+          this.update({ permissionPrompt: this.promptQueue.shift() ?? null });
         },
         onExit: () => {
-          this.stopRawModeWatchdog();
-          this.inkInstance?.unmount();
-          this.inkInstance = null;
-          this.releaseRawMode();
-          this.exitHandler?.();
+          this.scheduleTuiExit();
         },
+        onInterrupt: () => { this.interruptTurn(); },
         spotifyClient: this.spotifyClient,
       }),
-      { exitOnCtrlC: false, patchConsole: false },
+      {
+        exitOnCtrlC: false,
+        patchConsole: false,
+        // Rewrite only the changed part of each line (ink 8). Replaces the
+        // diff-render hunk Mercury carried on ink 5.
+        incrementalRendering: true,
+        stdin: (this.stdinProxy ?? process.stdin) as unknown as NodeJS.ReadStream,
+        stdout: this.tuiOutput as unknown as NodeJS.WriteStream,
+      },
     );
-
-    this.startRawModeWatchdog();
+    // After the output wrapper had to shed writes, the screen no longer
+    // matches the renderer's baseline: clear() makes the next frame a full
+    // repaint, and the same-size 'resize' triggers it.
+    const output = this.tuiOutput;
+    const ink = this.inkInstance;
+    if (output) {
+      output.onResync = () => {
+        ink.clear();
+        output.emit('resize');
+      };
+    }
   }
 
-  async send(content: string, _targetId?: string, _elapsedMs?: number): Promise<void> {
+  /**
+   * While the TUI owns the terminal nothing may print behind the renderer's
+   * back. The renderer redraws only the rows that changed and assumes the
+   * screen holds exactly what it last wrote; a stray console line (a library
+   * warning, say) shifts everything down, the next erase misses rows, and the
+   * "Processing" block stays frozen in the transcript. Console output goes to
+   * the logger instead (silent unless --verbose) until teardown.
+   */
+  private captureConsole(): void {
+    /* eslint-disable no-console -- this is the console redirect itself */
+    if (this.restoreConsole) return;
+    const methods = ['log', 'info', 'warn', 'error', 'debug'] as const;
+    const original = methods.map((m) => [m, console[m]] as const);
+    for (const m of methods) {
+      console[m] = (...args: unknown[]) => {
+        const level = m === 'error' ? 'error' : m === 'warn' ? 'warn' : 'debug';
+        logger[level]({ console: m }, args.map((a) => (typeof a === 'string' ? a : inspect(a))).join(' '));
+      };
+    }
+    this.restoreConsole = () => {
+      for (const [m, fn] of original) console[m] = fn;
+    };
+    /* eslint-enable no-console */
+  }
+
+  private inkPatchWarned = false;
+
+  /**
+   * Stock ink ignores `<Static itemKey>`: the transcript silently stops
+   * rendering new messages after ~100 (and the Yoga crash class is live).
+   * The patch is applied by postinstall, which npm users never see fail —
+   * so say it once, in the transcript, with the one command that fixes it.
+   * Never aborts: a degraded TUI beats no TUI for a hotfix.
+   */
+  private warnIfInkUnpatched(): void {
+    if (this.inkPatchWarned) return;
+    this.inkPatchWarned = true;
+    try {
+      const status = detectInkPatch();
+      if (status.patched) return;
+      const text = inkPatchWarning(status);
+      logger.warn({ missing: status.missing, inkBuildDir: status.inkBuildDir }, 'ink patch not applied');
+      this.trimAndSetMessages([
+        ...this.state.chatMessages,
+        { id: `ink-patch-${Date.now().toString(36)}`, role: 'system', content: text, timestamp: Date.now() },
+      ]);
+    } catch (err) {
+      logger.debug({ err }, 'ink patch detection failed');
+    }
+  }
+
+  private stdinProxy: TtyStdinProxy | null = null;
+
+  /** Install the filtered-stdin proxy: Ink reads clean text; the mouse
+   *  filter (always active) delivers wheel events for transcript scrolling
+   *  and never lets raw sequences leak into the input. */
+  private installStdinProxy(): void {
+    if (this.stdinProxy) return;
+    const proxy = new TtyStdinProxy(process.stdin, new MouseSequenceFilter(
+      (ev) => this.dispatchMouseEvent(ev),
+      (s) => proxy.write(s),
+    ));
+    this.stdinProxy = proxy;
+  }
+
+  /** Hard cap on rendered transcript messages held in TUI state. */
+  private static readonly MAX_CHAT_MESSAGES = 2000;
+  /**
+   * Byte budget for the rendered transcript. Sized to retain a full
+   * Mercury Code session without scrolling history out of reach: even a
+   * 75-step coding task with file echoes stays ~2MB now that per-message
+   * content is capped and the AI SDK no longer clones raw bodies per step.
+   */
+  private static readonly MAX_CHAT_CHARS = 4 * 1024 * 1024;
+  /** Per-message cap: larger payloads are truncated with a notice. */
+  private static readonly MAX_MESSAGE_CHARS = 64 * 1024;
+
+  private trimAndSetMessages(messages: ChatMessage[], extra: Partial<TuiState> = {}): void {
+    // Transcript bounds: cap both message count and total retained chars.
+    // Dropping oldest keeps renders + heap flat while preserving the tail
+    // the user is actively reading. The WorkLedger/session stores preserve
+    // the full history elsewhere.
+    let trimmed = messages.length > CLIChannel.MAX_CHAT_MESSAGES
+      ? messages.slice(-CLIChannel.MAX_CHAT_MESSAGES)
+      : messages;
+    // Per-message display cap: one multi-MB payload (a whole-file echo from
+    // a coding task) must never dominate the transcript heap. Full text is
+    // preserved in the session store; the TUI keeps the head + a notice.
+    trimmed = trimmed.map((msg) => msg.content.length > CLIChannel.MAX_MESSAGE_CHARS
+      ? { ...msg, content: msg.content.slice(0, CLIChannel.MAX_MESSAGE_CHARS) + `\n\n[…display truncated at ${Math.round(CLIChannel.MAX_MESSAGE_CHARS / 1024)}KB — full content in session history]` }
+      : msg);
+    let total = 0;
+    for (const msg of trimmed) total += msg.content.length;
+    while (trimmed.length > 1 && total > CLIChannel.MAX_CHAT_CHARS) {
+      total -= trimmed[0].content.length;
+      trimmed = trimmed.slice(1);
+    }
+    if (trimmed.length !== messages.length) {
+      trimmed = trimmed.map((msg, i) => i === 0 && trimmed.length > 0
+        ? { ...msg, content: `[…earlier transcript trimmed to keep Mercury responsive…]\n${msg.content}` }
+        : msg);
+    }
+    this.update({ chatMessages: trimmed, ...extra });
+  }
+
+  /**
+   * Show a file-change preview in the transcript (Mercury Code / coding
+   * surfaces): a bounded, syntax-highlighted excerpt of what the agent just
+   * wrote or edited. Formatted by utils/file-preview.ts. Skips silently
+   * when the identical preview is already the last message (tool retries).
+   */
+  showFileChange(content: string): void {
+    // Mercury Code shows the change inside the tool's own transcript block.
+    if (!content || this.state.mode === 'mercury-code') return;
+    const last = this.state.chatMessages[this.state.chatMessages.length - 1];
+    if (last && last.role === 'system' && last.content === content) return;
+    const msg: ChatMessage = {
+      id: `file-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`,
+      role: 'system',
+      content,
+      timestamp: Date.now(),
+    };
+    this.trimAndSetMessages([...this.state.chatMessages, msg]);
+  }
+
+  async send(content: string, targetId?: string, _elapsedMs?: number): Promise<void> {
     const msg: ChatMessage = {
       id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
       role: 'agent',
       content,
       timestamp: Date.now(),
     };
-    this.update({
-      chatMessages: [...this.state.chatMessages, msg],
-      isThinking: false,
-    });
+    // Bot transcripts (targetId `bot:<id>`, BOTS-ARCHITECTURE §3.3): route to
+    // the bot's own thread — live if it is the one on screen, else stored.
+    if (targetId?.startsWith('bot:')) {
+      this.appendBotMessage(targetId.slice(4), msg);
+      return;
+    }
+    // Clear any lingering heartbeat message when we send a real response.
+    let chat = this.state.chatMessages;
+    if (this.heartbeatMsgId) {
+      chat = chat.filter((m) => m.id !== this.heartbeatMsgId);
+      this.heartbeatMsgId = null;
+    }
+    // While a bot chat is open, main-agent traffic must not leak into the
+    // bot's thread: non-bot sends land in the parked main transcript.
+    if (this.activeBotId) {
+      // Parked main traffic is bounded by the same transcript cap as the
+      // visible transcript (review I1 — daemon-in-bot-chat memory growth).
+      this.mainTranscript = [
+        ...(this.mainTranscript ?? []).slice(-CLIChannel.MAX_CHAT_MESSAGES + 1),
+        msg,
+      ];
+      return;
+    }
+    this.trimAndSetMessages([...chat, msg], { isThinking: false, liveActivity: null });
   }
 
-  sendCompletion(elapsedMs: number, stepCount: number, meta?: CompletionMeta): void {
+  /**
+   * Send or replace a heartbeat progress message. First call creates a new
+   * message; subsequent calls update it in place. This avoids stacking
+   * multiple "⏳ Working..." messages in the chat history.
+   */
+  sendHeartbeat(content: string): void {
+    if (this.heartbeatMsgId) {
+      // Update existing heartbeat message in place.
+      this.updateMessage(this.heartbeatMsgId, content, { role: 'system' });
+    } else {
+      // First heartbeat — create the message.
+      const id = `heartbeat-${Date.now().toString(36)}`;
+      this.heartbeatMsgId = id;
+      const msg: ChatMessage = { id, role: 'system', content, timestamp: Date.now() };
+      this.trimAndSetMessages([...this.state.chatMessages, msg], { isThinking: true });
+    }
+  }
+
+  /** Clear the heartbeat message (called when processing completes). */
+  clearHeartbeat(): void {
+    if (this.heartbeatMsgId) {
+      // All state changes must go through update() — direct mutation here
+      // previously bypassed render notification.
+      const id = this.heartbeatMsgId;
+      this.heartbeatMsgId = null;
+      this.update({
+        chatMessages: this.state.chatMessages.filter((m) => m.id !== id),
+        isThinking: false,
+      });
+    } else {
+      this.rerender();
+    }
+  }
+
+  /**
+   * Durable system notice (provider fallback errors, switch announcements).
+   * Unlike the heartbeat, it RENDERS in Mercury Code (heartbeat rows are
+   * filtered out of the coding transcript) and it is NOT removed when the
+   * turn ends — the user must still see, after the response, that a provider
+   * failed and the task continued on another route.
+   */
+  sendSystemNotice(content: string): void {
+    const msg: ChatMessage = {
+      id: `notice-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`,
+      role: 'system',
+      content,
+      timestamp: Date.now(),
+    };
+    this.trimAndSetMessages([...this.state.chatMessages, msg]);
+  }
+
+  /**
+   * Real-time tool event: called at TOOL EXECUTION START (from the AI SDK's
+   * onToolCallStart), not after the LLM step completes. The step shows as
+   * running with a live elapsed timer while the tool actually runs.
+   */
+  sendToolEvent(toolName: string, args: Record<string, any>, callId: string): Promise<void> {
+    // File-change attribution: remember the path this file-tool call targets.
+    if (FILE_CHANGE_TOOLS.has(toolName) && typeof args?.path === 'string' && args.path) {
+      this.pendingTurnFiles.set(callId, args.path);
+    }
+    const label = formatToolStep(toolName, args);
+    // Reuse an existing running step for the same callId (e.g. duplicate start).
+    const existing = this.state.toolSteps.find((s) => s.callId === callId && s.status === 'running');
+    if (existing) {
+      return this.sendToolFeedback(toolName, args);
+    }
+    const step: ToolStep = {
+      id: `step-${Date.now()}-${this.stepCount}`,
+      toolName,
+      label,
+      status: 'running',
+      startedAt: Date.now(),
+      callId,
+    };
+    this.stepCount += 1;
+    this.stepStartTime = Date.now();
+    if (this.showsToolTranscript(toolName)) {
+      this.toolArgs.set(step.id, args ?? {});
+      this.cutStreamSegment();
+    }
+    // Cap the live step list: long coding sessions can run hundreds of
+    // tool calls; an unbounded array both bloats renders and memory.
+    const MAX_LIVE_STEPS = 60;
+    this.update({
+      toolSteps: [...this.state.toolSteps, step].slice(-MAX_LIVE_STEPS),
+      isThinking: true,
+    });
+    return Promise.resolve();
+  }
+
+  /** Mercury Code records finished tool calls as transcript blocks. */
+  private showsToolTranscript(toolName: string): boolean {
+    return this.state.mode === 'mercury-code' && isTranscriptTool(toolName);
+  }
+
+  /**
+   * Close the agent message being streamed at its current text, and start a
+   * new (not yet visible) segment for whatever streams next. Called when a
+   * tool starts: everything the model said so far precedes the tool's block.
+   */
+  private cutStreamSegment(): void {
+    const seg = this.streamSegment;
+    if (!seg) return;
+    if (seg.started) {
+      const content = this.capStreamDisplay(seg.text.trimEnd(), 'response');
+      const closed = { id: seg.id, role: 'agent' as const, content, timestamp: Date.now(), streaming: false };
+      this.update({ chatMessages: this.state.chatMessages.map((m) => (m.id === seg.id ? closed : m)) });
+    }
+    this.streamSegment = { id: CLIChannel.newMessageId(), text: '', started: false, lastRender: 0 };
+  }
+
+  private static newMessageId(): string {
+    return Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+  }
+
+  /** Streaming display cap: the complete text still reaches the session store. */
+  private capStreamDisplay(text: string, what: 'stream' | 'response'): string {
+    if (text.length <= CLIChannel.MAX_MESSAGE_CHARS) return text;
+    const kb = Math.round(CLIChannel.MAX_MESSAGE_CHARS / 1024);
+    return text.slice(0, CLIChannel.MAX_MESSAGE_CHARS) + (what === 'stream'
+      ? `\n\n[…stream display truncated at ${kb}KB — full response in transcript]`
+      : `\n\n[…response display truncated at ${kb}KB]`);
+  }
+
+  /**
+   * Real-time tool completion: pairs with sendToolEvent via callId so the
+   * exact step that started flips to done — even when several tools ran.
+   */
+  completeToolEvent(toolName: string, result: unknown, isError: boolean, durationMs?: number, callId?: string): void {
+    const summary = formatToolResult(toolName, result);
+    let matched = false;
+    let matchedCallId: string | undefined;
+    let matchedStepId: string | undefined;
+    // Exact callId match first (parallel calls of the same tool), else the
+    // oldest running step of that tool.
+    const byCallId = callId != null && this.state.toolSteps.some((s) => s.status === 'running' && s.callId === callId);
+    const toolSteps = this.state.toolSteps.map((step) => {
+      if (!matched && step.status === 'running' && step.toolName === toolName && (!byCallId || step.callId === callId)) {
+        matched = true;
+        matchedCallId = step.callId;
+        matchedStepId = step.id;
+        return {
+          ...step,
+          status: (isError ? 'error' : 'done') as 'done' | 'error',
+          elapsed: durationMs != null ? durationMs / 1000 : (step.startedAt ? (Date.now() - step.startedAt) / 1000 : 0),
+          result: summary || undefined,
+        };
+      }
+      return step;
+    });
+    const args = matchedStepId ? this.toolArgs.get(matchedStepId) : undefined;
+    if (matchedStepId) this.toolArgs.delete(matchedStepId);
+    if (args && this.showsToolTranscript(toolName)) {
+      const { block, full } = buildToolBlockDetail({ toolName, args, result, isError, cwd: this.state.mercuryCode?.cwd });
+      if (full) {
+        this.expandableTools.push({ block, full });
+        if (this.expandableTools.length > CLIChannel.MAX_EXPANDABLE_TOOLS) this.expandableTools.shift();
+      }
+      this.appendToolBlock(block, { toolSteps });
+    } else {
+      this.update({ toolSteps });
+    }
+    // Attribution commit: a file-tool call that finished successfully actually
+    // mutated the tree; a failed one did not (errors surface in the step list).
+    if (matchedCallId) {
+      const path = this.pendingTurnFiles.get(matchedCallId);
+      this.pendingTurnFiles.delete(matchedCallId);
+      if (!isError && path) this.committedTurnFiles.add(path);
+    }
+  }
+
+  /**
+   * ctrl+o: print the full output of the most recent collapsed tool block.
+   * Scrollback can't be re-rendered, so the expansion is appended as a new
+   * block; pressing again walks back to the previous collapsed block.
+   */
+  expandLastToolOutput(): void {
+    const entry = this.expandableTools.pop();
+    if (!entry) {
+      this.sendSystemNotice('Nothing to expand — no collapsed tool output.');
+      return;
+    }
+    const { block, full } = entry;
+    this.appendToolBlock({
+      ...block,
+      summary: `Full output · ${full.lines.length} line${full.lines.length === 1 ? '' : 's'}`,
+      body: full,
+    }, {});
+  }
+
+  /** Append a finished tool call to the transcript (parked while a bot chat is open). */
+  private appendToolBlock(tool: ToolBlock, extra: Partial<TuiState>): void {
+    const msg: ChatMessage = {
+      id: `tool-${CLIChannel.newMessageId()}`,
+      role: 'system',
+      content: `${tool.title}${tool.target ? `(${tool.target})` : ''} — ${tool.summary}`,
+      timestamp: Date.now(),
+      tool,
+    };
+    if (this.activeBotId) {
+      this.mainTranscript = [...(this.mainTranscript ?? []).slice(-CLIChannel.MAX_CHAT_MESSAGES + 1), msg];
+      this.update(extra);
+      return;
+    }
+    this.trimAndSetMessages([...this.state.chatMessages, msg], extra);
+  }
+
+  sendCompletion(elapsedMs: number, stepCount: number, meta?: CompletionMeta, outcome?: 'complete' | 'steps-paused', verificationNote?: string): void {
+    this.clearHeartbeat();
+    this.clearLiveActivity();
     const secs = Math.floor(elapsedMs / 1000);
     const mins = Math.floor(secs / 60);
     const remSecs = secs % 60;
@@ -301,18 +1685,156 @@ export class CLIChannel extends BaseChannel {
     const stepsStr = stepCount > 0 ? `${stepCount} step${stepCount !== 1 ? 's' : ''}` : '';
     const parts = [stepsStr, timeStr].filter(Boolean).join(' · ');
 
+    // Completion contract: a paused task never wears the completion banner,
+    // and execute-mode work that changed nothing cannot claim "complete".
+    let content = outcome === 'steps-paused'
+      ? STEPS_PAUSED_BANNER
+      : `Task complete · ${parts}`;
+    // File changes are SMART-CONDITIONAL, never repo-wide git status:
+    // - The list attributes ONLY files the turn's own file-tool calls
+    //   (write/create/edit/delete) actually mutated — a general chat turn
+    //   (question, review, planning) touches no files, so no file section,
+    //   no diff rows, no "next steps" — the banner stays clean.
+    // - Pre-existing uncommitted changes in the repo are never attributed to
+    //   this task (the old behavior listed all of them on every banner).
+    const canVerifyChanges = this.state.mode === 'mercury-code'
+      && (this.state.programmingMode === 'execute' || this.state.programmingMode === 'auto')
+      && this.state.mercuryCode?.git.branch !== 'no-git';
+    const fileChanges = canVerifyChanges && this.committedTurnFiles.size > 0
+      ? this.collectMercuryCodeChanges([...this.committedTurnFiles])
+      : undefined;
+    if (content.startsWith('Task complete') && fileChanges && fileChanges.length === 0) {
+      content = NO_CHANGES_BANNER + (parts ? ` · ${parts}` : '');
+    }
+    // End-of-task summary — files first (the developer's top question), then
+    // what was done, then the next steps.
+    if (fileChanges && fileChanges.length > 0) {
+      const planSteps = (this.state.planProgress ?? []).filter((s) => s.status === 'done').map((s) => s.label);
+      const doneSteps = planSteps.length > 0
+        ? planSteps
+        : [...new Set(this.state.toolSteps.filter((s) => s.status !== 'error').map((s) => s.label))];
+      content += `\n\n${buildTaskSummary({
+        fileChanges,
+        doneSteps,
+        verified: !!verificationNote,
+        uncommitted: (this.state.mercuryCode?.git.dirty ?? 0) > 0,
+      })}`;
+      if (verificationNote) content += `\n✓ Verified: ${verificationNote}`;
+    }
+
     const msg: ChatMessage = {
       id: `done-${Date.now().toString(36)}`,
       role: 'system',
-      content: `━━━ Task complete (${parts}) ━━━`,
+      content,
       timestamp: Date.now(),
       completionMeta: meta,
+      // File paths are inlined at the top of the summary text (above);
+      // attaching them again here would duplicate the rows in the transcript.
+      fileChanges: undefined,
     };
-    this.update({
-      chatMessages: [...this.state.chatMessages, msg],
+    this.trimAndSetMessages([...this.state.chatMessages, msg], {
       isThinking: false,
       toolSteps: [],
+      planProgress: null,
+      lastStepLog: this.state.toolSteps.length > 0 ? [...this.state.toolSteps] : (this.state.lastStepLog ?? null),
+      lastStepLogElapsed: elapsedMs,
     });
+    // "Did you know?" perk: a natural pause (task just finished, nothing
+    // pending). The picker's internal min-gap keeps it to a rare treat, never
+    // repeated, always in the system's own voice. Mercury Code has its own
+    // rotating tip row — the chat notice only fires in chat surfaces.
+    if (this.state.mode !== 'mercury-code') {
+      const tip = nextTip('chat');
+      if (tip) this.sendSystemNotice(`💡 Did you know? ${tip.tip}`);
+    }
+  }
+
+  /**
+   * Live "thinking" preview: the tail of the model's reasoning while it
+   * works, so a silent generation phase is never dead air. Pass null to
+   * clear (when text starts streaming or the stream ends).
+   */
+  showThinkingPreview(preview: string | null): void {
+    if (this.state.thinkingPreview === preview) return;
+    this.update({ thinkingPreview: preview });
+  }
+
+  /**
+   * Replace the live plan checklist (from the update_plan tool). Validates
+   * defensively — malformed model output must never break the TUI.
+   */
+  setPlanProgress(steps: unknown): void {
+    if (!Array.isArray(steps)) return;
+    const normalized: PlanStep[] = [];
+    for (const raw of steps.slice(0, 20)) {
+      const label = typeof (raw as any)?.label === 'string' ? (raw as any).label.trim() : '';
+      const status = (raw as any)?.status;
+      if (!label || (status !== 'pending' && status !== 'active' && status !== 'done')) continue;
+      if (normalized.some((s) => s.label === label)) continue;
+      normalized.push({ label: label.slice(0, 120), status });
+    }
+    if (normalized.length === 0) return;
+    // Guard against two "active" steps from sloppy model updates.
+    const activeIdx = normalized.findIndex((s) => s.status === 'active');
+    normalized.forEach((s, i) => { if (s.status === 'active' && i !== activeIdx) s.status = 'pending'; });
+    this.update({ planProgress: normalized });
+  }
+
+  /**
+   * Stats for file changes, scoped to the given paths when provided (per-turn
+   * attribution) — repo-wide git status is never shown on the banner. Deleted
+   * or modified tracked files come from numstat; untracked files count as new.
+   */
+  private collectMercuryCodeChanges(paths?: string[]): FileChangeSummary[] {
+    const cwd = this.state.mercuryCode?.cwd;
+    if (!cwd) return [];
+    const scopeFilter = (filePath: string): boolean => !paths || paths.includes(filePath);
+
+    const changes = new Map<string, FileChangeSummary>();
+    try {
+      let output = '';
+      try {
+        output = execFileSync('git', ['diff', '--numstat', 'HEAD', '--', ...(paths ?? [])], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+      } catch {
+        output = execFileSync('git', ['diff', '--numstat', '--', ...(paths ?? [])], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+      }
+      for (const line of output.split('\n')) {
+        if (!line.trim()) continue;
+        const [addedRaw, removedRaw, ...pathParts] = line.split('\t');
+        const filePath = pathParts.join('\t');
+        if (!filePath || !scopeFilter(filePath)) continue;
+        changes.set(filePath, {
+          path: filePath,
+          added: addedRaw === '-' ? null : Number.parseInt(addedRaw, 10) || 0,
+          removed: removedRaw === '-' ? null : Number.parseInt(removedRaw, 10) || 0,
+        });
+      }
+    } catch {
+      if (!paths) return [];
+      // A scoped diff that fails still allows the untracked pass below.
+    }
+
+    try {
+      const untracked = execFileSync('git', ['ls-files', '--others', '--exclude-standard'], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+      for (const filePath of untracked.split('\n').filter(Boolean)) {
+        if (!scopeFilter(filePath)) continue;
+        if (changes.has(filePath)) continue;
+        try {
+          const data = fs.readFileSync(path.join(cwd, filePath));
+          const binary = data.includes(0);
+          const text = binary ? '' : data.toString('utf8');
+          const added = binary ? null : (text.length === 0 ? 0 : text.split('\n').length - (text.endsWith('\n') ? 1 : 0));
+          changes.set(filePath, { path: filePath, added, removed: binary ? null : 0 });
+        } catch {
+          changes.set(filePath, { path: filePath, added: null, removed: null });
+        }
+      }
+    } catch {
+      // A tracked diff is still useful when untracked-file discovery fails.
+      if (!paths) return [...changes.values()].sort((a, b) => a.path.localeCompare(b.path));
+    }
+
+    return [...changes.values()].sort((a, b) => a.path.localeCompare(b.path));
   }
 
   async sendFile(filePath: string, _targetId?: string): Promise<void> {
@@ -337,9 +1859,7 @@ export class CLIChannel extends BaseChannel {
       content,
       timestamp: Date.now(),
     };
-    this.update({
-      chatMessages: [...this.state.chatMessages, msg],
-    });
+    this.trimAndSetMessages([...this.state.chatMessages, msg]);
   }
 
   async sendToolFeedback(toolName: string, args: Record<string, any>): Promise<void> {
@@ -349,64 +1869,128 @@ export class CLIChannel extends BaseChannel {
       toolName,
       label,
       status: 'running',
+      startedAt: Date.now(),
     };
     this.stepCount += 1;
     this.stepStartTime = Date.now();
+    logger.debug({ tool: toolName, args }, 'voice.tui step start');
+    // Cap the live step list: long coding sessions can run hundreds of
+    // tool calls; an unbounded array both bloats renders and memory.
+    const MAX_LIVE_STEPS = 60;
+    const nextSteps = [...this.state.toolSteps, step].slice(-MAX_LIVE_STEPS);
     this.update({
-      toolSteps: [...this.state.toolSteps, step],
+      toolSteps: nextSteps,
       isThinking: true,
     });
   }
 
   sendStepDone(toolName: string, result: unknown): void {
+    const summary = formatToolResult(toolName, result);
     const toolSteps = this.state.toolSteps.map((step) => {
       if (step.status === 'running') {
         const elapsed = this.stepStartTime ? (Date.now() - this.stepStartTime) / 1000 : 0;
-        const summary = formatToolResult(toolName, result);
         return { ...step, status: 'done' as const, elapsed, result: summary || undefined };
       }
       return step;
     });
+    logger.debug({ tool: toolName, summary }, 'voice.tui step done');
     this.update({ toolSteps });
   }
 
   async stream(content: AsyncIterable<string>, _targetId?: string): Promise<string> {
-    const msgId = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+    // While a bot chat is open, main-agent streaming must NEVER render into
+    // the bot's transcript (review D1): consume silently and park the full
+    // reply into the parked main transcript instead.
+    if (this.activeBotId) {
+      let parked = '';
+      for await (const chunk of content) parked += chunk;
+      this.mainTranscript = [
+        ...(this.mainTranscript ?? []).slice(-CLIChannel.MAX_CHAT_MESSAGES + 1),
+        { id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6), role: 'agent', content: parked, timestamp: Date.now() },
+      ];
+      return parked;
+    }
+    // The reply streams into a SEGMENT: one agent message. In Mercury Code a
+    // tool call starting mid-stream closes the segment (cutStreamSegment) and
+    // later text opens a new one, so text and tool blocks interleave in the
+    // order they happened. `full` stays the whole reply for the caller.
+    const segment = { id: CLIChannel.newMessageId(), text: '', started: false, lastRender: 0 };
+    this.streamSegment = segment;
     let full = '';
-    let lastRender = 0;
 
-    const initialMsg: ChatMessage = {
-      id: msgId,
-      role: 'agent',
-      content: '',
-      timestamp: Date.now(),
-      streaming: true,
+    this.clearHeartbeat();
+    this.setLiveActivity('Streaming response', 'generating answer');
+
+    const render = (seg: NonNullable<CLIChannel['streamSegment']>, now: number) => {
+      // Streaming display cap: an unbounded string re-rendered every 60ms
+      // makes each frame allocate a fresh multi-MB message object; a long
+      // code-mode task can then retain gigabytes. The complete text still
+      // reaches the session store via the final channel.send().
+      const streamedMessage = { id: seg.id, role: 'agent' as const, content: this.capStreamDisplay(seg.text, 'stream'), timestamp: now, streaming: true };
+      this.update({
+        chatMessages: seg.started
+          ? this.state.chatMessages.map((message) => message.id === seg.id ? streamedMessage : message)
+          : [...this.state.chatMessages, streamedMessage],
+        isThinking: true,
+      });
+      seg.started = true;
+      seg.lastRender = now;
     };
 
-    this.update({
-      chatMessages: [...this.state.chatMessages, initialMsg],
-      isThinking: true,
-    });
-
-    for await (const chunk of content) {
-      full += chunk;
-      const now = Date.now();
-      if (now - lastRender >= 16) {
-        this.update({
-          chatMessages: this.state.chatMessages.map((m) =>
-            m.id === msgId ? { ...m, content: full, streaming: true } : m,
-          ),
-        });
-        lastRender = now;
+    try {
+      for await (const chunk of content) {
+        full += chunk;
+        const seg = this.streamSegment ?? segment;
+        // A segment opens on its first visible text: step separators ("\n\n")
+        // arriving right after a tool call must not open an empty message.
+        seg.text = seg.started ? seg.text + chunk : (seg.text + chunk).replace(/^\s*\n/, '');
+        if (!seg.started && seg.text.trim() === '') continue;
+        const now = Date.now();
+        // Throttle streaming re-renders to ~60ms. At 16ms the live Yoga
+        // tree was being recomputed on nearly every token, which — combined
+        // with markdown re-parsing of the full accumulated buffer each
+        // render — caused the visible "vibration"/flicker during generation.
+        // 60ms is fast enough to feel live while keeping each frame's layout
+        // stable.
+        if (!seg.started || now - seg.lastRender >= 60) render(seg, now);
       }
+    } catch (err) {
+      const seg = this.streamSegment ?? segment;
+      this.streamSegment = null;
+      logger.warn({ err, partialLen: full.length }, 'CLI stream interrupted, saving partial text');
+      this.clearLiveActivity();
+      if (seg.text.trim().length > 0) {
+        const interruptedMessage = { id: seg.id, role: 'agent' as const, content: seg.text + '\n\n⚠ Stream was interrupted. Partial response shown above.', timestamp: Date.now(), streaming: false };
+        this.update({
+          chatMessages: seg.started
+            ? this.state.chatMessages.map((message) => message.id === seg.id ? interruptedMessage : message)
+            : [...this.state.chatMessages, interruptedMessage],
+          isThinking: false,
+        });
+      } else {
+        this.update({
+          chatMessages: [...this.state.chatMessages, { id: seg.id, role: 'agent', content: full.length > 0 ? '⚠ Stream was interrupted. Partial response shown above.' : '⚠ Stream was interrupted before any response was generated.', timestamp: Date.now(), streaming: false }],
+          isThinking: false,
+        });
+      }
+      return full;
     }
 
-    this.update({
-      chatMessages: this.state.chatMessages.map((m) =>
-        m.id === msgId ? { ...m, content: full, streaming: false } : m,
-      ),
-      isThinking: false,
-    });
+    const seg = this.streamSegment ?? segment;
+    this.streamSegment = null;
+    if (seg.text.trim().length > 0) {
+      const finalMessage = { id: seg.id, role: 'agent' as const, content: this.capStreamDisplay(seg.text, 'response'), timestamp: Date.now(), streaming: false };
+      this.trimAndSetMessages(
+        seg.started
+          ? this.state.chatMessages.map((message) => message.id === seg.id ? finalMessage : message)
+          : [...this.state.chatMessages, finalMessage],
+        { isThinking: false, liveActivity: null },
+      );
+    } else {
+      // Nothing visible arrived in this segment (the model returned nothing,
+      // or the reply ended on a tool call): render no empty message.
+      this.update({ isThinking: false, liveActivity: null });
+    }
 
     return full;
   }
@@ -436,7 +2020,7 @@ export class CLIChannel extends BaseChannel {
       if (this.menuDepth === 0) {
         this.menuAbortController = null;
       }
-      this.ensureRawMode();
+      this.restoreRawModeAfterMenu();
     }
   }
 
@@ -446,92 +2030,156 @@ export class CLIChannel extends BaseChannel {
     }
   }
 
-  async prompt(question: string): Promise<string> {
-    return new Promise((resolve) => {
-      this.permissionResolver = (val) => resolve(String(val));
-      this.update({
-        permissionPrompt: {
-          type: 'ask',
-          message: question,
-          resolve: () => {},
-        },
-      });
+  /**
+   * Register a prompt: its resolver lives in the map under a fresh id, and
+   * it is shown now or queued behind the prompt already on screen. The
+   * returned promise settles exactly once, whenever ITS prompt is answered.
+   */
+  private enqueuePrompt<T>(
+    prompt: Omit<PermissionPromptState, 'id' | 'resolve'>,
+    map: (value: string | boolean) => T,
+  ): Promise<T> {
+    return new Promise<T>((resolve) => {
+      const id = `prompt-${++this.promptSeq}`;
+      this.promptResolvers.set(id, (value) => resolve(map(value)));
+      const entry: PermissionPromptState = { ...prompt, id, resolve: (value) => { this.resolvePrompt(id, value); } };
+      if (this.state.permissionPrompt) {
+        this.promptQueue.push(entry);
+      } else {
+        this.update({ permissionPrompt: entry });
+      }
     });
   }
 
-  async askPermissionMode(): Promise<PermissionMode> {
-    if (!process.stdout.isTTY) return 'ask-me';
+  /**
+   * Settle the prompt with this id. Returns false when no such prompt is
+   * pending (already answered, or unknown). If it was the one on screen,
+   * the next queued prompt is shown; if it was queued, it is removed.
+   */
+  resolvePrompt(id: string, value: string | boolean): boolean {
+    const resolver = this.promptResolvers.get(id);
+    if (!resolver) return false;
+    this.promptResolvers.delete(id);
+    if (this.state.permissionPrompt?.id === id) {
+      this.update({ permissionPrompt: this.promptQueue.shift() ?? null });
+    } else {
+      this.promptQueue = this.promptQueue.filter((p) => p.id !== id);
+    }
+    resolver(value);
+    return true;
+  }
 
-    return new Promise((resolve) => {
-      this.permissionResolver = (val) => resolve(val as PermissionMode);
-      this.update({
-        permissionPrompt: {
-          type: 'mode',
-          message: 'Choose how Mercury handles risky actions this session.',
-          options: [
-            { value: 'allow-all', label: 'Allow All — auto-approve everything (scopes, commands, loop continuation)' },
-            { value: 'ask-me', label: 'Ask Me — confirm before file writes, shell commands, and scope changes' },
-          ],
-          resolve: () => {},
-        },
-      });
-    });
+  /** Ids of every unanswered prompt: the visible one first, then the queue. */
+  pendingPromptIds(): string[] {
+    const shown = this.state.permissionPrompt?.id;
+    const queued = this.promptQueue.map((p) => p.id).filter((id): id is string => typeof id === 'string');
+    return shown ? [shown, ...queued] : queued;
+  }
+
+  async prompt(question: string): Promise<string> {
+    return this.enqueuePrompt({ type: 'ask', message: question }, String);
+  }
+
+  /**
+   * The Ask Me / Allow All prompt for this session. `current` (the saved
+   * mode) is listed first, so Enter keeps it and ↓ Enter switches.
+   */
+  async askPermissionMode(current?: PermissionMode): Promise<PermissionMode> {
+    if (!process.stdout.isTTY) return current ?? 'ask-me';
+    const options = [
+      { value: 'allow-all', label: 'Allow All — auto-approve everything (scopes, commands, loop continuation)' },
+      { value: 'ask-me', label: 'Ask Me — confirm before file writes, shell commands, and scope changes' },
+    ];
+    if (current === 'ask-me') options.reverse();
+    return this.enqueuePrompt({
+      type: 'mode',
+      message: current
+        ? `Permission mode for this session? (now: ${current === 'allow-all' ? 'Allow All' : 'Ask Me'} — Enter keeps it)`
+        : 'Choose how Mercury handles risky actions this session.',
+      options,
+    }, (val) => val as PermissionMode);
   }
 
   async askPermission(prompt: string): Promise<string> {
-    return new Promise((resolve) => {
-      this.permissionResolver = (val) => resolve(String(val));
-      this.update({
-        permissionPrompt: {
-          type: 'ask',
-          message: prompt,
-          options: [
-            { value: 'yes', label: 'Yes — approve once' },
-            { value: 'always', label: 'Always — remember this permission' },
-            { value: 'no', label: 'No — deny' },
-          ],
-          resolve: () => {},
-        },
-      });
-    });
+    return this.enqueuePrompt({
+      type: 'ask',
+      message: prompt,
+      options: [
+        { value: 'yes', label: 'Yes — approve once' },
+        { value: 'always', label: 'Always — remember this permission' },
+        { value: 'no', label: 'No — deny' },
+      ],
+    }, String);
   }
 
   async presentChoicePrompt(question: string, options: Array<{ value: string; label: string }>): Promise<string> {
-    return new Promise((resolve) => {
-      this.permissionResolver = (val) => resolve(String(val));
-      this.update({
-        permissionPrompt: {
-          type: 'mode',
-          message: question,
-          options,
-          resolve: () => {},
-        },
-      });
-    });
+    return this.enqueuePrompt({ type: 'choice', message: question, options }, String);
+  }
+
+  /**
+   * Resolve a pending choice prompt with a default value (timeout / dismissal).
+   * Time-weighted prompts use this so an unanswered question is answered FOR
+   * the user and the box disappears instead of lingering forever. With
+   * `id` the exact prompt is settled; without it, the OLDEST unanswered
+   * choice prompt (the one whose timer fired first) — visible or queued.
+   */
+  resolveChoicePromptWithDefault(value: string, id?: string): void {
+    if (id) {
+      this.resolvePrompt(id, value);
+      return;
+    }
+    const target = [this.state.permissionPrompt, ...this.promptQueue]
+      .find((p): p is PermissionPromptState => Boolean(p && p.type === 'choice' && p.id && this.promptResolvers.has(p.id)));
+    if (target?.id) this.resolvePrompt(target.id, value);
   }
 
   async askToContinue(question: string, _targetId?: string): Promise<boolean> {
-    return new Promise((resolve) => {
-      this.permissionResolver = (val) => {
-        const normalized = typeof val === 'string' ? val.trim().toLowerCase() : val;
-        resolve(normalized === true || normalized === 'yes' || normalized === 'y');
-      };
-      this.update({
-        permissionPrompt: {
-          type: 'continue',
-          message: question,
-          options: [
-            { value: 'yes', label: 'Yes — continue' },
-            { value: 'no', label: 'No — stop' },
-          ],
-          resolve: () => {},
-        },
-      });
+    return this.enqueuePrompt({
+      type: 'continue',
+      message: question,
+      options: [
+        { value: 'yes', label: 'Yes — continue' },
+        { value: 'no', label: 'No — stop' },
+      ],
+    }, (val) => {
+      const normalized = typeof val === 'string' ? val.trim().toLowerCase() : val;
+      return normalized === true || normalized === 'yes' || normalized === 'y';
     });
   }
 
+  /**
+   * Dismiss every pending prompt. Each promise still settles — with the
+   * prompt's "declined" answer — so no caller hangs on a box that is gone.
+   */
   clearPermissionPrompt(): void {
+    for (const id of this.pendingPromptIds()) {
+      const entry = this.state.permissionPrompt?.id === id ? this.state.permissionPrompt : this.promptQueue.find((p) => p.id === id);
+      this.resolvePrompt(id, CLIChannel.dismissedAnswer(entry));
+    }
+    this.promptQueue = [];
     this.update({ permissionPrompt: null });
+  }
+
+  /** The answer a dismissed prompt reports (mirrors the TUI's Esc handling). */
+  private static dismissedAnswer(prompt: PermissionPromptState | null | undefined): string | boolean {
+    switch (prompt?.type) {
+      case 'mode': return 'ask-me';
+      case 'choice': return '';
+      case 'continue': return false;
+      default: return prompt?.options ? 'no' : '';
+    }
+  }
+
+  /** Status-bar note for a desktop plugin's activity (Optimus listening / working); null clears it. */
+  /** The permission mode shown on the bottom bar. */
+  setPermissionModeStatus(mode: PermissionMode): void {
+    if (this.state.permissionMode === mode) return;
+    this.update({ permissionMode: mode });
+  }
+
+  setDesktopActivity(text: string | null): void {
+    if (this.state.desktopActivity === text) return;
+    this.update({ desktopActivity: text });
   }
 
   setSkills(skills: SkillInfo[]): void {
@@ -542,8 +2190,21 @@ export class CLIChannel extends BaseChannel {
     this.update({ provider: { name, model, badge } });
   }
 
+  setCurrentSession(session: CurrentSessionInfo | null): void {
+    this.update({ currentSession: session });
+  }
+
   setTokenInfo(used: number, budget: number, percentage: number): void {
     this.update({ tokenInfo: { used, budget, percentage } });
+  }
+
+  setSaverMode(state: import('../core/saver-mode.js').SaverModeState, savedToday: number, savedLifetime: number): void {
+    if (state === 'off' && savedToday === 0 && savedLifetime === 0) {
+      // Keep null to preserve zero-impact UI when saver has never been touched.
+      this.update({ saverInfo: null });
+      return;
+    }
+    this.update({ saverInfo: { state, savedToday, savedLifetime } });
   }
 
   setWebInfo(enabled: boolean, port: number): void {
@@ -552,6 +2213,107 @@ export class CLIChannel extends BaseChannel {
 
   setSubAgents(agents: SubAgentInfo[]): void {
     this.update({ subAgents: agents });
+  }
+
+  /**
+   * Push a real-time activity phase to the live feedback block. Called by the
+   * agent at execution time (provider call, tool start, streaming) — the TUI
+   * shows what is happening now, not just post-step results.
+   */
+  setLiveActivity(phase: string, detail?: string): void {
+    const existing = this.state.liveActivity;
+    this.update({
+      liveActivity: {
+        phase,
+        detail,
+        stepsDone: existing?.stepsDone ?? 0,
+        startedAt: existing?.phase === phase && existing?.detail === detail
+          ? existing.startedAt
+          : Date.now(),
+      },
+      isThinking: true,
+    });
+  }
+
+  /** Advance the live step counter (called when an AI SDK step completes). */
+  bumpLiveActivitySteps(): void {
+    const existing = this.state.liveActivity;
+    if (existing) this.update({ liveActivity: { ...existing, stepsDone: existing.stepsDone + 1 } });
+  }
+
+  /**
+   * Per-bot real-time activity: what a bot is doing RIGHT NOW, rendered as a
+   * live region inside its open thread (same spinner block the main chat
+   * gets). Events arrive from the bot activity bus (BotManager.onBotActivity).
+   * Mapping: turn-start → "Working on: <task>"; step/tool labels follow the
+   * actual work; tool finishes keep the last running label (less churn);
+   * 'thinking' carries the bot's live reasoning/reply tails and lands in
+   * botStreamTails so the open thread renders what it is thinking;
+   * turn-end clears the region (and the tails).
+   */
+  setBotLiveActivity(botId: string, ev: { kind: 'turn-start' | 'step' | 'tool' | 'turn-end' | 'thinking'; label: string; detail?: string; status?: string; reasoningTail?: string; textTail?: string }): void {
+    const map = { ...this.state.botLiveActivity };
+    if (ev.kind === 'turn-end') {
+      if (!map[botId]) {
+        const tails = { ...this.state.botStreamTails };
+        if (!tails[botId]) return;
+        delete tails[botId];
+        this.update({ botStreamTails: tails });
+        return;
+      }
+      delete map[botId];
+      const tails = { ...this.state.botStreamTails };
+      delete tails[botId];
+      this.update({ botLiveActivity: map, botStreamTails: tails });
+      return;
+    }
+    if (ev.kind === 'thinking') {
+      // Skip when the tail hasn't changed — ink re-renders every update and
+      // the streaming cadence (300ms) must not paint identical frames.
+      const tails = { ...this.state.botStreamTails };
+      const prev = tails[botId];
+      if (prev && prev.reasoning === (ev.reasoningTail ?? '') && prev.text === (ev.textTail ?? '')) return;
+      tails[botId] = { reasoning: ev.reasoningTail ?? '', text: ev.textTail ?? '' };
+      this.update({ botStreamTails: tails });
+      return;
+    }
+    // A finished tool keeps its label until the next event — the region
+    // should not flicker to an intermediate state and back.
+    if (ev.kind === 'tool' && ev.status === 'done' && map[botId]) return;
+    const existing = map[botId];
+    map[botId] = {
+      phase: ev.kind === 'turn-start' ? 'Working' : ev.label,
+      detail: ev.kind === 'turn-start'
+        ? ev.label.slice(0, 80)
+        : ev.status === 'error'
+          ? `✗ ${ev.label}${ev.detail ? ` — ${ev.detail}` : ''}`
+          : undefined,
+      stepsDone: ev.kind === 'step' ? (existing?.stepsDone ?? 0) + 1 : (existing?.stepsDone ?? 0),
+      startedAt: existing?.startedAt ?? Date.now(),
+    };
+    // A fresh turn starts thinking anew — any leftover tail (missed turn-end,
+    // restart) must not bleed into the new turn's preview.
+    const staleTail = ev.kind === 'turn-start' && this.state.botStreamTails[botId];
+    if (staleTail) {
+      const tails = { ...this.state.botStreamTails };
+      delete tails[botId];
+      this.update({ botLiveActivity: map, botStreamTails: tails });
+      return;
+    }
+    this.update({ botLiveActivity: map });
+  }
+
+  /** Clear the live activity block (task finished or idle). */
+  clearLiveActivity(): void {
+    // Turn-end cleanup: clear the phase AND the thinking state together.
+    // In plain chat the final pushLiveActivity ('Finalizing response') sets
+    // isThinking, and no channel.send/sendCompletion follows (the response
+    // was already streamed; no banner for simple turns) — so the spinner
+    // survived the turn and rendered "Processing" forever while the agent
+    // was idle.
+    if (this.state.liveActivity || this.state.isThinking) {
+      this.update({ liveActivity: null, isThinking: false });
+    }
   }
 
   updateBackgroundTasks(tasks: BackgroundTaskInfo[]): void {
@@ -566,12 +2328,222 @@ export class CLIChannel extends BaseChannel {
     this.update({ mode });
   }
 
+  /** Read-only snapshot of the current TUI state (for cross-module checks). */
+  getTuiState(): TuiState {
+    return this.state;
+  }
+
+  // ─── Mercury Code (`/code`) full-screen mode ─────────────────────────────
+
+  /**
+   * Enable or disable SGR mouse tracking. When enabled, the filtered stdin
+   * stream forwards parsed mouse events to `handler`; wheel scroll drives
+   * transcript scrollback in Mercury Code.
+   */
+  setMouseEnabled(enabled: boolean, handler?: (ev: MouseEvent) => void): void {
+    this.mouseEnabled = enabled;
+    this.mouseHandler = enabled ? (handler ?? null) : null;
+    try {
+      process.stdout.write(mouseTrackingSequences(enabled));
+    } catch {
+      // Not a TTY or write failed — mouse stays off.
+      this.mouseEnabled = false;
+      this.mouseHandler = null;
+    }
+    this.update({ mercuryCode: this.state.mercuryCode ? { ...this.state.mercuryCode, mouse: enabled } : null });
+  }
+
+  isMouseEnabled(): boolean {
+    return this.mouseEnabled;
+  }
+
+  /** Internal: called by the filtered stdin stream on a parsed mouse event. */
+  private dispatchMouseEvent(ev: MouseEvent): void {
+    if (!this.mouseEnabled) return;
+    this.mouseHandler?.(ev);
+  }
+
+  /**
+   * Enter Mercury Code: full-screen coding TUI bound to `dir`.
+   * Switches to plan mode by default (analyze-first). The transcript prints
+   * into the terminal's native scrollback (<Static>), so scrolling and
+   * drag-selection are terminal-native: mouse reporting stays OFF — it would
+   * capture wheel/drag events and break both.
+   */
+  enterMercuryCode(dir: string, version: string): { ok: boolean; message: string } {
+    const target = path.resolve(dir.replace(/^~(?=$|\/|\\)/, homedir()));
+    if (!fs.existsSync(target)) return { ok: false, message: `Directory does not exist: ${target}` };
+    if (!fs.statSync(target).isDirectory()) return { ok: false, message: `Not a directory: ${target}` };
+
+    // A bot chat must not survive a mode switch: a stranded activeBotId would
+    // park every later send into the hidden main transcript (invisible
+    // responses) and wrap nothing visibly. The typed /code path already
+    // exits the bot chat first — this covers every OTHER entry (the
+    // automatic coding hand-off, Esc flows).
+    if (this.activeBotId) this.exitBotChat();
+
+    const dirName = path.basename(target) || target;
+    this.exitEscArmed = false;
+    this.update({
+      mode: 'mercury-code',
+      mercuryCode: {
+        cwd: target,
+        dirName,
+        // Filled in asynchronously below: a blocking git read here stalled
+        // the first frame. An EMPTY branch means "not read yet" (the status
+        // bar hides the segment); 'no-git' is the settled "not a repo"
+        // answer, which also disables completion-time change stats.
+        git: { branch: '', ahead: 0, behind: 0, dirty: 0 },
+        mouse: false,
+        scrollOffset: 0,
+        exitConfirm: false,
+      },
+      projectContext: target,
+      version,
+      // AUTO is the default Mercury Code flow: plan and build in one pass,
+      // confirming with the user only for large/consequential changes.
+      programmingMode: 'auto',
+      exitEscArmed: false,
+    });
+    try {
+      process.stdout.write('\x1b[2J\x1b[H');
+    } catch { /* ignore */ }
+    // Graceful one-time notices (never blocking, never repeated): the
+    // /whatsnew hint when this boot is a fresh install or an update, and a
+    // throttled background update check. Entirely async and unref'd — a slow
+    // npm look-up must never stall the TUI.
+    void this.announceVersionNotices(version);
+    // Branch / ahead / behind / dirty for the status bar — off the hot path.
+    void this.refreshMercuryCodeGit();
+    return { ok: true, message: `Mercury Code active in ${dirName}` };
+  }
+
+  /**
+   * One-time, once-per-version notices on Mercury Code entry. Tests skip the
+   * network check (VITEST); the hint is persisted in update-state.json so it
+   * cannot repeat for the same version even across restarts.
+   */
+  private async announceVersionNotices(version: string): Promise<void> {
+    if (process.env.VITEST || process.env.MERCURY_NO_UPDATE_CHECK === '1') return;
+    try {
+      const { shouldShowWhatsNewHint, markWhatsNewHintShown, maybeCheckForUpdate } = await this.updateNoticeApi();
+      if (shouldShowWhatsNewHint(version)) {
+        markWhatsNewHintShown(version);
+        this.sendSystemNotice(`☿ Mercury v${version} is here. Type \`/whatsnew\` to see what's new.`);
+      }
+      const latest = await maybeCheckForUpdate(version);
+      if (latest) {
+        this.setUpdateAvailable(latest);
+        this.sendSystemNotice(`⬆ Update available: v${version} → v${latest}. Run \`mercury upgrade\` in your terminal when you're ready — or ignore this version with \`/update ignore\`.`);
+      }
+    } catch (err) {
+      logger.debug({ err }, 'announceVersionNotices failed (non-fatal)');
+    }
+  }
+
+  /** Latest version the user hasn't ignored (for /update ignore even when the check is throttled). */
+  setUpdateAvailable(latestVersion: string | null): void {
+    this.update({ updateAvailable: latestVersion });
+  }
+
+  /**
+   * Push the Mercury Code status-verb pool (agent's one-shot LLM refinement,
+   * or the keyword fallback when that failed). Empty lists are ignored — they
+   * would fall through to the static label anyway.
+   */
+  setStatusVerbs(verbs: string[]): void {
+    if (!Array.isArray(verbs) || verbs.length === 0) return;
+    this.update({ statusVerbs: verbs });
+  }
+
+  exitMercuryCode(): void {
+    if (this.state.mercuryCode) {
+      this.setMouseEnabled(false);
+    }
+    this.exitEscArmed = false;
+    this.update({
+      mode: 'chat',
+      mercuryCode: null,
+      programmingMode: 'off',
+      projectContext: null,
+      planProgress: null,
+      exitEscArmed: false,
+      statusVerbs: null,
+    });
+    try {
+      process.stdout.write('\x1b[2J\x1b[H');
+    } catch { /* ignore */ }
+  }
+
+  /** Toggle the exit confirmation inline in Mercury Code. */
+  setMercuryCodeExitConfirm(show: boolean): void {
+    if (!this.state.mercuryCode) return;
+    this.update({ mercuryCode: { ...this.state.mercuryCode, exitConfirm: show } });
+  }
+
+  /** Adjust transcript scrollback (distance from bottom, clamped). */
+  scrollMercuryCode(deltaTowardTop: number): void {
+    const mc = this.state.mercuryCode;
+    if (!mc) return;
+    const next = Math.max(0, mc.scrollOffset + deltaTowardTop);
+    if (next !== mc.scrollOffset) {
+      this.update({ mercuryCode: { ...mc, scrollOffset: next } });
+    }
+  }
+
+  /** Snap transcript to live (bottom). */
+  scrollMercuryCodeToLive(): void {
+    const mc = this.state.mercuryCode;
+    if (!mc || mc.scrollOffset === 0) return;
+    this.update({ mercuryCode: { ...mc, scrollOffset: 0 } });
+  }
+
+  /** A git header refresh in flight (coalesces overlapping requests). */
+  private gitRefreshInFlight: Promise<void> | null = null;
+
+  /**
+   * Refresh the cached git header state from disk — asynchronously. The
+   * old `execSync` pair blocked the event loop for the whole `git status`
+   * (hundreds of ms on a large tree), freezing streaming and input every
+   * time Mercury Code entered or `/mc git-refresh` ran.
+   */
+  refreshMercuryCodeGit(): Promise<void> {
+    if (this.gitRefreshInFlight) return this.gitRefreshInFlight;
+    const mc = this.state.mercuryCode;
+    if (!mc) return Promise.resolve();
+    const cwd = mc.cwd;
+    this.gitRefreshInFlight = this.readGitStateQuick(cwd)
+      .then((git) => {
+        const current = this.state.mercuryCode;
+        // The session may have left Mercury Code (or moved) meanwhile.
+        if (!current || current.cwd !== cwd) return;
+        if (
+          git.branch !== current.git.branch ||
+          git.ahead !== current.git.ahead ||
+          git.behind !== current.git.behind ||
+          git.dirty !== current.git.dirty
+        ) {
+          this.update({ mercuryCode: { ...current, git } });
+        }
+      })
+      .catch((err) => logger.debug({ err }, 'git header refresh failed'))
+      .finally(() => { this.gitRefreshInFlight = null; });
+    return this.gitRefreshInFlight;
+  }
+
+  /** Header-sized git state (branch / ahead / behind / dirty count) via async execFile. */
+  private async readGitStateQuick(rootPath: string): Promise<MercuryCodeGitState> {
+    const state = await this.readGitStateAsync(rootPath);
+    if (state.branch === 'not-a-git-repo') return { branch: 'no-git', ahead: 0, behind: 0, dirty: 0 };
+    return { branch: state.branch, ahead: state.ahead, behind: state.behind, dirty: state.files.length };
+  }
+
   setProgrammingStatus(mode: import('../core/programming-mode.js').ProgrammingModeState, projectContext: string | null): void {
     this.update({ programmingMode: mode, projectContext });
   }
 
   openWorkspace(rawPath: string): { ok: boolean; message: string } {
-    const target = path.resolve(rawPath.replace(/^~(?=$|\/)/, process.env.HOME || '~'));
+    const target = path.resolve(rawPath.replace(/^~(?=$|\/|\\)/, homedir()));
     if (!fs.existsSync(target)) return { ok: false, message: `Workspace path does not exist: ${target}` };
     if (!fs.statSync(target).isDirectory()) return { ok: false, message: `Workspace path is not a directory: ${target}` };
 
@@ -585,6 +2557,152 @@ export class CLIChannel extends BaseChannel {
     const selectedPath = this.state.workspace.selectedPath ?? undefined;
     const workspace = this.buildWorkspaceState(this.state.workspace.rootPath, selectedPath, 'Workspace refreshed');
     this.update({ workspace });
+  }
+
+  /**
+   * Register provider callbacks the poller will sample on every tick.
+   * Called once at boot from index.ts. Each callback should be cheap
+   * (just a getter on already-in-memory state).
+   */
+  setStatusProviders(providers: typeof this.statusProviders): void {
+    this.statusProviders = { ...this.statusProviders, ...providers };
+  }
+
+  /**
+   * Start the 2s status poller. Refreshes:
+   *  - token budget bar (every tick)
+   *  - saver mode state (every tick)
+   *  - sub-agent counts (every tick)
+   *  - background task counts (every tick)
+   *  - workspace git state (every tick, async, only if workspace is active)
+   *
+   * Each section diff-checks its values before calling update() so
+   * idle ticks cause zero React re-renders.
+   */
+  startStatusPoller(intervalMs = 2000): void {
+    this.stopStatusPoller();
+    this.statusPoller = setInterval(() => { void this.statusPollerTick(); }, intervalMs);
+    // Fire once immediately so the first paint is fresh.
+    void this.statusPollerTick();
+  }
+
+  stopStatusPoller(): void {
+    if (this.statusPoller) {
+      clearInterval(this.statusPoller);
+      this.statusPoller = null;
+    }
+  }
+
+  private async statusPollerTick(): Promise<void> {
+    // Re-entrancy guard: if a previous git read is still in flight we skip.
+    if (this.statusPollerBusy) return;
+    this.statusPollerBusy = true;
+    try {
+      const patch: Partial<TuiState> = {};
+
+      // 1. Token budget
+      if (this.statusProviders.tokens) {
+        const t = this.statusProviders.tokens();
+        const cur = this.state.tokenInfo;
+        if (!cur || cur.used !== t.used || cur.budget !== t.budget || cur.percentage !== t.percentage) {
+          patch.tokenInfo = { used: t.used, budget: t.budget, percentage: t.percentage };
+        }
+      }
+
+      // 2. Saver mode
+      if (this.statusProviders.saver) {
+        const s = this.statusProviders.saver();
+        const cur = this.state.saverInfo;
+        const shouldShow = !(s.state === 'off' && s.savedToday === 0 && s.savedLifetime === 0);
+        if (!shouldShow) {
+          if (cur !== null) patch.saverInfo = null;
+        } else if (!cur || cur.state !== s.state || cur.savedToday !== s.savedToday || cur.savedLifetime !== s.savedLifetime) {
+          patch.saverInfo = { state: s.state, savedToday: s.savedToday, savedLifetime: s.savedLifetime };
+        }
+      }
+
+      // 3. Sub-agents
+      if (this.statusProviders.subAgents) {
+        const agents = this.statusProviders.subAgents();
+        if (!shallowEqualSubAgents(this.state.subAgents, agents)) {
+          patch.subAgents = agents;
+        }
+      }
+
+      // 4. Background tasks
+      if (this.statusProviders.bgTasks) {
+        const tasks = this.statusProviders.bgTasks();
+        if (!shallowEqualBgTasks(this.state.backgroundTasks, tasks)) {
+          patch.backgroundTasks = tasks;
+        }
+      }
+
+      // 4b. Bot roster — drives /bots argument autocomplete (§3.2)
+      if (this.statusProviders.botRoster) {
+        const roster = this.statusProviders.botRoster();
+        const current = this.state.botRoster;
+        if (current.length !== roster.length || current.some((b, i) =>
+          b.id !== roster[i].id || b.name !== roster[i].name || b.state !== roster[i].state || b.needsYou !== roster[i].needsYou)) {
+          patch.botRoster = roster;
+        }
+      }
+
+      // 5. Workspace git state (async — branch/files/ahead/behind can
+      // change from outside Mercury, so we re-read every tick)
+      if (this.state.workspace?.active) {
+        const root = this.state.workspace.rootPath;
+        const fresh = await this.readGitStateAsync(root);
+        const cur = this.state.workspace;
+        if (
+          cur.branch !== fresh.branch ||
+          cur.ahead !== fresh.ahead ||
+          cur.behind !== fresh.behind ||
+          cur.stagedCount !== fresh.stagedCount ||
+          cur.unstagedCount !== fresh.unstagedCount ||
+          cur.gitFiles.length !== fresh.files.length
+        ) {
+          patch.workspace = {
+            ...cur,
+            branch: fresh.branch,
+            ahead: fresh.ahead,
+            behind: fresh.behind,
+            stagedCount: fresh.stagedCount,
+            unstagedCount: fresh.unstagedCount,
+            gitFiles: fresh.files,
+          };
+        }
+      }
+
+      // 6. Mercury Code header (branch / ahead / behind / dirty count).
+      // Async git read: execSync here blocks the event loop while the TUI
+      // is rendering (and mid-task), which stalls streaming + input.
+      if (this.state.mode === 'mercury-code' && this.state.mercuryCode) {
+        const mc = this.state.mercuryCode;
+        const asyncState = await this.readGitStateAsync(mc.cwd);
+        const fresh = {
+          branch: asyncState.branch,
+          ahead: asyncState.ahead,
+          behind: asyncState.behind,
+          dirty: asyncState.files.length,
+        };
+        if (
+          fresh.branch !== mc.git.branch ||
+          fresh.ahead !== mc.git.ahead ||
+          fresh.behind !== mc.git.behind ||
+          fresh.dirty !== mc.git.dirty
+        ) {
+          patch.mercuryCode = { ...mc, git: fresh };
+        }
+      }
+
+      if (Object.keys(patch).length > 0) {
+        this.update(patch);
+      }
+    } catch {
+      // Polling should never crash the UI loop.
+    } finally {
+      this.statusPollerBusy = false;
+    }
   }
 
   stageWorkspaceFile(filePath: string): { ok: boolean; message: string } {
@@ -704,7 +2822,7 @@ export class CLIChannel extends BaseChannel {
     const nodes = this.buildTreeNodes(rootPath, expanded, 0);
     const selectedIndex = Math.max(0, nodes.findIndex((n) => n.path === selectedPath));
     const selectedNode = nodes[selectedIndex] || nodes[0] || null;
-    const { files, branch, stagedCount, unstagedCount } = this.readGitState(rootPath);
+    const { files, branch, stagedCount, unstagedCount, ahead, behind } = this.readGitState(rootPath);
     return {
       active: true,
       rootPath,
@@ -717,6 +2835,8 @@ export class CLIChannel extends BaseChannel {
       stagedCount,
       unstagedCount,
       branch,
+      ahead,
+      behind,
       lastAction,
       codeScrollOffset: this.state.workspace?.codeScrollOffset ?? 0,
       focusArea: this.state.workspace?.focusArea ?? 'explorer',
@@ -732,14 +2852,23 @@ export class CLIChannel extends BaseChannel {
     this.update({ workspace: { ...ws, openedFilePath: null, openedFilePreview: [], codeScrollOffset: 0, focusArea: 'explorer', lastAction: 'Closed file preview' } });
   }
 
-  scrollWorkspaceCode(delta: number): void {
+  scrollWorkspaceCode(delta: number, viewportLines = 1): void {
     const ws = this.state.workspace;
     if (!ws?.active || !ws.openedFilePreview.length) return;
-    const maxOffset = Math.max(0, ws.openedFilePreview.length - 1);
+    const maxOffset = Math.max(0, ws.openedFilePreview.length - Math.max(1, viewportLines));
     const next = Math.max(0, Math.min(maxOffset, ws.codeScrollOffset + delta));
     if (next !== ws.codeScrollOffset) {
       this.update({ workspace: { ...ws, codeScrollOffset: next } });
     }
+  }
+
+  private scrollWorkspaceCodeToBoundary(boundary: 'top' | 'bottom', viewportLines = 1): void {
+    const ws = this.state.workspace;
+    if (!ws?.active || !ws.openedFilePreview.length) return;
+    const codeScrollOffset = boundary === 'top'
+      ? 0
+      : Math.max(0, ws.openedFilePreview.length - Math.max(1, viewportLines));
+    this.update({ workspace: { ...ws, codeScrollOffset } });
   }
 
   setWorkspaceFocus(area: 'explorer' | 'code' | 'git' | 'chat'): void {
@@ -762,10 +2891,29 @@ export class CLIChannel extends BaseChannel {
   scrollWorkspaceChat(delta: number): void {
     const ws = this.state.workspace;
     if (!ws?.active) return;
-    const maxOffset = Math.max(0, this.state.chatMessages.length - 1);
-    const next = Math.max(0, Math.min(maxOffset, ws.chatScrollOffset + delta));
+    const next = Math.max(0, ws.chatScrollOffset + delta);
     if (next !== ws.chatScrollOffset) {
       this.update({ workspace: { ...ws, chatScrollOffset: next } });
+    }
+  }
+
+  private setWorkspaceChatBoundary(boundary: 'top' | 'bottom'): void {
+    const ws = this.state.workspace;
+    if (!ws?.active) return;
+    this.update({
+      workspace: {
+        ...ws,
+        chatScrollOffset: boundary === 'top' ? Number.MAX_SAFE_INTEGER : 0,
+      },
+    });
+  }
+
+  private setWorkspaceChatDistance(distance: number): void {
+    const ws = this.state.workspace;
+    if (!ws?.active) return;
+    const chatScrollOffset = Math.max(0, distance);
+    if (chatScrollOffset !== ws.chatScrollOffset) {
+      this.update({ workspace: { ...ws, chatScrollOffset } });
     }
   }
 
@@ -783,7 +2931,7 @@ export class CLIChannel extends BaseChannel {
   private readFilePreview(filePath: string): string[] {
     try {
       const raw = fs.readFileSync(filePath, 'utf-8');
-      return raw.split('\n').slice(0, 500);
+      return raw.replace(/\r\n?/g, '\n').split('\n').slice(0, 500);
     } catch {
       return ['(Unable to read file preview)'];
     }
@@ -815,27 +2963,61 @@ export class CLIChannel extends BaseChannel {
     return nodes;
   }
 
-  private readGitState(rootPath: string): { files: WorkspaceGitFile[]; branch: string; stagedCount: number; unstagedCount: number } {
+  private readGitState(rootPath: string): { files: WorkspaceGitFile[]; branch: string; stagedCount: number; unstagedCount: number; ahead: number; behind: number } {
     try {
       const branch = execSync('git branch --show-current', { cwd: rootPath, stdio: 'pipe' }).toString().trim() || 'detached';
-      const out = execSync('git status --porcelain', { cwd: rootPath, stdio: 'pipe' }).toString();
-      const files: WorkspaceGitFile[] = out
-        .split('\n')
-        .map((line) => line.trimEnd())
-        .filter(Boolean)
-        .map((line) => {
-          const x = line[0] || ' ';
-          const y = line[1] || ' ';
-          const rel = line.slice(3).trim();
-          const staged = x !== ' ' && x !== '?';
-          const status = `${x}${y}`.trim() || '??';
-          return { path: rel, staged, status };
-        });
-      const stagedCount = files.filter((f) => f.staged).length;
-      const unstagedCount = files.length - stagedCount;
-      return { files, branch, stagedCount, unstagedCount };
+      const out = execSync('git status --porcelain=v1 --branch', { cwd: rootPath, stdio: 'pipe' }).toString();
+      return this.parseGitOutput(branch, out);
     } catch {
-      return { files: [], branch: 'not-a-git-repo', stagedCount: 0, unstagedCount: 0 };
+      return { files: [], branch: 'not-a-git-repo', stagedCount: 0, unstagedCount: 0, ahead: 0, behind: 0 };
+    }
+  }
+
+  private parseGitOutput(branch: string, statusOut: string): { files: WorkspaceGitFile[]; branch: string; stagedCount: number; unstagedCount: number; ahead: number; behind: number } {
+    const lines = statusOut.split('\n');
+    let ahead = 0;
+    let behind = 0;
+    const header = lines[0] || '';
+    const aheadMatch = header.match(/ahead (\d+)/);
+    const behindMatch = header.match(/behind (\d+)/);
+    if (aheadMatch) ahead = parseInt(aheadMatch[1], 10);
+    if (behindMatch) behind = parseInt(behindMatch[1], 10);
+    const files: WorkspaceGitFile[] = lines
+      .slice(1)
+      .map((line) => line.trimEnd())
+      .filter(Boolean)
+      .map((line) => {
+        const x = line[0] || ' ';
+        const y = line[1] || ' ';
+        const rel = line.slice(3).trim();
+        const staged = x !== ' ' && x !== '?';
+        const status = `${x}${y}`.trim() || '??';
+        return { path: rel, staged, status };
+      });
+    const stagedCount = files.filter((f) => f.staged).length;
+    const unstagedCount = files.length - stagedCount;
+    return { files, branch, stagedCount, unstagedCount, ahead, behind };
+  }
+
+  private execAsync(cmd: string, args: string[], cwd: string, timeoutMs = 1500): Promise<string> {
+    return new Promise((resolve, reject) => {
+      execFile(cmd, args, { cwd, timeout: timeoutMs, maxBuffer: 1024 * 512 }, (err, stdout) => {
+        if (err) reject(err);
+        else resolve(stdout.toString());
+      });
+    });
+  }
+
+  private async readGitStateAsync(rootPath: string): Promise<{ files: WorkspaceGitFile[]; branch: string; stagedCount: number; unstagedCount: number; ahead: number; behind: number }> {
+    try {
+      const [branchOut, statusOut] = await Promise.all([
+        this.execAsync('git', ['branch', '--show-current'], rootPath),
+        this.execAsync('git', ['status', '--porcelain=v1', '--branch'], rootPath),
+      ]);
+      const branch = branchOut.trim() || 'detached';
+      return this.parseGitOutput(branch, statusOut);
+    } catch {
+      return { files: [], branch: 'not-a-git-repo', stagedCount: 0, unstagedCount: 0, ahead: 0, behind: 0 };
     }
   }
 
@@ -844,13 +3026,16 @@ export class CLIChannel extends BaseChannel {
   }
 
   sendUserMessage(content: string): void {
+    // New turn → reset file-change attribution (the buffer is per-turn).
+    this.pendingTurnFiles.clear();
+    this.committedTurnFiles.clear();
     const userMsg: ChatMessage = {
       id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
       role: 'user',
       content,
       timestamp: Date.now(),
     };
-    this.update({ chatMessages: [...this.state.chatMessages, userMsg] });
+    this.trimAndSetMessages([...this.state.chatMessages, userMsg]);
     this.emit({
       id: userMsg.id,
       channelId: 'cli',

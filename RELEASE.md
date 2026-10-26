@@ -1,27 +1,31 @@
-# Release v0.4.1
+# Release v1.4.2
 
-## ☿ Mercury Agent v0.4.1
+## ☿ Mercury Agent v1.4.2
 
-**Smarter agent context, co-author fix, and loop detection.**
+Web search finds things again, with no key and with any model, and the research prompt now asks only when you actually want a research article.
 
-### What's Changed
+### Web search
+- **Three sources that answer.** `web_search` asks [Parallel's public search](https://search.parallel.ai/mcp) first (keyless, built for agents, about a second, with excerpts and dates), then DuckDuckGo's html page, then its lite page. Bing's web feed, which had started returning unrelated pages, and the engines that refuse automated requests are gone.
+- **DuckDuckGo read exactly.** Both pages are parsed from their real markup: the title, the real address behind DuckDuckGo's redirect, and the snippet. Ads are dropped, a bot challenge is retried once, and a page Mercury can't read is reported instead of looking empty.
+- **News links open the article.** News comes from Parallel's article links, then Bing News with its redirects unwrapped to the publisher, then Google News and Hacker News.
+- **Never the model's own search.** Results come only from Mercury's search tools, so search works the same whichever model you use.
+- **You can see what happened.** Every result ends with a `Searched:` trail, such as `Parallel: timed out → DuckDuckGo: 8 results`, so "nothing found" and "every source was blocked" read differently.
+- The built-in `web-search` skill (1.3.0) describes the sources. An installed skill that scraped DuckDuckGo directly is replaced, and your copy is kept as `SKILL.md.replaced.bak`.
 
-- **Agent context enrichment** — Every request now includes `Platform` and `Working directory` in the system prompt, so the LLM knows what OS it's on and where it's working. Prevents the "trying `/home/zayd` on Windows" confusion.
-- **GitHub companion awareness** — When GitHub tools are active, the system prompt now explains when to use `git_commit` + `git_push` vs. `github_api` Contents API, so the agent doesn't fumble between approaches.
-- **Co-author injection for GitHub API** — `github_api` now automatically injects `Co-authored-by: Mercury <mercury@cosmicstack.org>` into all content creation/update operations (`PUT /repos/:owner/:repo/contents/:path`). Previously, only `git_commit` had the co-author trailer — API-created files were missing it.
-- **Loop detection circuit breaker** — New `ToolCallLoopDetector` tracks consecutive tool calls. If the same tool+params is called 3+ times in a row, a system warning is injected telling the LLM to try a different approach. Prevents the infinite `approve_scope` / `list_dir` death spirals that burned through token budgets.
-- **`github_api` description overhaul** — The tool description now explicitly documents Contents API operations (push files, delete files) and when to use the API vs. git CLI, so the LLM makes smarter choices from the start.
+### Chat
+- **The research prompt asks only when you mean it.** It used to fire on words like "latest" or "explain", so instructions such as "convert the latest epub" got a research question. One short model call now decides; instructions, quick questions and today's news never get the prompt.
+- **Quick answer comes first**, so an accidental Enter never starts a long research run.
 
-### Bug Fixes
+### Upgrade
 
-- LLM no longer blind to the current working directory or platform when making tool calls
-- GitHub API file pushes now correctly show Mercury as co-author in GitHub's commit history
-- Agent no longer loops on failing permission/approval calls until token budget exhaustion
+**npm:**
+```
+npm install -g @cosmicstack/mercury-agent@1.4.2
+mercury restart
+```
 
-### Migration from v0.4.0
+**Standalone binary:** `mercury upgrade`, or re-run the one-line installer from mercuryagent.sh.
 
-No configuration changes required. All improvements are in agent behavior and tool descriptions.
+No config changes needed.
 
----
-
-**Full Changelog**: https://github.com/cosmicstack-labs/mercury-agent/compare/v0.4.0...v0.4.1
+**Full Changelog**: https://github.com/cosmicstack-labs/mercury-agent/compare/v1.4.1...v1.4.2

@@ -1,47 +1,29 @@
-import { existsSync, mkdirSync, rmSync } from 'node:fs';
-import { dirname, join } from 'node:path';
-import { tmpdir } from 'node:os';
-import { createRequire } from 'node:module';
+import { existsSync, mkdirSync } from 'node:fs';
+import { dirname } from 'node:path';
 import { logger } from '../utils/logger.js';
+import { isSqliteAvailable, openSqlite, type SqliteDatabase } from '../utils/sqlite-driver.js';
 
-type BetterSqlite3Database = import('better-sqlite3').Database;
-
-const require = createRequire(import.meta.url);
-
-let syncDatabaseClass: typeof import('better-sqlite3') | null = null;
-let availabilityChecked = false;
-let available = false;
-
-function ensureProbed(): void {
-  if (availabilityChecked) return;
-  availabilityChecked = true;
-  try {
-    const mod = require('better-sqlite3');
-    const probeDir = join(tmpdir(), `mercury-sqlite3-probe-${process.pid}`);
-    try {
-      mkdirSync(probeDir, { recursive: true });
-      const probeDb = new mod(join(probeDir, 'probe.db'));
-      probeDb.close();
-      rmSync(probeDir, { recursive: true, force: true });
-      syncDatabaseClass = mod;
-      available = true;
-    } catch {
-      syncDatabaseClass = null;
-    }
-  } catch {
-    syncDatabaseClass = null;
-  }
-}
-
+/**
+ * True when any SQLite engine is available (better-sqlite3, bun:sqlite or
+ * node:sqlite — see `src/utils/sqlite-driver.ts`).
+ * @deprecated The name predates the shared driver; prefer `isSqliteAvailable()`.
+ */
 export function isBetterSqlite3Available(): boolean {
-  ensureProbed();
-  return syncDatabaseClass !== null;
+  return isSqliteAvailable();
 }
+
+export const SECOND_BRAIN_UNAVAILABLE_MESSAGE =
+  'No SQLite engine is available — second brain memory requires one. ' +
+  'Use Node >= 22.13 (built-in node:sqlite), a standalone Mercury binary (bun:sqlite), ' +
+  'or install build tools (make, gcc/g++, python3) and run `npm rebuild better-sqlite3`. ' +
+  'Run `mercury doctor --storage` for details.';
 
 export interface MemoryRow {
   id: string;
   user_key: string;
   type: string;
+  categories: string;
+  shareable: number;
   summary: string;
   detail: string | null;
   scope: string;
@@ -86,25 +68,50 @@ export interface PersonConnectionRow {
   strength: number;
 }
 
+/** Most distinct terms a memory search uses; keeps queries far below SQLite's
+ *  expression-depth limit (1000), which a long pasted message used to blow
+ *  through in both the FTS query and its LIKE fallback, failing the turn. */
+const MAX_SEARCH_TERMS = 32;
+
+/**
+ * Search terms for a free-text query: distinct lowercase words of 2+ letters
+ * or digits (punctuation and FTS operators can't leak in), first occurrence
+ * order, capped at MAX_SEARCH_TERMS.
+ */
+export function ftsSearchTerms(query: string): string[] {
+  const seen = new Set<string>();
+  for (const match of query.toLowerCase().matchAll(/[\p{L}\p{N}_]+/gu)) {
+    const term = match[0];
+    if (term.length < 2 || seen.has(term)) continue;
+    seen.add(term);
+    if (seen.size >= MAX_SEARCH_TERMS) break;
+  }
+  return [...seen];
+}
+
 export class SecondBrainDB {
-  private db: BetterSqlite3Database;
+  private db: SqliteDatabase;
 
   constructor(dbPath: string) {
-    ensureProbed();
-    if (!syncDatabaseClass) {
-      throw new Error(
-        'better-sqlite3 is not available — second brain memory requires it. ' +
-        'Install build tools (make, gcc/g++, python3) or upgrade to Node >= 20. ' +
-        'See: https://github.com/WiseLibs/better-sqlite3/blob/master/docs/compilation.md'
-      );
-    }
     const dir = dirname(dbPath);
     if (!existsSync(dir)) {
       mkdirSync(dir, { recursive: true });
     }
-    this.db = new syncDatabaseClass(dbPath);
+    const db = openSqlite(dbPath);
+    if (!db) throw new Error(SECOND_BRAIN_UNAVAILABLE_MESSAGE);
+    this.db = db;
     this.db.pragma('journal_mode = WAL');
     this.db.pragma('synchronous = NORMAL');
+  }
+
+  /** Engine backing this database: `better-sqlite3`, `bun:sqlite` or `node:sqlite`. */
+  get backend(): string {
+    return this.db.backend;
+  }
+
+  /** The shared connection, for stores that keep their own tables in this file (beliefs). */
+  get connection(): SqliteDatabase {
+    return this.db;
   }
 
   init(): void {
@@ -113,6 +120,8 @@ export class SecondBrainDB {
         id TEXT PRIMARY KEY,
         user_key TEXT NOT NULL,
         type TEXT NOT NULL,
+        categories TEXT NOT NULL DEFAULT '[]',
+        shareable INTEGER NOT NULL DEFAULT 0,
         summary TEXT NOT NULL,
         detail TEXT,
         scope TEXT NOT NULL DEFAULT 'durable',
@@ -221,18 +230,35 @@ export class SecondBrainDB {
     `);
 
     this.db.pragma('foreign_keys = ON');
-    logger.info('Second brain database initialized');
+
+    // ── Migrations for existing DBs ──────────────────────────────────────────
+    // Add `categories` and `shareable` columns if the table predates them.
+    // Existing memories get categories='[]' and shareable=0 (private).
+    const columns = this.db.prepare('PRAGMA table_info(memories)').all() as { name: string }[];
+    if (!columns.some((c) => c.name === 'categories')) {
+      this.db.exec("ALTER TABLE memories ADD COLUMN categories TEXT NOT NULL DEFAULT '[]'");
+      logger.info('Added categories column to memories table');
+    }
+    if (!columns.some((c) => c.name === 'shareable')) {
+      this.db.exec('ALTER TABLE memories ADD COLUMN shareable INTEGER NOT NULL DEFAULT 0');
+      logger.info('Added shareable column to memories table');
+    }
+
+    // Index for incremental fetch (shareable + updated_at — the cloud pull query).
+    this.db.exec('CREATE INDEX IF NOT EXISTS idx_memories_shareable_updated ON memories(shareable, updated_at)');
+
+    logger.info({ backend: this.db.backend }, 'Second brain database initialized');
   }
 
   insert(row: Omit<MemoryRow, 'rowid'> & { rowid?: never }): void {
     const stmt = this.db.prepare(`
       INSERT INTO memories (
-        id, user_key, type, summary, detail, scope, evidence_kind, source,
+        id, user_key, type, categories, shareable, summary, detail, scope, evidence_kind, source,
         confidence, importance, durability, evidence_count, provenance,
         dismissed, superseded_by, created_at, updated_at,
         last_seen_at, last_used_at, last_used_query
       ) VALUES (
-        @id, @user_key, @type, @summary, @detail, @scope, @evidence_kind, @source,
+        @id, @user_key, @type, @categories, @shareable, @summary, @detail, @scope, @evidence_kind, @source,
         @confidence, @importance, @durability, @evidence_count, @provenance,
         @dismissed, @superseded_by, @created_at, @updated_at,
         @last_seen_at, @last_used_at, @last_used_query
@@ -242,6 +268,8 @@ export class SecondBrainDB {
       id: row.id,
       user_key: row.user_key,
       type: row.type,
+      categories: row.categories ?? '[]',
+      shareable: row.shareable ?? 0,
       summary: row.summary,
       detail: row.detail ?? null,
       scope: row.scope ?? 'durable',
@@ -271,6 +299,7 @@ export class SecondBrainDB {
       'confidence', 'importance', 'durability', 'evidence_count',
       'provenance', 'dismissed', 'superseded_by',
       'updated_at', 'last_seen_at', 'last_used_at', 'last_used_query',
+      'categories', 'shareable',
     ] as const;
 
     for (const field of allowedFields) {
@@ -294,6 +323,42 @@ export class SecondBrainDB {
   getById(id: string): MemoryRow | undefined {
     const stmt = this.db.prepare('SELECT * FROM memories WHERE id = ?');
     return stmt.get(id) as MemoryRow | undefined;
+  }
+
+  /**
+   * Incremental fetch query — shareable memories newer than the cursor.
+   * Used by the cloud `memory.fetch` handler to pull only memories created or
+   * updated since the last fetch (watermark stored in MemorySyncState).
+   * Excludes dismissed rows. Ordered by `updated_at ASC` so the cloud can
+   * advance its cursor to the max `updated_at` safely.
+   */
+  getShareableSince(userKey: string, since: number, limit: number = 500): MemoryRow[] {
+    const stmt = this.db.prepare(`
+      SELECT * FROM memories
+      WHERE user_key = ? AND shareable = 1 AND dismissed = 0
+      AND updated_at > ?
+      ORDER BY updated_at ASC
+      LIMIT ?
+    `);
+    return stmt.all(userKey, since, limit) as MemoryRow[];
+  }
+
+  /** Count shareable memories (for display / config). */
+  countShareable(userKey: string): number {
+    const stmt = this.db.prepare('SELECT COUNT(*) as count FROM memories WHERE user_key = ? AND shareable = 1 AND dismissed = 0');
+    return (stmt.get(userKey) as { count: number }).count;
+  }
+
+  /** List all shareable memories (for the /memory menu "Shared Memories" view). */
+  getShareable(userKey: string, limit: number = 50): MemoryRow[] {
+    const stmt = this.db.prepare(`SELECT * FROM memories WHERE user_key = ? AND shareable = 1 AND dismissed = 0 ORDER BY updated_at DESC LIMIT ?`);
+    return stmt.all(userKey, limit) as MemoryRow[];
+  }
+
+  /** Toggle a memory's shareable flag on/off. */
+  setShareable(id: string, shareable: boolean): void {
+    const stmt = this.db.prepare('UPDATE memories SET shareable = ?, updated_at = ? WHERE id = ?');
+    stmt.run(shareable ? 1 : 0, Date.now(), id);
   }
 
   getByType(userKey: string, type: string): MemoryRow[] {
@@ -333,12 +398,13 @@ export class SecondBrainDB {
   }
 
   searchRelevant(userKey: string, query: string, limit: number = 10): MemoryRow[] {
-    const tokens = query.split(/\s+/).filter(t => t.length > 0).map(t => t.replace(/"/g, '""'));
+    const tokens = ftsSearchTerms(query);
     if (tokens.length === 0) {
       const stmt = this.db.prepare(`SELECT * FROM memories WHERE user_key = ? AND dismissed = 0 AND scope IN ('active', 'durable') ORDER BY updated_at DESC LIMIT ?`);
       return stmt.all(userKey, limit) as MemoryRow[];
     }
-    const ftsQuery = tokens.join(' OR ');
+    // Quoted: punctuation in a term can't break FTS5 query syntax.
+    const ftsQuery = tokens.map((term) => `"${term}"`).join(' OR ');
     const ftsStmt = this.db.prepare(`
       SELECT m.* FROM memories m
       JOIN memories_fts fts ON m.rowid = fts.rowid
@@ -357,12 +423,13 @@ export class SecondBrainDB {
   }
 
   searchSubconscious(userKey: string, query: string, limit: number = 10): MemoryRow[] {
-    const tokens = query.split(/\s+/).filter(t => t.length > 0).map(t => t.replace(/"/g, '""'));
+    const tokens = ftsSearchTerms(query);
     if (tokens.length === 0) {
       const stmt = this.db.prepare(`SELECT * FROM memories WHERE user_key = ? AND dismissed = 0 AND scope = 'subconscious' ORDER BY updated_at DESC LIMIT ?`);
       return stmt.all(userKey, limit) as MemoryRow[];
     }
-    const ftsQuery = tokens.join(' OR ');
+    // Quoted: punctuation in a term can't break FTS5 query syntax.
+    const ftsQuery = tokens.map((term) => `"${term}"`).join(' OR ');
     const ftsStmt = this.db.prepare(`
       SELECT m.* FROM memories m
       JOIN memories_fts fts ON m.rowid = fts.rowid
@@ -758,6 +825,19 @@ export class SecondBrainDB {
     const stmt = this.db.prepare(`SELECT COUNT(*) as count FROM memories WHERE user_key = ? AND dismissed = 0 AND scope IN ('active', 'durable')`);
     const row = stmt.get(userKey) as { count: number };
     return row.count;
+  }
+
+  /** Rows the belief migration set aside as junk (ADR-026 §3.7): hidden from prompts, shown on the dashboard for review. */
+  listQuarantined(userKey: string, limit: number = 500): MemoryRow[] {
+    const stmt = this.db.prepare(`SELECT * FROM memories WHERE user_key = ? AND scope = 'quarantine' AND dismissed = 0 ORDER BY updated_at DESC LIMIT ?`);
+    return stmt.all(userKey, limit) as MemoryRow[];
+  }
+
+  /** The owner reviewed a quarantined row and wants it back: it becomes a durable memory again. */
+  restoreQuarantined(id: string): boolean {
+    const now = Date.now();
+    const stmt = this.db.prepare(`UPDATE memories SET scope = 'durable', dismissed = 0, provenance = 'restored', updated_at = ?, last_seen_at = ? WHERE id = ? AND scope = 'quarantine'`);
+    return stmt.run(now, now, id).changes > 0;
   }
 
   close(): void {
